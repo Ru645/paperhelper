@@ -18,6 +18,10 @@ pub struct LlmConfig {
     pub model: String,
     pub context_length: usize,
     pub thinking_mode: bool,
+    /// 是否声明当前模型支持直接读取 PDF（file 模式）。
+    /// false=使用 pdf-extract 抽纯文本塞入 prompt（text 模式，全模型通用）。
+    #[serde(default)]
+    pub pdf_input: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +44,7 @@ impl Default for Config {
                 model: "gpt-4o-mini".into(),
                 context_length: 8192,
                 thinking_mode: false,
+                pdf_input: false,
             },
             pricing: PricingConfig {
                 input_price_per_1m: 0.15,
@@ -80,6 +85,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PAPERHELPER_THINKING") {
             cfg.llm.thinking_mode = matches!(v.as_str(), "1" | "true" | "TRUE");
+        }
+        if let Ok(v) = std::env::var("PAPERHELPER_PDF_INPUT") {
+            cfg.llm.pdf_input = matches!(v.as_str(), "1" | "true" | "TRUE");
         }
         if let Ok(v) = std::env::var("PAPERHELPER_INPUT_PRICE") {
             if let Ok(n) = v.parse() {

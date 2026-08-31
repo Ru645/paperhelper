@@ -46,6 +46,9 @@ pub struct Note {
     pub title: String,
     #[serde(default)]
     pub blocks: Vec<Block>,
+    /// 论文全文纯文本（ingest 时抽取，ask 时作为上下文重发）。
+    #[serde(default)]
+    pub raw_text: String,
 }
 
 impl Note {
@@ -116,90 +119,209 @@ impl Note {
         }
         best.map(|(b, _)| b)
     }
+
+    /// 把笔记渲染回 Markdown（供 ask 上下文使用，也供导出参考）。
+    pub fn to_markdown(&self) -> String {
+        let mut s = format!("# {}\n", self.title);
+        fn walk(blocks: &[Block], depth: usize, s: &mut String) {
+            for b in blocks {
+                match b.kind {
+                    BlockKind::Section => {
+                        let level = (depth + 2).min(6);
+                        s.push_str(&format!("{} {}\n", "#".repeat(level), b.text));
+                    }
+                    BlockKind::Paragraph => {
+                        s.push_str(&format!("{}\n", b.text));
+                    }
+                    BlockKind::Formula => {
+                        s.push_str(&format!("$$\n{}\n$$\n", b.text));
+                    }
+                }
+                walk(&b.children, depth + 1, s);
+            }
+        }
+        walk(&self.blocks, 0, &mut s);
+        s
+    }
 }
 
 fn uid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-#[derive(Deserialize)]
-struct RawNote {
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    blocks: Vec<RawBlock>,
-}
+/// 解析 LLM 输出的 Markdown 为笔记树。
+/// 约定：`#`=标题；`##`/`###`…=按层级嵌套的 Section；`$$…$$`=Formula；
+/// 其余非空行=Paragraph（连续行合并为一段），挂到最近的 Section 下。
+pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
+    let md = strip_fences(md);
+    let lines: Vec<&str> = md.lines().collect();
 
-#[derive(Deserialize)]
-struct RawBlock {
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    children: Vec<RawBlock>,
-}
+    let mut title = String::new();
+    let mut roots: Vec<Block> = Vec::new();
+    // stack[i] 是当前打开的 depth=i 的 Section。
+    let mut stack: Vec<Block> = Vec::new();
+    let mut para_buf = String::new();
 
-fn parse_kind(s: &str) -> BlockKind {
-    match s.to_lowercase().as_str() {
-        "section" => BlockKind::Section,
-        "formula" | "equation" => BlockKind::Formula,
-        _ => BlockKind::Paragraph,
+    let flush_para = |buf: &mut String, roots: &mut Vec<Block>, stack: &mut Vec<Block>| {
+        if !buf.trim().is_empty() {
+            let block = Block {
+                id: uid(),
+                kind: BlockKind::Paragraph,
+                text: buf.trim().to_string(),
+                children: Vec::new(),
+                explanations: Vec::new(),
+            };
+            if let Some(sec) = stack.last_mut() {
+                sec.children.push(block);
+            } else {
+                roots.push(block);
+            }
+        }
+        buf.clear();
+    };
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            flush_para(&mut para_buf, &mut roots, &mut stack);
+            i += 1;
+            continue;
+        }
+
+        // 标题行
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            let text = rest.trim().to_string();
+            flush_para(&mut para_buf, &mut roots, &mut stack);
+
+            if level == 1 {
+                if title.is_empty() {
+                    title = text;
+                }
+                i += 1;
+                continue;
+            }
+
+            // 关闭 depth >= (level-2) 的 Section
+            let target_depth = level - 2;
+            while stack.len() > target_depth {
+                let sec = stack.pop().unwrap();
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(sec);
+                } else {
+                    roots.push(sec);
+                }
+            }
+            stack.push(Block {
+                id: uid(),
+                kind: BlockKind::Section,
+                text,
+                children: Vec::new(),
+                explanations: Vec::new(),
+            });
+            i += 1;
+            continue;
+        }
+
+        // 公式块 $$ ... $$（可能跨行）
+        if trimmed.starts_with("$$") {
+            flush_para(&mut para_buf, &mut roots, &mut stack);
+            let mut content = String::new();
+            let first = trimmed.trim_start_matches("$$");
+            if first.trim().is_empty() {
+                // 多行公式
+            } else {
+                content.push_str(first.trim());
+            }
+            // 若单行就闭合
+            if !trimmed.ends_with("$$") || trimmed.len() > 2 {
+                // 继续收集到闭合
+                while i + 1 < lines.len() && !lines[i + 1].trim().ends_with("$$") {
+                    i += 1;
+                    content.push('\n');
+                    content.push_str(lines[i].trim());
+                }
+                if i + 1 < lines.len() {
+                    i += 1;
+                    let last = lines[i].trim();
+                    let last = last.strip_suffix("$$").unwrap_or(last).trim();
+                    if !last.is_empty() {
+                        content.push('\n');
+                        content.push_str(last);
+                    }
+                }
+            }
+            let block = Block {
+                id: uid(),
+                kind: BlockKind::Formula,
+                text: content.trim().to_string(),
+                children: Vec::new(),
+                explanations: Vec::new(),
+            };
+            if let Some(sec) = stack.last_mut() {
+                sec.children.push(block);
+            } else {
+                roots.push(block);
+            }
+            i += 1;
+            continue;
+        }
+
+        // 普通段落行：累积
+        if !para_buf.is_empty() {
+            para_buf.push('\n');
+        }
+        para_buf.push_str(trimmed);
+        i += 1;
+    }
+    flush_para(&mut para_buf, &mut roots, &mut stack);
+
+    // 关闭剩余打开的 Section
+    while let Some(sec) = stack.pop() {
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(sec);
+        } else {
+            roots.push(sec);
+        }
+    }
+
+    if title.is_empty() {
+        title = "未命名论文".to_string();
+    }
+
+    // 兜底：完全没解析出内容时，用原文做一个段落
+    if roots.is_empty() && !raw_text.is_empty() {
+        let t: String = raw_text.chars().take(2000).collect();
+        roots.push(Block {
+            id: uid(),
+            kind: BlockKind::Paragraph,
+            text: t,
+            children: Vec::new(),
+            explanations: Vec::new(),
+        });
+    }
+
+    Note {
+        paper_id: String::new(),
+        title,
+        blocks: roots,
+        raw_text: raw_text.to_string(),
     }
 }
 
-fn convert_block(raw: RawBlock) -> Block {
-    Block {
-        id: uid(),
-        kind: parse_kind(&raw.kind),
-        text: raw.text,
-        children: raw.children.into_iter().map(convert_block).collect(),
-        explanations: Vec::new(),
-    }
-}
-
-fn strip_fences(content: &str) -> String {
+fn strip_fences(content: &str) -> &str {
     let t = content.trim();
     if let Some(rest) = t.strip_prefix("```") {
-        let rest = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+        // 跳过语言标识行
+        let rest = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == '-');
         let rest = rest.trim_start_matches('\n');
         if let Some(rest) = rest.strip_suffix("```") {
-            return rest.trim().to_string();
+            return rest.trim();
         }
-        return rest.trim().to_string();
+        return rest.trim();
     }
-    t.to_string()
-}
-
-/// 把 LLM 返回的 JSON 解析成 Note；失败则用原文兜底成一个段落块。
-pub fn parse_note(content: &str, fallback_text: &str) -> Note {
-    let cleaned = strip_fences(content);
-    match serde_json::from_str::<RawNote>(&cleaned) {
-        Ok(r) => {
-            let blocks: Vec<Block> = r.blocks.into_iter().map(convert_block).collect();
-            Note {
-                paper_id: String::new(),
-                title: if r.title.is_empty() {
-                    "未命名论文".to_string()
-                } else {
-                    r.title
-                },
-                blocks,
-            }
-        }
-        Err(_) => {
-            let t: String = fallback_text.chars().take(2000).collect();
-            Note {
-                paper_id: String::new(),
-                title: "未命名论文（结构化失败，使用原文）".to_string(),
-                blocks: vec![Block {
-                    id: uid(),
-                    kind: BlockKind::Paragraph,
-                    text: t,
-                    children: Vec::new(),
-                    explanations: Vec::new(),
-                }],
-            }
-        }
-    }
+    t
 }
