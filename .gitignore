@@ -1,4 +1,6 @@
 /target
 session-*.json
+session.json
 .env
+.paperhelper/
 samples/
