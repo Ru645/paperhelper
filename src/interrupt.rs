@@ -1,0 +1,33 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use tokio::sync::Notify;
+
+static FLAG: AtomicBool = AtomicBool::new(false);
+static NOTIFY: OnceLock<Notify> = OnceLock::new();
+
+pub fn notify() -> &'static Notify {
+    NOTIFY.get_or_init(Notify::new)
+}
+
+pub fn is_interrupted() -> bool {
+    FLAG.load(Ordering::Relaxed)
+}
+
+pub fn reset() {
+    FLAG.store(false, Ordering::Relaxed);
+}
+
+pub fn install() {
+    tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            if !FLAG.swap(true, Ordering::Relaxed) {
+                eprintln!("\n[收到 Ctrl-C，正在停止当前任务… 输入 exit 退出程序]");
+                notify().notify_waiters();
+            }
+        }
+    });
+}
