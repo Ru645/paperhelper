@@ -98,7 +98,7 @@ impl Conversation {
             return out;
         }
         for (i, n) in order.iter().enumerate() {
-            let depth = self.depth_of(n.id);
+            let depth = self.depth_of(&n.id);
             let prefix = if depth == 0 {
                 String::new()
             } else {
