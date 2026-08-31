@@ -68,21 +68,6 @@ impl Note {
         self.flatten().len()
     }
 
-    pub fn find_block(&self, id: &str) -> Option<&Block> {
-        fn walk<'a>(blocks: &'a [Block], id: &str) -> Option<&'a Block> {
-            for b in blocks {
-                if b.id == id {
-                    return Some(b);
-                }
-                if let Some(f) = walk(&b.children, id) {
-                    return Some(f);
-                }
-            }
-            None
-        }
-        walk(&self.blocks, id)
-    }
-
     pub fn find_block_mut(&mut self, id: &str) -> Option<&mut Block> {
         fn walk<'a>(blocks: &'a mut [Block], id: &str) -> Option<&'a mut Block> {
             for b in blocks {
@@ -192,9 +177,9 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         }
 
         // 标题行
-        if let Some(rest) = trimmed.strip_prefix('#') {
+        if trimmed.strip_prefix('#').is_some() {
             let level = trimmed.chars().take_while(|c| *c == '#').count();
-            let text = rest.trim().to_string();
+            let text = trimmed.trim_start_matches('#').trim().to_string();
             flush_para(&mut para_buf, &mut roots, &mut stack);
 
             if level == 1 {
@@ -230,28 +215,33 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         if trimmed.starts_with("$$") {
             flush_para(&mut para_buf, &mut roots, &mut stack);
             let mut content = String::new();
-            let first = trimmed.trim_start_matches("$$");
-            if first.trim().is_empty() {
-                // 多行公式
-            } else {
-                content.push_str(first.trim());
-            }
-            // 若单行就闭合
-            if !trimmed.ends_with("$$") || trimmed.len() > 2 {
-                // 继续收集到闭合
-                while i + 1 < lines.len() && !lines[i + 1].trim().ends_with("$$") {
-                    i += 1;
-                    content.push('\n');
-                    content.push_str(lines[i].trim());
+            // 处理首行：$$...$$ 单行闭合，或 $$... 开头
+            let first_inner = trimmed.strip_prefix("$$").unwrap_or(trimmed);
+            if first_inner.trim().ends_with("$$") {
+                // 单行 $$...$$
+                let mid = first_inner.trim().strip_suffix("$$").unwrap_or(first_inner).trim();
+                if !mid.is_empty() {
+                    content.push_str(mid);
                 }
-                if i + 1 < lines.len() {
+            } else if !first_inner.trim().is_empty() {
+                content.push_str(first_inner.trim());
+                content.push('\n');
+            }
+            // 若未闭合，继续收集到含 $$ 的行
+            if !trimmed[2..].contains("$$") || trimmed.len() == 2 {
+                while i + 1 < lines.len() {
                     i += 1;
-                    let last = lines[i].trim();
-                    let last = last.strip_suffix("$$").unwrap_or(last).trim();
-                    if !last.is_empty() {
-                        content.push('\n');
-                        content.push_str(last);
+                    let l = lines[i].trim();
+                    if l.ends_with("$$") {
+                        let body = l.strip_suffix("$$").unwrap_or(l).trim();
+                        if !body.is_empty() {
+                            content.push_str(body);
+                            content.push('\n');
+                        }
+                        break;
                     }
+                    content.push_str(l);
+                    content.push('\n');
                 }
             }
             let block = Block {
@@ -324,4 +314,51 @@ fn strip_fences(content: &str) -> &str {
         return rest.trim();
     }
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic_markdown() {
+        let md = "# Title\n## 1. Intro\nsome text\n## 2. Method\n### 2.1 Attn\npara1\n$$\nE=mc^2\n$$\npara2\n";
+        let note = parse_markdown_note(md, "raw");
+        assert_eq!(note.title, "Title");
+        assert!(note.count_blocks() >= 5, "blocks={}", note.count_blocks());
+        let kinds: Vec<_> = note.flatten().iter().map(|(b, _)| b.kind.clone()).collect();
+        assert!(kinds.contains(&BlockKind::Section));
+        assert!(kinds.contains(&BlockKind::Formula));
+        assert!(kinds.contains(&BlockKind::Paragraph));
+        let formula = note.flatten().iter().find(|(b, _)| b.kind == BlockKind::Formula).unwrap().0;
+        assert!(formula.text.contains("E=mc^2"), "formula text={}", formula.text);
+    }
+
+    #[test]
+    fn locate_finds_block() {
+        let md = "# T\n## Intro\nWe propose a transformer model.\n## Method\nThe attention is key.\n";
+        let note = parse_markdown_note(md, "raw");
+        let b = note.locate("attention mechanism").expect("should locate");
+        assert!(b.text.to_lowercase().contains("attention"));
+    }
+
+    #[test]
+    fn explanations_attach_and_export() {
+        let md = "# T\n## Intro\nWe propose a transformer.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        // 定位并挂解释
+        let bid = note.locate("transformer").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "x".into(),
+            question: "什么是transformer?".into(),
+            answer: "一种基于注意力的模型。".into(),
+            concept: "transformer".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
+        let md_out = crate::export::to_markdown(&note);
+        assert!(md_out.contains("追问"), "export should include explanation: {md_out}");
+        assert!(md_out.contains("transformer"));
+        let mm = crate::export::to_mindmap(&note);
+        assert!(mm.contains("# T"), "mindmap: {mm}");
+    }
 }

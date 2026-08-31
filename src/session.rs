@@ -72,3 +72,55 @@ impl Session {
         Ok(sess)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::{Conversation, ConvNode};
+    use crate::notes::parse_markdown_note;
+
+    #[test]
+    fn session_save_load_roundtrip() {
+        let dir = std::env::temp_dir().join("paperhelper_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sess.json");
+
+        let note = parse_markdown_note("# 论文A\n## 引言\n内容\n", "rawA");
+        let mut conv = Conversation::default();
+        conv.add_exchange(ConvNode {
+            id: "n1".into(),
+            parent: None,
+            question: "什么是X?".into(),
+            answer: "X是…".into(),
+            block_id: None,
+            input_tokens: 10,
+            output_tokens: 20,
+            cost: 0.001,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            label: "什么是X?".into(),
+        });
+        conv.current = Some("n1".into());
+
+        let mut sess = Session {
+            notes: Some(note),
+            conversation: conv,
+            stats: SessionStats {
+                calls: 1,
+                total_input: 10,
+                total_output: 20,
+                total_cost: 0.001,
+            },
+            current_paper_id: Some("p1".into()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        sess.save(&path).unwrap();
+
+        let loaded = Session::load(&path).unwrap();
+        assert!(loaded.notes.is_some());
+        assert_eq!(loaded.conversation.nodes.len(), 1);
+        assert_eq!(loaded.stats.calls, 1);
+        assert_eq!(loaded.conversation.current.as_deref(), Some("n1"));
+        let _ = std::fs::remove_file(&path);
+    }
+}

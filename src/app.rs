@@ -2,18 +2,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::conversation::{Conversation, ConvNode};
+use crate::conversation::ConvNode;
 use crate::export;
 use crate::interrupt;
 use crate::knowledge::{Concept, KnowledgeBase, Paper};
 use crate::llm::{self, Message};
-use crate::notes::{self, BlockKind, Explanation};
+use crate::notes::{self, Explanation};
 use crate::pdf;
-use crate::session::{Session, SessionStats};
+use crate::session::Session;
 
 const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。";
 
@@ -207,9 +207,7 @@ PaperHelper 命令：
 
     async fn cmd_note(&self) -> Result<()> {
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
-        let mut s = format!("# {}\n\n", note.title);
-        print_block(&note.blocks, 0, &mut s);
-        println!("{s}");
+        println!("{}", export::to_markdown(note));
         Ok(())
     }
 
@@ -329,7 +327,8 @@ PaperHelper 命令：
         bar.enable_steady_tick(Duration::from_millis(100));
         let pages = pdf::extract_pages(p)?;
         let raw_text = pages.join("\n\n");
-        bar.finish_with_message(format!("PDF 已解析: {} 页, {} 字符", pages.len(), raw_text.chars().count()));
+        bar.finish_and_clear();
+        println!("✓ PDF 已解析: {} 页, {} 字符", pages.len(), raw_text.chars().count());
 
         if interrupt::is_interrupted() {
             bail!("已打断");
@@ -616,20 +615,3 @@ fn mask_key(k: &str) -> String {
     }
 }
 
-fn print_block(blocks: &[notes::Block], depth: usize, s: &mut String) {
-    use notes::Block;
-    for b in blocks {
-        match b.kind {
-            BlockKind::Section => {
-                let lvl = (depth + 2).min(6);
-                s.push_str(&format!("{} {}\n\n", "#".repeat(lvl), b.text));
-            }
-            BlockKind::Paragraph => s.push_str(&format!("{}\n\n", b.text)),
-            BlockKind::Formula => s.push_str(&format!("$$\n{}\n$$\n\n", b.text)),
-        }
-        for e in &b.explanations {
-            s.push_str(&format!("> **追问**：{}\n>\n> **解答**：{}\n\n", e.question, e.answer));
-        }
-        print_block(&b.children, depth + 1, s);
-    }
-}

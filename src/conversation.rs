@@ -35,15 +35,6 @@ impl Conversation {
         self.nodes.push(node);
     }
 
-    pub fn goto(&mut self, id: &str) -> bool {
-        if self.nodes.iter().any(|n| n.id == id) {
-            self.current = Some(id.to_string());
-            true
-        } else {
-            false
-        }
-    }
-
     /// 按 DFS 编号跳转（1-based）。返回跳转到的节点。
     pub fn goto_index(&mut self, idx: usize) -> Option<&ConvNode> {
         let target = self.dfs_order().get(idx.wrapping_sub(1))?.id.clone();
