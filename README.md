@@ -52,7 +52,7 @@ pip install pymupdf
 ```bash
 paperhelper                       # 进入 REPL
 > config set llm.api_key <你的key>
-> config set llm.model deepseek-chat
+> config set llm.model deepseek-v4-pro
 > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
 > config show                     # 查看（key 自动脱敏）
 ```
@@ -62,7 +62,7 @@ paperhelper                       # 进入 REPL
 cat > .env <<'EOF'
 PAPERHELPER_API_KEY=sk-xxxxxxxx
 PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-PAPERHELPER_MODEL=deepseek-chat
+PAPERHELPER_MODEL=deepseek-v4-pro
 PAPERHELPER_CONTEXT_LENGTH=64000
 EOF
 ```
@@ -71,7 +71,7 @@ EOF
 ```bash
 export PAPERHELPER_API_KEY=sk-xxxxxxxx
 export PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-export PAPERHELPER_MODEL=deepseek-chat
+export PAPERHELPER_MODEL=deepseek-v4-pro
 ```
 
 可配置项一览（`config set <key> <value>` 或 .env 同名大写变量）：
@@ -80,7 +80,7 @@ export PAPERHELPER_MODEL=deepseek-chat
 |--------|------|------|
 | `llm.api_key` | API 密钥 | `sk-...` |
 | `llm.api_endpoint` | OpenAI 兼容端点 | `https://api.deepseek.com/v1/chat/completions` |
-| `llm.model` | 模型名 | `deepseek-chat` |
+| `llm.model` | 模型名 | `deepseek-v4-pro` |
 | `llm.context_length` | 上下文长度（token） | `64000` |
 | `llm.thinking_mode` | 思考模式（reasoning_effort） | `true` |
 | `pricing.input_price_per_1m` | 输入单价（$/百万token） | `0.27` |

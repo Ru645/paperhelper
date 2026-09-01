@@ -49,9 +49,9 @@ impl App {
             }
             if default_endpoint {
                 println!("  > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions");
-                println!("  > config set llm.model deepseek-chat");
+                println!("  > config set llm.model deepseek-v4-pro");
             }
-            println!("  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-chat");
+            println!("  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
         }
         println!("输入 help 查看命令；exit 退出。Ctrl-C 可打断当前任务。\n");
 
@@ -169,7 +169,7 @@ PaperHelper 命令：
                               pricing.input_price_per_1m pricing.output_price_per_1m \
                               budget.token_budget");
                     println!("常见端点：");
-                    println!("  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-chat");
+                    println!("  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
                     println!("  OpenAI   : https://api.openai.com/v1/chat/completions    model=gpt-4o-mini");
                     println!("  本地Ollama: http://localhost:11434/v1/chat/completions    model=qwen2.5:7b");
                     return Ok(());

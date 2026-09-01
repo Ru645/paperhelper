@@ -34,7 +34,7 @@ pip install pymupdf
 # 配置大模型（.env 或交互式）
 paperhelper              # 进入 REPL
 > config set llm.api_key <你的key>
-> config set llm.model deepseek-chat
+> config set llm.model deepseek-v4-pro
 > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
 # 或写 .env：PAPERHELPER_API_KEY=... PAPERHELPER_API_ENDPOINT=... PAPERHELPER_MODEL=...
 
