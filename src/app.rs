@@ -37,8 +37,21 @@ impl App {
     pub async fn repl(&mut self) -> Result<()> {
         println!("=== PaperHelper 论文学习助手 ===");
         println!("模型: {} | 端点: {}", self.config.llm.model, self.config.llm.api_endpoint);
-        if self.config.llm.api_key.is_empty() {
-            println!("⚠️  未配置 API Key。运行 `config set llm.api_key <key>` 或设置 .env 的 PAPERHELPER_API_KEY。");
+
+        // 配置完整性检查：缺 key 或端点仍是默认 OpenAI 时给出引导
+        let need_key = self.config.llm.api_key.is_empty();
+        let default_endpoint = self.config.llm.api_endpoint
+            == "https://api.openai.com/v1/chat/completions";
+        if need_key || default_endpoint {
+            println!("⚠️  配置不完整，请先完成以下设置（或写 .env）：");
+            if need_key {
+                println!("  > config set llm.api_key <你的key>");
+            }
+            if default_endpoint {
+                println!("  > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions");
+                println!("  > config set llm.model deepseek-chat");
+            }
+            println!("  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-chat");
         }
         println!("输入 help 查看命令；exit 退出。Ctrl-C 可打断当前任务。\n");
 
@@ -155,11 +168,17 @@ PaperHelper 命令：
                               llm.thinking_mode llm.pdf_input \
                               pricing.input_price_per_1m pricing.output_price_per_1m \
                               budget.token_budget");
+                    println!("常见端点：");
+                    println!("  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-chat");
+                    println!("  OpenAI   : https://api.openai.com/v1/chat/completions    model=gpt-4o-mini");
+                    println!("  本地Ollama: http://localhost:11434/v1/chat/completions    model=qwen2.5:7b");
                     return Ok(());
                 }
                 self.set_config(key, val)?;
                 self.config.save()?;
-                println!("已设置 {key} = {val}（已写入 .paperhelper/config.toml）");
+                // api_key 脱敏回显，避免明文泄露
+                let display = if key == "llm.api_key" { mask_key(val) } else { val.to_string() };
+                println!("已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
             }
             _ => println!("用法: config [show | set <key> <value>]"),
         }
