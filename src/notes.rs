@@ -171,7 +171,11 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            flush_para(&mut para_buf, &mut roots, &mut stack);
+            // 空行不分割块：仅作段落内分隔（一个 section 下所有内容合成一块），
+            // 在 para_buf 中插入一个换行表示段落边界，但不 flush。
+            if !para_buf.is_empty() && !para_buf.ends_with('\n') {
+                para_buf.push('\n');
+            }
             i += 1;
             continue;
         }
@@ -336,14 +340,7 @@ mod tests {
         let md = "# Title\n## 1. Intro\nsome text\n## 2. Method\n### 2.1 Attn\npara1\n$$\nE=mc^2\n$$\npara2\n";
         let note = parse_markdown_note(md, "raw");
         assert_eq!(note.title, "Title");
-        assert!(note.count_blocks() >= 4, "blocks={}", note.count_blocks());
-        // 公式不再独立成块，应并入其所在段落
-        let has_formula_in_para = note
-            .flatten()
-            .iter()
-            .any(|(b, _)| b.text.contains("E=mc^2"));
-        assert!(has_formula_in_para, "公式应并入段落文本");
-        // 2.1 Attn 下应只有一个段落块（公式 + para1 + para2 合一），不被切开
+        // 一个 section 下所有段落+公式合成一块
         let flat = note.flatten();
         let attn = flat
             .iter()
@@ -351,6 +348,8 @@ mod tests {
             .expect("find para");
         assert!(attn.0.text.contains("E=mc^2"), "公式与段落应在同一块");
         assert!(attn.0.text.contains("para2"), "后续段落也合并进来");
+        // 不应有独立的 Formula 块
+        assert!(!flat.iter().any(|(b, _)| b.kind == BlockKind::Formula));
     }
     #[test]
     fn locate_finds_block() {
@@ -362,21 +361,25 @@ mod tests {
 
     #[test]
     fn formula_merges_into_preceding_paragraph() {
-        // 模拟真实 LLM 输出：公式前后有空行
+        // 模拟真实 LLM 输出：公式前后有空行，但同一 section 下应合成一块
         let md = "# T\n## M\nThe entropy is defined as:\n\n$$\nH = -\\sum p \\ln p\n$$\n\nThis means high uncertainty.\n";
         let note = parse_markdown_note(md, "raw");
-        // 公式应并入前一段"The entropy..."，而不是独立成块
         let flat = note.flatten();
-        let entropy_block = flat
+        // section M 下应只有一块，含全部文字与公式
+        let m_block = flat
             .iter()
             .find(|(b, _)| b.text.contains("entropy"))
             .expect("find entropy block");
         assert!(
-            entropy_block.0.text.contains("H = -"),
-            "公式应并入前一段: {}",
-            entropy_block.0.text
+            m_block.0.text.contains("H = -"),
+            "公式应在同一块内: {}",
+            m_block.0.text
         );
-        // 确认没有独立的 Formula 块
+        assert!(
+            m_block.0.text.contains("high uncertainty"),
+            "后续段落也合并进同一块: {}",
+            m_block.0.text
+        );
         assert!(
             !flat.iter().any(|(b, _)| b.kind == BlockKind::Formula),
             "不应有独立 Formula 块"
