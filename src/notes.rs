@@ -212,13 +212,13 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         }
 
         // 公式块 $$ ... $$（可能跨行）
+        // 公式视为所在段落的一部分，不单独切块、不分割段落：
+        //  - 若当前正在累积段落（para_buf 非空），直接追加进去；
+        //  - 若 para_buf 已被空行 flush，则并入最近一个段落块的文本末尾。
         if trimmed.starts_with("$$") {
-            flush_para(&mut para_buf, &mut roots, &mut stack);
             let mut content = String::new();
-            // 处理首行：$$...$$ 单行闭合，或 $$... 开头
             let first_inner = trimmed.strip_prefix("$$").unwrap_or(trimmed);
             if first_inner.trim().ends_with("$$") {
-                // 单行 $$...$$
                 let mid = first_inner.trim().strip_suffix("$$").unwrap_or(first_inner).trim();
                 if !mid.is_empty() {
                     content.push_str(mid);
@@ -227,7 +227,6 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 content.push_str(first_inner.trim());
                 content.push('\n');
             }
-            // 若未闭合，继续收集到含 $$ 的行
             if !trimmed[2..].contains("$$") || trimmed.len() == 2 {
                 while i + 1 < lines.len() {
                     i += 1;
@@ -244,17 +243,29 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                     content.push('\n');
                 }
             }
-            let block = Block {
-                id: uid(),
-                kind: BlockKind::Formula,
-                text: content.trim().to_string(),
-                children: Vec::new(),
-                explanations: Vec::new(),
-            };
-            if let Some(sec) = stack.last_mut() {
-                sec.children.push(block);
+            let formula_text = format!("$$\n{}\n$$", content.trim());
+            if !para_buf.is_empty() {
+                para_buf.push('\n');
+                para_buf.push_str(&formula_text);
             } else {
-                roots.push(block);
+                // 并入最近一个段落块（跳过被空行隔开的情况）
+                let target: Option<&mut Block> = if let Some(sec) = stack.last_mut() {
+                    sec.children.last_mut()
+                } else {
+                    roots.last_mut()
+                };
+                match target {
+                    Some(b) if b.kind == BlockKind::Paragraph => {
+                        if !b.text.is_empty() {
+                            b.text.push('\n');
+                        }
+                        b.text.push_str(&formula_text);
+                    }
+                    _ => {
+                        // 前面没有段落（如 section 开头），公式作为新段落累积
+                        para_buf.push_str(&formula_text);
+                    }
+                }
             }
             i += 1;
             continue;
@@ -325,21 +336,51 @@ mod tests {
         let md = "# Title\n## 1. Intro\nsome text\n## 2. Method\n### 2.1 Attn\npara1\n$$\nE=mc^2\n$$\npara2\n";
         let note = parse_markdown_note(md, "raw");
         assert_eq!(note.title, "Title");
-        assert!(note.count_blocks() >= 5, "blocks={}", note.count_blocks());
-        let kinds: Vec<_> = note.flatten().iter().map(|(b, _)| b.kind.clone()).collect();
-        assert!(kinds.contains(&BlockKind::Section));
-        assert!(kinds.contains(&BlockKind::Formula));
-        assert!(kinds.contains(&BlockKind::Paragraph));
-        let formula = note.flatten().iter().find(|(b, _)| b.kind == BlockKind::Formula).unwrap().0;
-        assert!(formula.text.contains("E=mc^2"), "formula text={}", formula.text);
+        assert!(note.count_blocks() >= 4, "blocks={}", note.count_blocks());
+        // 公式不再独立成块，应并入其所在段落
+        let has_formula_in_para = note
+            .flatten()
+            .iter()
+            .any(|(b, _)| b.text.contains("E=mc^2"));
+        assert!(has_formula_in_para, "公式应并入段落文本");
+        // 2.1 Attn 下应只有一个段落块（公式 + para1 + para2 合一），不被切开
+        let flat = note.flatten();
+        let attn = flat
+            .iter()
+            .find(|(b, _)| b.text.contains("para1"))
+            .expect("find para");
+        assert!(attn.0.text.contains("E=mc^2"), "公式与段落应在同一块");
+        assert!(attn.0.text.contains("para2"), "后续段落也合并进来");
     }
-
     #[test]
     fn locate_finds_block() {
         let md = "# T\n## Intro\nWe propose a transformer model.\n## Method\nThe attention is key.\n";
         let note = parse_markdown_note(md, "raw");
         let b = note.locate("attention mechanism").expect("should locate");
         assert!(b.text.to_lowercase().contains("attention"));
+    }
+
+    #[test]
+    fn formula_merges_into_preceding_paragraph() {
+        // 模拟真实 LLM 输出：公式前后有空行
+        let md = "# T\n## M\nThe entropy is defined as:\n\n$$\nH = -\\sum p \\ln p\n$$\n\nThis means high uncertainty.\n";
+        let note = parse_markdown_note(md, "raw");
+        // 公式应并入前一段"The entropy..."，而不是独立成块
+        let flat = note.flatten();
+        let entropy_block = flat
+            .iter()
+            .find(|(b, _)| b.text.contains("entropy"))
+            .expect("find entropy block");
+        assert!(
+            entropy_block.0.text.contains("H = -"),
+            "公式应并入前一段: {}",
+            entropy_block.0.text
+        );
+        // 确认没有独立的 Formula 块
+        assert!(
+            !flat.iter().any(|(b, _)| b.kind == BlockKind::Formula),
+            "不应有独立 Formula 块"
+        );
     }
 
     #[test]

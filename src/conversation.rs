@@ -79,42 +79,69 @@ impl Conversation {
         path
     }
 
-    /// 以文件树样式渲染整棵对话树，当前节点用 * 标记。
-    /// 每个节点前带 `[n]` 编号（DFS 顺序），可用 `goto n` 跳转。
+    /// 以树形（类似 `tree` 命令）渲染整棵对话树，当前节点用 * 标记。
+    /// 每个节点带 `[n]` 编号（DFS 顺序，标号在缩进之后），可用 `goto n` 跳转。
     pub fn render_tree(&self) -> String {
         let order = self.dfs_order();
-        let mut out = String::new();
         if order.is_empty() {
-            out.push_str("（对话树为空，先用 ask 提问）\n");
-            return out;
+            return "（对话树为空，先用 ask 提问）\n".to_string();
         }
+        // id -> 1-based DFS 编号
+        let mut num: HashMap<&str, usize> = HashMap::new();
         for (i, n) in order.iter().enumerate() {
-            let depth = self.depth_of(&n.id);
-            let prefix = if depth == 0 {
-                String::new()
+            num.insert(n.id.as_str(), i + 1);
+        }
+        // parent -> children
+        let mut children: HashMap<Option<&str>, Vec<&ConvNode>> = HashMap::new();
+        for n in &self.nodes {
+            children.entry(n.parent.as_deref()).or_default().push(n);
+        }
+        let mut out = String::new();
+        self.render_sub(None, &children, &mut Vec::new(), &num, &mut out);
+        out
+    }
+
+    fn render_sub(
+        &self,
+        parent: Option<&str>,
+        children: &HashMap<Option<&str>, Vec<&ConvNode>>,
+        prefix: &mut Vec<&'static str>,
+        num: &HashMap<&str, usize>,
+        out: &mut String,
+    ) {
+        let Some(sibs) = children.get(&parent) else {
+            return;
+        };
+        let total = sibs.len();
+        for (i, node) in sibs.iter().enumerate() {
+            let is_last = i == total - 1;
+            // 根级节点不带连接符；子级带 ├── / └──
+            let conn = if parent.is_none() {
+                ""
+            } else if is_last {
+                "└── "
             } else {
-                format!("{}  ", "│ ".repeat(depth - 1))
+                "├── "
             };
-            let branch = if depth == 0 { "" } else { "├─ " };
-            let mark = if self.current.as_deref() == Some(n.id.as_str()) {
+            let head: String = prefix.iter().cloned().collect::<String>() + conn;
+            let n_num = num.get(node.id.as_str()).copied().unwrap_or(0);
+            let mark = if self.current.as_deref() == Some(node.id.as_str()) {
                 " *"
             } else {
                 ""
             };
-            let id_short = n.id.get(..6).unwrap_or(&n.id);
-            let tok = if n.input_tokens + n.output_tokens > 0 {
-                format!("  [{}→{} tok ${:.4}]", n.input_tokens, n.output_tokens, n.cost)
+            let tok = if node.input_tokens + node.output_tokens > 0 {
+                format!("  [{}→{} tok ${:.4}]", node.input_tokens, node.output_tokens, node.cost)
             } else {
                 String::new()
             };
-            out.push_str(&format!(
-                "{prefix}{branch}[{}] ({}) {}{mark}{tok}\n",
-                i + 1,
-                id_short,
-                n.label
-            ));
+            out.push_str(&format!("{}[{}] {}{}{}\n", head, n_num, node.label, mark, tok));
+            // 下一层前缀：本层若不是最后一个孩子，则画竖线；否则留空
+            let child_entry: &'static str = if is_last { "    " } else { "│   " };
+            prefix.push(child_entry);
+            self.render_sub(Some(node.id.as_str()), children, prefix, num, out);
+            prefix.pop();
         }
-        out
     }
 
     /// DFS 顺序（根优先）的所有节点引用。
@@ -140,19 +167,5 @@ impl Conversation {
                 self.collect(Some(n.id.clone()), children, out);
             }
         }
-    }
-
-    fn depth_of(&self, id: &str) -> usize {
-        let mut depth = 0;
-        let mut cur = Some(id.to_string());
-        while let Some(cid) = cur {
-            if let Some(node) = self.nodes.iter().find(|n| n.id == cid) {
-                depth += 1;
-                cur = node.parent.clone();
-            } else {
-                break;
-            }
-        }
-        depth
     }
 }

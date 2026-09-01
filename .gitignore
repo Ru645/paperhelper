@@ -4,3 +4,4 @@ session.json
 .env
 .paperhelper/
 samples/
+*.log
