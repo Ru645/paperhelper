@@ -15,3 +15,5 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 futures-util = "0.3"
 dotenvy = "0.15"
+owo-colors = "4"
+rustyline = "14"

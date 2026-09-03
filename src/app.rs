@@ -1,7 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::io::{self, BufRead, Write};
+use owo_colors::OwoColorize;
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::MatchingBracketHighlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::MatchingBracketValidator;
+use rustyline::{Cmd, Editor, KeyEvent, Helper};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,6 +24,74 @@ use crate::pdf;
 use crate::session::Session;
 
 const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。";
+
+const COMMANDS: &[&str] = &[
+    "ingest", "ask", "blocks", "note", "tree", "goto", "stats", "budget",
+    "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
+];
+
+/// 命令补全器：补全第一个单词（命令名）。
+struct CommandCompleter;
+
+impl Completer for CommandCompleter {
+    type Candidate = String;
+    fn complete(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
+        let start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let word = &line[start..pos];
+        if line[..start].trim().is_empty() {
+            let matches: Vec<String> = COMMANDS
+                .iter()
+                .filter(|c| c.starts_with(word))
+                .map(|c| c.to_string())
+                .collect();
+            Ok((start, matches))
+        } else {
+            Ok((start, Vec::new()))
+        }
+    }
+}
+
+/// rustyline Helper：命令补全 + 括号高亮/校验。
+struct PaperHelperHelper {
+    completer: CommandCompleter,
+    highlighter: MatchingBracketHighlighter,
+    validator: MatchingBracketValidator,
+}
+
+impl Helper for PaperHelperHelper {}
+
+impl Completer for PaperHelperHelper {
+    type Candidate = String;
+    fn complete(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
+
+impl Hinter for PaperHelperHelper {
+    type Hint = String;
+}
+
+impl rustyline::highlight::Highlighter for PaperHelperHelper {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+}
+
+impl rustyline::validate::Validator for PaperHelperHelper {
+    fn validate(&self, ctx: &mut rustyline::validate::ValidationContext<'_>) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        self.validator.validate(ctx)
+    }
+}
+
+impl PaperHelperHelper {
+    fn new() -> Self {
+        Self {
+            completer: CommandCompleter,
+            highlighter: MatchingBracketHighlighter::new(),
+            validator: MatchingBracketValidator::new(),
+        }
+    }
+}
 
 pub struct App {
     pub config: Config,
@@ -35,15 +111,21 @@ impl App {
     }
 
     pub async fn repl(&mut self) -> Result<()> {
-        println!("=== PaperHelper 论文学习助手 ===");
-        println!("模型: {} | 端点: {}", self.config.llm.model, self.config.llm.api_endpoint);
+        println!("{}", "=== PaperHelper 论文学习助手 ===".bold().cyan());
+        println!(
+            "{} {} | {} {}",
+            "模型:".dimmed(),
+            self.config.llm.model.green(),
+            "端点:".dimmed(),
+            self.config.llm.api_endpoint.green(),
+        );
 
         // 配置完整性检查：缺 key 或端点仍是默认 OpenAI 时给出引导
         let need_key = self.config.llm.api_key.is_empty();
         let default_endpoint = self.config.llm.api_endpoint
             == "https://api.openai.com/v1/chat/completions";
         if need_key || default_endpoint {
-            println!("⚠️  配置不完整，请先完成以下设置（或写 .env）：");
+            println!("{}", "⚠️  配置不完整，请先完成以下设置（或写 .env）：".yellow());
             if need_key {
                 println!("  > config set llm.api_key <你的key>");
             }
@@ -53,37 +135,54 @@ impl App {
             }
             println!("  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
         }
-        println!("输入 help 查看命令；exit 退出。Ctrl-C 可打断当前任务。\n");
+        println!("{}  help 查看命令；exit 退出。Ctrl-C 打断当前任务，↑↓ 切换历史，Tab 补全。\n",
+            "输入".dimmed());
 
-        let stdin = io::stdin();
+        let hist_path = crate::paths::data_dir().join("history.txt");
+        let mut rl = Editor::<PaperHelperHelper, DefaultHistory>::new()?;
+        rl.set_helper(Some(PaperHelperHelper::new()));
+        // 绑定 Ctrl-C 为中断信号（不打断程序，只取消当前输入/任务）
+        rl.bind_sequence(KeyEvent::ctrl('c'), Cmd::Interrupt);
+        let _ = rl.load_history(&hist_path);
+
         loop {
             let cur = self.session.conversation.current_label().to_string();
-            let prompt = format!("paperhelper [{}]> ", short(&cur, 20));
-            print!("{}", prompt);
-            io::stdout().flush()?;
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => {
+            let prompt = format!(
+                "{} [{}]> ",
+                "paperhelper".bold().cyan(),
+                short(&cur, 20).purple(),
+            );
+            let readline = rl.readline(&prompt);
+            match readline {
+                Ok(line) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let _ = rl.add_history_entry(line);
+                    if matches!(line, "exit" | "quit") {
+                        break;
+                    }
+                    if let Err(e) = self.run_command(line).await {
+                        eprintln!("{} {e:#}", "❌".red());
+                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl-C：打断当前 LLM 任务（如果有），不退出
+                    if !interrupt::is_interrupted() {
+                        eprintln!("{}", "[已打断当前任务]".yellow());
+                    }
+                }
+                Err(ReadlineError::Eof) => {
                     println!();
                     break;
                 }
-                Ok(_) => {}
                 Err(e) => {
-                    eprintln!("读取输入失败: {e}");
-                    continue;
+                    eprintln!("{} 读取输入失败: {e}", "❌".red());
                 }
             }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if matches!(line, "exit" | "quit") {
-                break;
-            }
-            if let Err(e) = self.run_command(line).await {
-                eprintln!("❌ {e:#}");
-            }
         }
+        let _ = rl.save_history(&hist_path);
         Ok(())
     }
 
@@ -348,7 +447,7 @@ PaperHelper 命令：
         let pages = pdf::extract_pages(p)?;
         let raw_text = pages.join("\n\n");
         bar.finish_and_clear();
-        println!("✓ PDF 已解析: {} 页, {} 字符", pages.len(), raw_text.chars().count());
+        println!("{} PDF 已解析: {} 页, {} 字符", "✓".green().bold(), pages.len(), raw_text.chars().count());
 
         if interrupt::is_interrupted() {
             bail!("已打断");
@@ -405,7 +504,7 @@ PaperHelper 命令：
         let note = notes::parse_markdown_note(&res.content, &raw_clone);
         let title = note.title.clone();
         let nblocks = note.count_blocks();
-        println!("✓ 笔记已生成: 《{}》({} 个结构块)", title, nblocks);
+        println!("{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
 
         // 5. 注册到知识库
         let paper_id = uuid::Uuid::new_v4().to_string();
@@ -477,7 +576,7 @@ PaperHelper 命令：
         let ctx = self.config.llm.context_length;
         let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4;
         if base_tokens > ctx {
-            eprintln!("⚠️ 论文+笔记约 {} token，超过模型上下文 {}，可能报错。建议换更大上下文的模型。", base_tokens, ctx);
+            eprintln!("{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。建议换更大上下文的模型。", "⚠️ ".yellow(), base_tokens, ctx);
         }
         let mut kept = path.clone();
         let mut used = 0usize;
@@ -495,7 +594,7 @@ PaperHelper 命令：
         let dropped = drop_idx;
         let kept_pairs: Vec<(String, String)> = kept.drain(drop_idx..).collect();
         if dropped > 0 {
-            eprintln!("（上下文偏长，已省略最早 {} 轮对话）", dropped);
+            eprintln!("{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
         }
 
         let mut msgs = vec![
