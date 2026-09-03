@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::conversation::ConvNode;
+use crate::conversation::{Conversation, ConvNode};
 use crate::export;
 use crate::interrupt;
 use crate::knowledge::{Concept, KnowledgeBase, Paper};
@@ -420,6 +420,24 @@ PaperHelper 命令：
             read_at: Utc::now().to_rfc3339(),
         });
         self.kb.save()?;
+
+        // 6. 创建对话树的 0 号根节点（代表"论文已导入、尚未追问"状态）
+        let root_id = uuid::Uuid::new_v4().to_string();
+        self.session.conversation = Conversation::default();
+        self.session.conversation.add_exchange(ConvNode {
+            id: root_id.clone(),
+            parent: None,
+            question: format!("（导入论文《{}》，生成笔记，{} 个结构块）", title, nblocks),
+            answer: String::new(),
+            block_id: None,
+            input_tokens: res.input_tokens,
+            output_tokens: res.output_tokens,
+            cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
+                + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
+            created_at: Utc::now().to_rfc3339(),
+            label: format!("导入《{}》", title),
+        });
+        self.session.conversation.current = Some(root_id);
         Ok(())
     }
 
