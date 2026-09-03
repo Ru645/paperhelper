@@ -84,13 +84,9 @@ impl Note {
     }
 
     /// 用关键词重叠度定位最相关的块（Rust 确定性逻辑）。
+    /// 支持中英文混排：英文按单词切分，中文按 2-gram 切分，避免"BERTScore是什么"被当成一个词。
     pub fn locate(&self, query: &str) -> Option<&Block> {
-        let terms: Vec<String> = query
-            .to_lowercase()
-            .split_whitespace()
-            .filter(|t| t.chars().count() >= 2)
-            .map(|t| t.to_string())
-            .collect();
+        let terms = tokenize_query(query);
         if terms.is_empty() {
             return None;
         }
@@ -132,6 +128,51 @@ impl Note {
 
 fn uid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 把查询切分为关键词用于 locate 定位。
+/// 英文：连续 ASCII 字母数字为单词（≥2 字符）；中文：2-gram（连续汉字每 2 字一组）。
+/// 过滤常见无意义词。注意：Rust 的 is_alphanumeric 对汉字返回 true，需显式排除 CJK。
+fn tokenize_query(query: &str) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut terms: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = q.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            buf.push(c);
+        } else {
+            if !buf.is_empty() {
+                if buf.chars().count() >= 2 {
+                    terms.push(buf.clone());
+                }
+                buf.clear();
+            }
+            // 中文 2-gram：连续 CJK 字符两两组合
+            if is_cjk(c) {
+                let mut gram = String::new();
+                gram.push(c);
+                if let Some(&next) = chars.peek() {
+                    if is_cjk(next) {
+                        gram.push(next);
+                        chars.next();
+                        terms.push(gram);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    if !buf.is_empty() && buf.chars().count() >= 2 {
+        terms.push(buf);
+    }
+    const STOP: &[&str] = &["什么", "怎么", "为什么", "如何", "这个", "那个", "可以", "一下", "请问", "是什么", "the", "is", "a", "an", "of", "to", "in"];
+    terms.retain(|t| !STOP.iter().any(|s| s == t));
+    terms
+}
+
+fn is_cjk(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
 /// 解析 LLM 输出的 Markdown 为笔记树。
@@ -357,6 +398,15 @@ mod tests {
         let note = parse_markdown_note(md, "raw");
         let b = note.locate("attention mechanism").expect("should locate");
         assert!(b.text.to_lowercase().contains("attention"));
+    }
+
+    #[test]
+    fn locate_chinese_query() {
+        // 模拟中文无空格提问"BERTScore是什么"，应切出 bertscore 并命中
+        let md = "# T\n## BERTScore\n对句子 r_i 用 BERTScore 计算相似度。\n## Other\n无关内容\n";
+        let note = parse_markdown_note(md, "raw");
+        let b = note.locate("BERTScore是什么").expect("应命中 BERTScore 块");
+        assert!(b.text.contains("BERTScore"), "命中的块应含 BERTScore");
     }
 
     #[test]
