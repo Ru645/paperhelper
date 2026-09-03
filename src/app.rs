@@ -314,12 +314,13 @@ PaperHelper 命令：
 
     async fn cmd_blocks(&self) -> Result<()> {
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记，先 `ingest <pdf>`"))?;
-        for (i, (b, depth)) in note.flatten().iter().enumerate() {
-            let indent = "  ".repeat(*depth);
+        for (b, depth) in note.flatten() {
+            let indent = "  ".repeat(depth);
             let text: String = b.text.chars().take(60).collect();
             let nexpl = b.explanations.len();
             let expl = if nexpl > 0 { format!("  [{}条解释]", nexpl) } else { String::new() };
-            println!("{:>3}. {}{} {} {}{}", i, indent, b.kind.tag(), text, "", expl);
+            let num = if b.number.is_empty() { format!("{:>6}", "") } else { format!("{:>6}", b.number) };
+            println!("{} {}{} {} {}{}", num, indent, b.kind.tag(), text, "", expl);
         }
         Ok(())
     }
@@ -541,9 +542,10 @@ PaperHelper 命令：
     }
 
     async fn cmd_ask(&mut self, args: &str) -> Result<()> {
-        let question = args.trim();
+        let (block_num, question) = parse_ask_args(args);
+        let question = question.trim();
         if question.is_empty() {
-            bail!("用法: ask <你的问题>");
+            bail!("用法: ask [编号] <你的问题>   例: ask 3.2 BERTScore是什么");
         }
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
@@ -555,10 +557,17 @@ PaperHelper 命令：
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
 
-        // 1. 取出笔记原文 + 定位最相关 block（确定性 Rust 逻辑）
+        // 1. 取出笔记原文 + 定位 block
+        //    - 若用户给了编号(如 "3.2")：按编号精确匹配 Section
+        //    - 否则：退化为关键词匹配 locate
         let (raw_text, notes_md, block_id) = {
             let note = self.session.notes.as_ref().unwrap();
-            let blk = note.locate(question);
+            let blk = if let Some(num) = &block_num {
+                note.find_section_by_number(num)
+                    .or_else(|| note.locate(question))
+            } else {
+                note.locate(question)
+            };
             let bid = blk.map(|b| b.id.clone());
             (note.raw_text.clone(), note.to_markdown(), bid)
         };
@@ -644,16 +653,29 @@ PaperHelper 命令：
         self.record_usage(res.input_tokens, res.output_tokens);
 
         // 7. 把解释插入笔记对应 block
+        //    若定位到的是 Section，挂到该 section 下第一个段落块；否则直接挂到该块。
         if let Some(bid) = &block_id {
             if let Some(note) = self.session.notes.as_mut() {
-                if let Some(b) = note.find_block_mut(bid) {
-                    b.explanations.push(Explanation {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        question: question.to_string(),
-                        answer: res.content.clone(),
-                        concept: derive_concept(question),
-                        created_at: Utc::now().to_rfc3339(),
-                    });
+                let target_id = note.find_block(bid).and_then(|b| {
+                    if b.kind == notes::BlockKind::Section {
+                        b.children
+                            .iter()
+                            .find(|c| c.kind == notes::BlockKind::Paragraph)
+                            .map(|c| c.id.clone())
+                    } else {
+                        Some(b.id.clone())
+                    }
+                });
+                if let Some(tid) = target_id {
+                    if let Some(b) = note.find_block_mut(&tid) {
+                        b.explanations.push(Explanation {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            question: question.to_string(),
+                            answer: res.content.clone(),
+                            concept: derive_concept(question),
+                            created_at: Utc::now().to_rfc3339(),
+                        });
+                    }
                 }
             }
         }
@@ -743,6 +765,26 @@ fn spinner_style() -> ProgressStyle {
 }
 
 /// 用问题前若干字作为概念名 / 节点标签（免 token）。
+/// 解析 ask 参数：若第一个 token 形如 "3.2"（数字.数字...）则视为编号，
+/// 返回 (编号, 剩余问题)；否则返回 (None, 整个 args)。
+fn parse_ask_args(args: &str) -> (Option<String>, String) {
+    let args = args.trim();
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    if is_section_number(first) && !rest.trim().is_empty() {
+        (Some(first.to_string()), rest.to_string())
+    } else {
+        (None, args.to_string())
+    }
+}
+
+/// 判断是否是章节编号：如 "3", "3.2", "3.2.1"。
+fn is_section_number(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn derive_concept(q: &str) -> String {
     q.chars().take(20).collect()
 }

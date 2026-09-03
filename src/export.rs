@@ -11,7 +11,12 @@ fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
         match b.kind {
             BlockKind::Section => {
                 let level = (depth + 2).min(6);
-                s.push_str(&format!("{} {}\n\n", "#".repeat(level), b.text));
+                let title = if b.number.is_empty() {
+                    b.text.clone()
+                } else {
+                    format!("{} {}", b.number, b.text)
+                };
+                s.push_str(&format!("{} {}\n\n", "#".repeat(level), title));
             }
             BlockKind::Paragraph => {
                 s.push_str(&format!("{}\n\n", b.text));

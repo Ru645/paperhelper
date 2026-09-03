@@ -32,6 +32,9 @@ pub struct Block {
     pub id: String,
     pub kind: BlockKind,
     pub text: String,
+    /// 层级编号，如 "3.2"，仅 Section 有；Paragraph 无（空串）。
+    #[serde(default)]
+    pub number: String,
     #[serde(default)]
     pub children: Vec<Block>,
     #[serde(default)]
@@ -66,6 +69,21 @@ impl Note {
 
     pub fn count_blocks(&self) -> usize {
         self.flatten().len()
+    }
+
+    pub fn find_block(&self, id: &str) -> Option<&Block> {
+        fn walk<'a>(blocks: &'a [Block], id: &str) -> Option<&'a Block> {
+            for b in blocks {
+                if b.id == id {
+                    return Some(b);
+                }
+                if let Some(f) = walk(&b.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        walk(&self.blocks, id)
     }
 
     pub fn find_block_mut(&mut self, id: &str) -> Option<&mut Block> {
@@ -109,7 +127,12 @@ impl Note {
                 match b.kind {
                     BlockKind::Section => {
                         let level = (depth + 2).min(6);
-                        s.push_str(&format!("{} {}\n", "#".repeat(level), b.text));
+                        let title = if b.number.is_empty() {
+                            b.text.clone()
+                        } else {
+                            format!("{} {}", b.number, b.text)
+                        };
+                        s.push_str(&format!("{} {}\n", "#".repeat(level), title));
                     }
                     BlockKind::Paragraph => {
                         s.push_str(&format!("{}\n", b.text));
@@ -123,6 +146,33 @@ impl Note {
         }
         walk(&self.blocks, 0, &mut s);
         s
+    }
+
+    /// 按编号查找 Section 块（如 "3.2" 匹配 number=="3.2"）。
+    pub fn find_section_by_number(&self, num: &str) -> Option<&Block> {
+        for (b, _) in self.flatten() {
+            if b.kind == BlockKind::Section && b.number == num {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    /// 按编号查找 Section 块（可变）。
+    #[allow(dead_code)]
+    pub fn find_section_by_number_mut(&mut self, num: &str) -> Option<&mut Block> {
+        fn walk<'a>(blocks: &'a mut [Block], num: &str) -> Option<&'a mut Block> {
+            for b in blocks {
+                if b.kind == BlockKind::Section && b.number == num {
+                    return Some(b);
+                }
+                if let Some(f) = walk(&mut b.children, num) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        walk(&mut self.blocks, num)
     }
 }
 
@@ -194,6 +244,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 id: uid(),
                 kind: BlockKind::Paragraph,
                 text: buf.trim().to_string(),
+                number: String::new(),
                 children: Vec::new(),
                 explanations: Vec::new(),
             };
@@ -249,6 +300,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 id: uid(),
                 kind: BlockKind::Section,
                 text,
+                number: String::new(),
                 children: Vec::new(),
                 explanations: Vec::new(),
             });
@@ -345,17 +397,42 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
             id: uid(),
             kind: BlockKind::Paragraph,
             text: t,
+            number: String::new(),
             children: Vec::new(),
             explanations: Vec::new(),
         });
     }
 
-    Note {
+    let mut note = Note {
         paper_id: String::new(),
         title,
         blocks: roots,
         raw_text: raw_text.to_string(),
+    };
+    assign_numbers(&mut note);
+    note
+}
+
+/// 给每个 Section 块按层级分配编号（如 "3.2"），写进 block.number。
+/// Paragraph 不编号。在 parse 完成后调用一次，之后不变。
+fn assign_numbers(note: &mut Note) {
+    fn walk(blocks: &mut [Block], prefix: &[usize]) {
+        let mut idx = 0;
+        for b in blocks {
+            idx += 1;
+            if b.kind == BlockKind::Section {
+                let mut num = prefix.to_vec();
+                num.push(idx);
+                b.number = num
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                walk(&mut b.children, &num);
+            }
+        }
     }
+    walk(&mut note.blocks, &[]);
 }
 
 fn strip_fences(content: &str) -> &str {
@@ -402,7 +479,6 @@ mod tests {
 
     #[test]
     fn locate_chinese_query() {
-        // 模拟中文无空格提问"BERTScore是什么"，应切出 bertscore 并命中
         let md = "# T\n## BERTScore\n对句子 r_i 用 BERTScore 计算相似度。\n## Other\n无关内容\n";
         let note = parse_markdown_note(md, "raw");
         let b = note.locate("BERTScore是什么").expect("应命中 BERTScore 块");
@@ -410,37 +486,46 @@ mod tests {
     }
 
     #[test]
+    fn section_numbers_assigned() {
+        let md = "# T\n## A\npara\n## B\n### B1\npara\n### B2\npara\n## C\npara\n";
+        let note = parse_markdown_note(md, "raw");
+        let secs: Vec<&Block> = note.flatten().iter().map(|(b, _)| *b).filter(|b| b.kind == BlockKind::Section).collect();
+        let numbers: Vec<&str> = secs.iter().map(|s| s.number.as_str()).collect();
+        assert!(numbers.contains(&"1"), "A 应为 1: {:?}", numbers);
+        assert!(numbers.contains(&"2"), "B 应为 2: {:?}", numbers);
+        assert!(numbers.contains(&"2.1"), "B1 应为 2.1: {:?}", numbers);
+        assert!(numbers.contains(&"2.2"), "B2 应为 2.2: {:?}", numbers);
+        assert!(numbers.contains(&"3"), "C 应为 3: {:?}", numbers);
+        assert!(note.flatten().iter().all(|(b, _)| b.kind != BlockKind::Paragraph || b.number.is_empty()));
+    }
+
+    #[test]
+    fn find_section_by_number_works() {
+        let md = "# T\n## A\npara\n## B\n### B1\npara\n";
+        let note = parse_markdown_note(md, "raw");
+        let b = note.find_section_by_number("2.1").expect("应找到 2.1");
+        assert!(b.text.contains("B1"));
+        assert!(note.find_section_by_number("9.9").is_none());
+    }
+
+    #[test]
     fn formula_merges_into_preceding_paragraph() {
-        // 模拟真实 LLM 输出：公式前后有空行，但同一 section 下应合成一块
         let md = "# T\n## M\nThe entropy is defined as:\n\n$$\nH = -\\sum p \\ln p\n$$\n\nThis means high uncertainty.\n";
         let note = parse_markdown_note(md, "raw");
         let flat = note.flatten();
-        // section M 下应只有一块，含全部文字与公式
         let m_block = flat
             .iter()
             .find(|(b, _)| b.text.contains("entropy"))
             .expect("find entropy block");
-        assert!(
-            m_block.0.text.contains("H = -"),
-            "公式应在同一块内: {}",
-            m_block.0.text
-        );
-        assert!(
-            m_block.0.text.contains("high uncertainty"),
-            "后续段落也合并进同一块: {}",
-            m_block.0.text
-        );
-        assert!(
-            !flat.iter().any(|(b, _)| b.kind == BlockKind::Formula),
-            "不应有独立 Formula 块"
-        );
+        assert!(m_block.0.text.contains("H = -"), "公式应在同一块内: {}", m_block.0.text);
+        assert!(m_block.0.text.contains("high uncertainty"), "后续段落也合并进同一块: {}", m_block.0.text);
+        assert!(!flat.iter().any(|(b, _)| b.kind == BlockKind::Formula), "不应有独立 Formula 块");
     }
 
     #[test]
     fn explanations_attach_and_export() {
         let md = "# T\n## Intro\nWe propose a transformer.\n";
         let mut note = parse_markdown_note(md, "raw");
-        // 定位并挂解释
         let bid = note.locate("transformer").unwrap().id.clone();
         note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
             id: "x".into(),
