@@ -159,6 +159,7 @@ PaperHelper 命令：
                 println!("pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
                 println!("pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
                 println!("budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
+                println!("提示：api_endpoint 需是完整 URL（含 /chat/completions），如 https://api.deepseek.com/v1/chat/completions");
             }
             "set" => {
                 let (key, val) = split_cmd(args);

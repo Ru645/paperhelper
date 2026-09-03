@@ -54,6 +54,8 @@ paperhelper                       # 进入 REPL
 > config set llm.api_key <你的key>
 > config set llm.model deepseek-v4-pro
 > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
+```
+> 注意：`llm.api_endpoint` 需填**完整 URL**（含 `/chat/completions` 路径），不是 DeepSeek 文档里的 `base_url`。DeepSeek 文档写的 `base_url=https://api.deepseek.com` 是给 OpenAI SDK 用的，SDK 会自动补路径；本程序直接调用，需补全为 `https://api.deepseek.com/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`。
 > config show                     # 查看（key 自动脱敏）
 ```
 
@@ -79,7 +81,7 @@ export PAPERHELPER_MODEL=deepseek-v4-pro
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
 | `llm.api_key` | API 密钥 | `sk-...` |
-| `llm.api_endpoint` | OpenAI 兼容端点 | `https://api.deepseek.com/v1/chat/completions` |
+| `llm.api_endpoint` | OpenAI 兼容端点（完整 URL，不是 base_url） | `https://api.deepseek.com/v1/chat/completions` |
 | `llm.model` | 模型名 | `deepseek-v4-pro` |
 | `llm.context_length` | 上下文长度（token） | `64000` |
 | `llm.thinking_mode` | 思考模式（reasoning_effort） | `true` |
