@@ -186,6 +186,24 @@ impl App {
             }
         }
         let _ = rl.save_history(&hist_path);
+        // 退出时自动保存会话
+        self.autosave_on_exit()?;
+        Ok(())
+    }
+
+    /// 退出时自动保存会话到 .paperhelper/sessions/，用时间戳编号。
+    fn autosave_on_exit(&mut self) -> Result<()> {
+        if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
+            // 空会话不保存
+            return Ok(());
+        }
+        crate::paths::ensure_sessions_dir()?;
+        let id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let path = crate::paths::session_path(&id);
+        self.session.save(&path)?;
+        println!("{} 会话已自动保存：{}", "✓".green().bold(), id);
+        println!("  恢复方式：paperhelper -s {}", id);
+        println!("  查看所有会话：paperhelper -l");
         Ok(())
     }
 
@@ -243,7 +261,12 @@ PaperHelper 命令：
   config show              查看配置
   config set <k> <v>       设置(如 llm.api_key / llm.model / llm.context_length)
   new                      新建会话
-  exit                     退出";
+  exit                     退出（自动保存会话）
+
+启动方式：
+  paperhelper              新会话
+  paperhelper -s <编号>    恢复指定会话
+  paperhelper -l           列出所有已保存会话";
         println!("{h}");
         Ok(())
     }
