@@ -187,24 +187,78 @@ impl App {
         }
         let _ = rl.save_history(&hist_path);
         // 退出时自动保存会话
-        self.autosave_on_exit()?;
+        self.autosave_on_exit().await?;
         Ok(())
     }
 
-    /// 退出时自动保存会话到 .paperhelper/sessions/，用时间戳编号。
-    fn autosave_on_exit(&mut self) -> Result<()> {
+    /// 退出时自动保存会话到 .paperhelper/sessions/。
+    /// 若有笔记，调 LLM 取一个简短名字作为会话名；否则用时间戳。
+    async fn autosave_on_exit(&mut self) -> Result<()> {
         if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
-            // 空会话不保存
             return Ok(());
         }
         crate::paths::ensure_sessions_dir()?;
-        let id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+
+        // 让 LLM 给会话取个简短名字
+        let session_name = self.generate_session_name().await;
+        // 文件名安全化
+        let safe = sanitize_filename(&session_name);
+        // 避免重名：若已存在则加后缀
+        let mut id = safe.clone();
+        let mut suffix = 2;
+        while crate::paths::session_path(&id).exists() {
+            id = format!("{safe}_{suffix}");
+            suffix += 1;
+        }
         let path = crate::paths::session_path(&id);
         self.session.save(&path)?;
         println!("{} 会话已自动保存：{}", "✓".green().bold(), id);
         println!("  恢复方式：paperhelper -s {}", id);
         println!("  查看所有会话：paperhelper -l");
         Ok(())
+    }
+
+    /// 调 LLM 根据笔记标题+对话历史概括一个简短会话名（≤20字）。
+    async fn generate_session_name(&self) -> String {
+        let title = self
+            .session
+            .notes
+            .as_ref()
+            .map(|n| n.title.clone())
+            .unwrap_or_default();
+        let labels: Vec<String> = self
+            .session
+            .conversation
+            .path_to_current()
+            .iter()
+            .map(|n| n.label.clone())
+            .collect();
+        let summary = if labels.is_empty() {
+            title.clone()
+        } else {
+            format!("{title}；提问：{}", labels.join("、"))
+        };
+        let prompt = format!(
+            "请用不超过20个中文字/英文单词概括以下会话主题，只输出名字，不要解释：\n{summary}"
+        );
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: prompt,
+        }];
+        match llm::chat(&self.client, &self.config.llm, &msgs, false, false, &mut |_| {}).await {
+            Ok(res) => {
+                let name = res.content.trim().to_string();
+                if name.is_empty() {
+                    title.chars().take(20).collect()
+                } else {
+                    name
+                }
+            }
+            Err(_) => {
+                // LLM 调用失败，用时间戳兜底
+                chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
+            }
+        }
     }
 
     pub async fn run_command(&mut self, line: &str) -> Result<()> {
@@ -880,6 +934,24 @@ fn parse_ask_args(args: &str) -> (Option<String>, String) {
         (Some(first.to_string()), rest.to_string())
     } else {
         (None, args.to_string())
+    }
+}
+
+/// 文件名安全化：替换非法字符，限制长度。
+fn sanitize_filename(s: &str) -> String {
+    let s = s.trim();
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            _ => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '_' || c.is_whitespace()).to_string();
+    if cleaned.is_empty() {
+        "session".to_string()
+    } else {
+        cleaned.chars().take(40).collect()
     }
 }
 
