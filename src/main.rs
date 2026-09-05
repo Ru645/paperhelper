@@ -52,10 +52,24 @@ async fn main() -> Result<()> {
                 println!("（无已保存会话）");
             } else {
                 println!("已保存的会话：");
-                for s in &sessions {
-                    println!("  {s}");
+                println!("{:>4}  {:<30}  {}", "序号", "会话名", "保存时间");
+                for (i, s) in sessions.iter().enumerate() {
+                    let path = paths::session_path(s);
+                    let time = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| {
+                            t.duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| {
+                                    let dt = chrono::DateTime::from_timestamp(d.as_secs() as i64, 0).unwrap_or_default();
+                                    dt.format("%Y-%m-%d %H:%M").to_string()
+                                })
+                        })
+                        .unwrap_or_else(|| "未知".to_string());
+                    println!("{:>4}  {:<30}  {}", i + 1, s, time);
                 }
-                println!("用 paperhelper -s <编号> 恢复");
+                println!("用 paperhelper -s <会话名> 恢复");
             }
             return Ok(());
         }
