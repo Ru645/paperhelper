@@ -93,6 +93,7 @@ mod tests {
             question: "什么是X?".into(),
             answer: "X是…".into(),
             block_id: None,
+            explanation_id: None,
             input_tokens: 10,
             output_tokens: 20,
             cost: 0.001,

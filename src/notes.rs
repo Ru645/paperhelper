@@ -25,6 +25,8 @@ pub struct Explanation {
     pub answer: String,
     pub concept: String,
     pub created_at: String,
+    #[serde(default)]
+    pub children: Vec<Explanation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +176,78 @@ impl Note {
         }
         walk(&mut self.blocks, num)
     }
+
+    /// 递归查找指定 id 的 Explanation（可变），用于嵌套追问插入。
+    pub fn find_explanation_mut(&mut self, id: &str) -> Option<&mut Explanation> {
+        fn walk_expl<'a>(expls: &'a mut [Explanation], id: &str) -> Option<&'a mut Explanation> {
+            for e in expls {
+                if e.id == id {
+                    return Some(e);
+                }
+                if let Some(f) = walk_expl(&mut e.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        fn walk<'a>(blocks: &'a mut [Block], id: &str) -> Option<&'a mut Explanation> {
+            for b in blocks {
+                if let Some(f) = walk_expl(&mut b.explanations, id) {
+                    return Some(f);
+                }
+                if let Some(f) = walk(&mut b.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        walk(&mut self.blocks, id)
+    }
+}
+
+/// 去掉标题开头的编号前缀（如 "1.1 标题" → "标题"；"1.1 1.1 标题" → "标题"），
+/// 因为编号由 Rust 后处理统一赋值，避免 LLM 自带编号导致重复。
+/// 循环去除，防止 LLM 写了 "1.1 1.1" 这种重复。
+fn strip_leading_number(s: &str) -> String {
+    let mut s = s.trim().to_string();
+    loop {
+        let stripped = strip_one_leading_number(&s);
+        if stripped == s {
+            break;
+        }
+        s = stripped;
+    }
+    s
+}
+
+fn strip_one_leading_number(s: &str) -> String {
+    let s = s.trim();
+    let mut chars = s.chars().peekable();
+    let mut consumed = 0usize;
+    let mut saw_digit = false;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            chars.next();
+            consumed += c.len_utf8();
+        } else if c == '.' && saw_digit {
+            chars.next();
+            consumed += 1;
+        } else if c == ' ' && saw_digit {
+            chars.next();
+            consumed += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+    if saw_digit && consumed > 0 {
+        let rest = &s[consumed..];
+        if !rest.is_empty() {
+            return rest.trim().to_string();
+        }
+    }
+    s.to_string()
 }
 
 fn uid() -> String {
@@ -275,7 +349,8 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         // 标题行
         if trimmed.strip_prefix('#').is_some() {
             let level = trimmed.chars().take_while(|c| *c == '#').count();
-            let text = trimmed.trim_start_matches('#').trim().to_string();
+            let raw = trimmed.trim_start_matches('#').trim();
+            let text = strip_leading_number(raw);
             flush_para(&mut para_buf, &mut roots, &mut stack);
 
             if level == 1 {
@@ -509,6 +584,19 @@ mod tests {
     }
 
     #[test]
+    fn strips_llm_leading_number() {
+        // LLM 自带编号 "### 1.1 标题"，Rust 应去掉并用自己的编号
+        let md = "# T\n## 1 一、问题\npara\n### 1.1 1.1 细节\npara\n";
+        let note = parse_markdown_note(md, "raw");
+        let secs: Vec<&Block> = note.flatten().iter().map(|(b, _)| *b).filter(|b| b.kind == BlockKind::Section).collect();
+        for s in &secs {
+            assert!(!s.text.starts_with("1."), "标题不应含 LLM 残留编号: {}", s.text);
+        }
+        // 中文"一、"保留
+        assert!(secs.iter().any(|s| s.text.contains("一、问题")), "中文序号应保留: {:?}", secs.iter().map(|s| &s.text).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn formula_merges_into_preceding_paragraph() {
         let md = "# T\n## M\nThe entropy is defined as:\n\n$$\nH = -\\sum p \\ln p\n$$\n\nThis means high uncertainty.\n";
         let note = parse_markdown_note(md, "raw");
@@ -533,11 +621,66 @@ mod tests {
             answer: "一种基于注意力的模型。".into(),
             concept: "transformer".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            children: Vec::new(),
         });
         let md_out = crate::export::to_markdown(&note);
         assert!(md_out.contains("追问"), "export should include explanation: {md_out}");
         assert!(md_out.contains("transformer"));
         let mm = crate::export::to_mindmap(&note);
         assert!(mm.contains("# T"), "mindmap: {mm}");
+    }
+
+    #[test]
+    fn nested_explanation_export() {
+        // 顶层追问 + 嵌套子追问，验证导出时层级正确
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "p1".into(),
+            question: "这个方法是什么?".into(),
+            answer: "是方法A。".into(),
+            concept: "方法A".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            children: vec![Explanation {
+                id: "c1".into(),
+                question: "方法A的参数怎么调?".into(),
+                answer: "用默认值。".into(),
+                concept: "方法A参数".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                children: Vec::new(),
+            }],
+        });
+        let out = crate::export::to_markdown(&note);
+        // 顶层用 > ，子层用 > >
+        assert!(out.contains("> **追问**：这个方法是什么"), "应有顶层追问: {out}");
+        assert!(out.contains("> > **追问**：方法A的参数怎么调"), "应有嵌套追问: {out}");
+    }
+
+    #[test]
+    fn find_explanation_mut_works() {
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "root_expl".into(),
+            question: "Q1".into(),
+            answer: "A1".into(),
+            concept: "C1".into(),
+            created_at: "t".into(),
+            children: vec![Explanation {
+                id: "child_expl".into(),
+                question: "Q2".into(),
+                answer: "A2".into(),
+                concept: "C2".into(),
+                created_at: "t".into(),
+                children: Vec::new(),
+            }],
+        });
+        // 找到子解释并修改
+        let found = note.find_explanation_mut("child_expl").unwrap();
+        assert_eq!(found.question, "Q2");
+        // 找不到
+        assert!(note.find_explanation_mut("nonexistent").is_none());
     }
 }

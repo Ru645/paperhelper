@@ -12,6 +12,9 @@ pub struct ConvNode {
     pub answer: String,
     #[serde(default)]
     pub block_id: Option<String>,
+    /// 本节点创建的 Explanation 的 id（用于关联追问嵌套）。
+    #[serde(default)]
+    pub explanation_id: Option<String>,
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]

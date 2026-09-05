@@ -9,7 +9,7 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::MatchingBracketValidator;
 use rustyline::{Cmd, Editor, KeyEvent, Helper};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use crate::notes::{self, Explanation};
 use crate::pdf;
 use crate::session::Session;
 
-const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。";
+const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。\n\n回答完毕后，另起一行写 [[概念: 概念名]]，概念名是1-8个词的短语，概括本次问答涉及的核心知识点（如\"BERTScore\"、\"MQAG框架\"、\"语义熵\"）。";
 
 const COMMANDS: &[&str] = &[
     "ingest", "ask", "blocks", "note", "tree", "goto", "stats", "budget",
@@ -98,6 +98,8 @@ pub struct App {
     pub kb: KnowledgeBase,
     pub session: Session,
     pub client: reqwest::Client,
+    /// ask 后自动导出笔记的文件路径（ingest 时由用户指定）。
+    pub export_path: Option<String>,
 }
 
 impl App {
@@ -107,6 +109,7 @@ impl App {
             kb,
             session: Session::default(),
             client,
+            export_path: None,
         }
     }
 
@@ -223,8 +226,10 @@ impl App {
         let h = "\
 PaperHelper 命令：
   ingest <pdf>            解析 PDF 并生成结构化笔记
-  ask <问题>               基于论文全文+笔记回答，解释插入笔记对应位置
-  blocks                   列出笔记结构（带序号）
+  ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
+                          编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
+                          例: ask 3.2 BERTScore的公式里max_k是什么意思
+  blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
   goto <n|id前缀>          跳到对话树某节点，其根路径成为上下文
@@ -530,6 +535,7 @@ PaperHelper 命令：
             question: format!("（导入论文《{}》，生成笔记，{} 个结构块）", title, nblocks),
             answer: String::new(),
             block_id: None,
+            explanation_id: None,
             input_tokens: res.input_tokens,
             output_tokens: res.output_tokens,
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
@@ -538,14 +544,43 @@ PaperHelper 命令：
             label: format!("导入《{}》", title),
         });
         self.session.conversation.current = Some(root_id);
+
+        // 7. 询问用户导出文件名，首次生成 markdown 笔记文件
+        let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
+        print!("请输入笔记导出文件名（回车默认 {}）: ", default_name);
+        io::stdout().flush()?;
+        let mut name = String::new();
+        io::stdin().lock().read_line(&mut name)?;
+        let name = name.trim();
+        let path = if name.is_empty() { default_name.clone() } else { name.to_string() };
+        self.export_path = Some(path.clone());
+        if let Some(note) = &self.session.notes {
+            std::fs::write(&path, export::to_markdown(note))?;
+            println!("{} 笔记已导出到 {}", "✓".green().bold(), path);
+        }
         Ok(())
     }
 
     async fn cmd_ask(&mut self, args: &str) -> Result<()> {
+        let args = args.trim();
+        // ask --help：打印用法
+        if args == "--help" || args == "-h" || args.is_empty() {
+            println!("用法: ask <编号> <问题>");
+            println!("  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
+            println!("  <问题>    你的追问内容");
+            println!("例:");
+            println!("  ask 3.2 BERTScore的公式里max_k是什么意思");
+            println!("  ask 2.1 灰盒方法为什么对黑盒不适用");
+            println!("说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
+            return Ok(());
+        }
         let (block_num, question) = parse_ask_args(args);
         let question = question.trim();
         if question.is_empty() {
-            bail!("用法: ask [编号] <你的问题>   例: ask 3.2 BERTScore是什么");
+            bail!("用法: ask <编号> <问题>   例: ask 3.2 BERTScore是什么   (ask --help 看详情)");
+        }
+        if block_num.is_none() {
+            eprintln!("{} 未指定编号，将用关键词匹配定位（可能不准）。建议用 `ask <编号> <问题>`。", "⚠️ ".yellow());
         }
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
@@ -587,21 +622,21 @@ PaperHelper 命令：
         if base_tokens > ctx {
             eprintln!("{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。建议换更大上下文的模型。", "⚠️ ".yellow(), base_tokens, ctx);
         }
-        let mut kept = path.clone();
-        let mut used = 0usize;
+        // 从最近的对话往前保留，直到 token 用尽；最早的轮次被丢弃。
         let avail = ctx.saturating_sub(base_tokens + question.chars().count() / 4 + 200);
-        let mut drop_idx = 0;
-        while drop_idx < kept.len() {
-            let (q, a) = &kept[drop_idx];
+        let mut used = 0usize;
+        let mut keep_from = path.len();
+        while keep_from > 0 {
+            let (q, a) = &path[keep_from - 1];
             let t = (q.chars().count() + a.chars().count()) / 4;
             if used + t > avail {
                 break;
             }
             used += t;
-            drop_idx += 1;
+            keep_from -= 1;
         }
-        let dropped = drop_idx;
-        let kept_pairs: Vec<(String, String)> = kept.drain(drop_idx..).collect();
+        let dropped = keep_from;
+        let kept_pairs: Vec<(String, String)> = path[keep_from..].to_vec();
         if dropped > 0 {
             eprintln!("{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
         }
@@ -652,53 +687,90 @@ PaperHelper 命令：
         // 6. 记录统计
         self.record_usage(res.input_tokens, res.output_tokens);
 
-        // 7. 把解释插入笔记对应 block
-        //    若定位到的是 Section，挂到该 section 下第一个段落块；否则直接挂到该块。
-        if let Some(bid) = &block_id {
+        // 6.5 从 LLM 回答末尾提取概念名，去掉 [[概念:]] 标记行
+        let (clean_answer, concept_name) = extract_concept(&res.content, question);
+        let now = Utc::now().to_rfc3339();
+        let expl_id = uuid::Uuid::new_v4().to_string();
+
+        // 7. 把解释插入笔记
+        //    判断父节点类型：若父是对话节点且有 explanation_id → 嵌套追问；若父是根(导入)→ 顶层追问
+        let parent_node = self
+            .session
+            .conversation
+            .current
+            .as_ref()
+            .and_then(|id| self.session.conversation.nodes.iter().find(|n| n.id == *id).cloned());
+
+        let is_nested = parent_node
+            .as_ref()
+            .and_then(|p| p.explanation_id.as_ref())
+            .is_some();
+
+        if is_nested {
+            // 嵌套追问：找到父解释，插入其 children
+            let parent_expl_id = parent_node.as_ref().unwrap().explanation_id.as_ref().unwrap().clone();
             if let Some(note) = self.session.notes.as_mut() {
-                let target_id = note.find_block(bid).and_then(|b| {
-                    if b.kind == notes::BlockKind::Section {
-                        b.children
-                            .iter()
-                            .find(|c| c.kind == notes::BlockKind::Paragraph)
-                            .map(|c| c.id.clone())
-                    } else {
-                        Some(b.id.clone())
-                    }
-                });
-                if let Some(tid) = target_id {
-                    if let Some(b) = note.find_block_mut(&tid) {
-                        b.explanations.push(Explanation {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            question: question.to_string(),
-                            answer: res.content.clone(),
-                            concept: derive_concept(question),
-                            created_at: Utc::now().to_rfc3339(),
-                        });
+                if let Some(parent_expl) = note.find_explanation_mut(&parent_expl_id) {
+                    parent_expl.children.push(Explanation {
+                        id: expl_id.clone(),
+                        question: question.to_string(),
+                        answer: clean_answer.clone(),
+                        concept: concept_name.clone(),
+                        created_at: now.clone(),
+                        children: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            // 顶层追问：按 block_id 定位 block，插入顶层 explanations
+            if let Some(bid) = &block_id {
+                if let Some(note) = self.session.notes.as_mut() {
+                    let target_id = note.find_block(bid).and_then(|b| {
+                        if b.kind == notes::BlockKind::Section {
+                            b.children
+                                .iter()
+                                .find(|c| c.kind == notes::BlockKind::Paragraph)
+                                .map(|c| c.id.clone())
+                        } else {
+                            Some(b.id.clone())
+                        }
+                    });
+                    if let Some(tid) = target_id {
+                        if let Some(b) = note.find_block_mut(&tid) {
+                            b.explanations.push(Explanation {
+                                id: expl_id.clone(),
+                                question: question.to_string(),
+                                answer: clean_answer.clone(),
+                                concept: concept_name.clone(),
+                                created_at: now.clone(),
+                                children: Vec::new(),
+                            });
+                        }
                     }
                 }
             }
         }
 
-        // 8. 记录对话树节点（当前节点为父）
+        // 8. 记录对话树节点（当前节点为父），关联 explanation_id
         let parent = self.session.conversation.current.clone();
         let node_id = uuid::Uuid::new_v4().to_string();
         self.session.conversation.add_exchange(ConvNode {
             id: node_id.clone(),
             parent,
             question: question.to_string(),
-            answer: res.content.clone(),
-            block_id: block_id.clone(),
+            answer: clean_answer.clone(),
+            block_id: if is_nested { None } else { block_id.clone() },
+            explanation_id: Some(expl_id.clone()),
             input_tokens: res.input_tokens,
             output_tokens: res.output_tokens,
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
                 + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
-            created_at: Utc::now().to_rfc3339(),
-            label: derive_concept(question),
+            created_at: now.clone(),
+            label: concept_name.clone(),
         });
         self.session.conversation.current = Some(node_id);
 
-        // 9. 加入知识库概念
+        // 9. 加入知识库概念（用 LLM 提取的概念名）
         let (pid, ptitle) = self
             .session
             .current_paper_id
@@ -706,14 +778,23 @@ PaperHelper 命令：
             .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
             .unwrap_or_default();
         self.kb.add_concept(Concept {
-            name: derive_concept(question),
-            definition: res.content.chars().take(200).collect(),
+            name: concept_name.clone(),
+            definition: clean_answer.chars().take(200).collect(),
             paper_id: pid,
             paper_title: ptitle,
-            block_id,
-            created_at: Utc::now().to_rfc3339(),
+            block_id: if is_nested { None } else { block_id },
+            created_at: now,
         });
         self.kb.save()?;
+
+        // 自动更新导出的 markdown 文件
+        if let Some(p) = &self.export_path {
+            if let Some(note) = &self.session.notes {
+                if std::fs::write(p, export::to_markdown(note)).is_ok() {
+                    println!("{} 笔记已同步更新到 {}", "✓".green().bold(), p);
+                }
+            }
+        }
 
         if res.estimated {
             println!("[注: 本次 token 数为估算]");
@@ -789,6 +870,28 @@ fn derive_concept(q: &str) -> String {
     q.chars().take(20).collect()
 }
 
+/// 从 LLM 回答末尾解析 [[概念: XXX]] 行，返回 (去掉该行的正文, 概念名)。
+/// 若未找到概念行，concept 用 derive_concept(question) 兜底。
+fn extract_concept(content: &str, question: &str) -> (String, String) {
+    // 找最后一行含 [[概念: ...]] 的
+    let mut concept = None;
+    let mut clean_lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("[[概念:").and_then(|s| s.strip_suffix("]]")) {
+            let name = rest.trim().to_string();
+            if !name.is_empty() {
+                concept = Some(name);
+                continue; // 跳过这行，不加入 clean
+            }
+        }
+        clean_lines.push(line);
+    }
+    let clean_answer = clean_lines.join("\n").trim_end().to_string();
+    let concept = concept.unwrap_or_else(|| derive_concept(question));
+    (clean_answer, concept)
+}
+
 fn mask_key(k: &str) -> String {
     if k.is_empty() {
         "（未设置）".into()
@@ -796,6 +899,27 @@ fn mask_key(k: &str) -> String {
         format!("{}…", &k[..k.len() / 2])
     } else {
         format!("{}…{}", &k[..4], &k[k.len() - 4..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_concept;
+
+    #[test]
+    fn extract_concept_from_answer() {
+        let content = "BERTScore是相似度指标。\n\n[[概念: BERTScore]]";
+        let (clean, concept) = extract_concept(content, "什么是BERTScore");
+        assert!(!clean.contains("[[概念"), "clean 应去掉概念行: {clean}");
+        assert_eq!(concept, "BERTScore");
+    }
+
+    #[test]
+    fn extract_concept_fallback() {
+        let content = "这个方法叫注意力机制。";
+        let (clean, concept) = extract_concept(content, "注意力机制是什么");
+        assert_eq!(clean, content);
+        assert!(!concept.is_empty());
     }
 }
 
