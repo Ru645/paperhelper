@@ -41,7 +41,8 @@ cargo test  -p paperhelper          # 运行测试（13 个）
 ### 3. 加入 PATH（可选，方便直接用 `paperhelper` 命令）
 
 ```bash
-echo 'export PATH="$HOME/My_Code/Course/Rust/target/debug:$PATH"' >> ~/.bashrc
+# 把下面的 <项目路径> 替换为你实际的 paperhelper 上级目录
+echo 'export PATH="<项目路径>/../target/debug:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
