@@ -25,38 +25,28 @@ async fn main() -> Result<()> {
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        // -s <序号|会话名> : 恢复指定会话
+        // -s <ID> : 恢复指定会话（ID 是固定数字，不会变）
         if args.len() == 2 && args[0] == "-s" {
             let sid = &args[1];
-            let sessions = paths::list_sessions();
-            // 纯数字 → 按序号匹配（1-based）
-            let target = if sid.chars().all(|c| c.is_ascii_digit()) {
-                sid.parse::<usize>().ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .and_then(|i| sessions.get(i).map(|s| s.clone()))
-            } else {
-                // 非数字 → 按会话名匹配
-                sessions.iter().find(|s| *s == sid).cloned()
-            };
-            match target {
-                Some(name) => {
-                    let path = paths::session_path(&name);
-                    app.session = session::Session::load(&path)?;
-                    println!("已恢复会话：{}（序号 {}）", name, sid);
-                    return app.repl().await;
-                }
-                None => {
-                    eprintln!("会话 {sid} 不存在。可用会话：");
-                    if sessions.is_empty() {
-                        eprintln!("  （无已保存会话）");
-                    } else {
-                        for (i, s) in sessions.iter().enumerate() {
-                            eprintln!("  {}  {}", i + 1, s);
-                        }
+            let id: u64 = sid.parse().map_err(|_| anyhow!("ID 必须是数字"))?;
+            let path = paths::session_path(id);
+            if !path.exists() {
+                eprintln!("会话 {id} 不存在。可用会话：");
+                let sessions = paths::list_sessions();
+                if sessions.is_empty() {
+                    eprintln!("  （无已保存会话）");
+                } else {
+                    for s in &sessions {
+                        let name = session_name_of(*s);
+                        eprintln!("  {s}  {name}");
                     }
-                    return Err(anyhow!("会话不存在"));
                 }
+                return Err(anyhow!("会话不存在"));
             }
+            app.session = session::Session::load(&path)?;
+            let name = app.session.session_name.clone();
+            println!("已恢复会话 {id}：{}", if name.is_empty() { "（未命名）".into() } else { name });
+            return app.repl().await;
         }
         // -l : 列出所有会话
         if args.len() == 1 && (args[0] == "-l" || args[0] == "--list") {
@@ -65,9 +55,10 @@ async fn main() -> Result<()> {
                 println!("（无已保存会话）");
             } else {
                 println!("已保存的会话：");
-                println!("{:>4}  {:<30}  {}", "序号", "会话名", "保存时间");
-                for (i, s) in sessions.iter().enumerate() {
-                    let path = paths::session_path(s);
+                println!("{:>4}  {:<30}  {}", "ID", "会话名", "保存时间");
+                for id in &sessions {
+                    let path = paths::session_path(*id);
+                    let name = session_name_of(*id);
                     let time = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
                         .ok()
@@ -80,9 +71,9 @@ async fn main() -> Result<()> {
                                 })
                         })
                         .unwrap_or_else(|| "未知".to_string());
-                    println!("{:>4}  {:<30}  {}", i + 1, s, time);
+                    println!("{:>4}  {:<30}  {}", id, name, time);
                 }
-                println!("用 paperhelper -s <序号> 恢复（如 paperhelper -s 1）");
+                println!("用 paperhelper -s <ID> 恢复（如 paperhelper -s 1）");
             }
             return Ok(());
         }
@@ -91,4 +82,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     app.repl().await
+}
+
+/// 读取会话文件里的 session_name 字段（不完整反序列化，只取名字）。
+fn session_name_of(id: u64) -> String {
+    let path = paths::session_path(id);
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return "（读取失败）".into();
+    };
+    // 简单提取 "session_name":"xxx"
+    if let Some(pos) = s.find("\"session_name\"") {
+        let rest = &s[pos..];
+        if let Some(colon) = rest.find(':') {
+            let rest = &rest[colon + 1..];
+            let rest = rest.trim_start();
+            if rest.starts_with('"') {
+                let rest = &rest[1..];
+                if let Some(end) = rest.find('"') {
+                    return rest[..end].to_string();
+                }
+            }
+        }
+    }
+    "（未命名）".into()
 }

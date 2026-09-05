@@ -192,7 +192,7 @@ impl App {
     }
 
     /// 退出时自动保存会话到 .paperhelper/sessions/。
-    /// 若有笔记，调 LLM 取一个简短名字作为会话名；否则用时间戳。
+    /// 用递增数字 ID 作文件名（永不变），会话名存在 JSON 内部供 -l 展示。
     async fn autosave_on_exit(&mut self) -> Result<()> {
         if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
             return Ok(());
@@ -201,22 +201,14 @@ impl App {
 
         // 让 LLM 给会话取个简短名字
         let session_name = self.generate_session_name().await;
-        // 文件名安全化
-        let safe = sanitize_filename(&session_name);
-        // 避免重名：若已存在则加后缀
-        let mut id = safe.clone();
-        let mut suffix = 2;
-        while crate::paths::session_path(&id).exists() {
-            id = format!("{safe}_{suffix}");
-            suffix += 1;
-        }
-        let path = crate::paths::session_path(&id);
+        self.session.session_name = session_name;
+
+        // 分配固定数字 ID（递增，永不变）
+        let id = crate::paths::next_session_id()?;
+        let path = crate::paths::session_path(id);
         self.session.save(&path)?;
-        // 计算序号（按 list_sessions 排序后的位置，1-based）
-        let sessions = crate::paths::list_sessions();
-        let idx = sessions.iter().position(|s| s == &id).map(|i| i + 1).unwrap_or(0);
-        println!("{} 会话已保存：{}", "✓".green().bold(), id);
-        println!("  恢复方式：paperhelper -s {}", idx);
+        println!("{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
+        println!("  恢复方式：paperhelper -s {}", id);
         Ok(())
     }
 
@@ -1045,23 +1037,6 @@ fn parse_ask_args(args: &str) -> (Option<String>, String) {
     }
 }
 
-/// 文件名安全化：替换非法字符，限制长度。
-fn sanitize_filename(s: &str) -> String {
-    let s = s.trim();
-    let cleaned: String = s
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
-            _ => c,
-        })
-        .collect();
-    let cleaned = cleaned.trim_matches(|c: char| c == '_' || c.is_whitespace()).to_string();
-    if cleaned.is_empty() {
-        "session".to_string()
-    } else {
-        cleaned.chars().take(40).collect()
-    }
-}
 
 /// 判断是否是章节编号：如 "3", "3.2", "3.2.1"。
 fn is_section_number(s: &str) -> bool {

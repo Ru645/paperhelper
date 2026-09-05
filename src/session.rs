@@ -45,6 +45,9 @@ pub struct Session {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// 会话名（LLM 退出时生成，用于 -l 展示）。
+    #[serde(default)]
+    pub session_name: String,
 }
 
 impl Session {
@@ -114,6 +117,7 @@ mod tests {
             current_paper_id: Some("p1".into()),
             created_at: String::new(),
             updated_at: String::new(),
+            session_name: String::new(),
         };
         sess.save(&path).unwrap();
 

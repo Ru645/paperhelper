@@ -37,25 +37,41 @@ pub fn ensure_sessions_dir() -> Result<()> {
     Ok(())
 }
 
-/// 列出所有已保存的会话编号（文件名去掉 .json）
-pub fn list_sessions() -> Vec<String> {
+/// 分配一个新的会话 ID（递增数字，持久化在 .paperhelper/sessions/counter）。
+/// ID 一旦分配永不变，保证 -s <ID> 稳定。
+pub fn next_session_id() -> Result<u64> {
+    let counter = sessions_dir().join("counter");
+    let id = if counter.exists() {
+        fs::read_to_string(&counter)?.trim().parse::<u64>().unwrap_or(0) + 1
+    } else {
+        1
+    };
+    ensure_sessions_dir()?;
+    fs::write(&counter, id.to_string())?;
+    Ok(id)
+}
+
+/// 会话文件路径（按数字 ID）
+pub fn session_path(id: u64) -> PathBuf {
+    sessions_dir().join(format!("{id}.json"))
+}
+
+/// 列出所有会话 ID（数字，升序）
+pub fn list_sessions() -> Vec<u64> {
     let dir = sessions_dir();
     if !dir.exists() {
         return Vec::new();
     }
-    let mut sessions = Vec::new();
+    let mut ids = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                sessions.push(name.to_string());
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                if let Ok(id) = stem.parse::<u64>() {
+                    ids.push(id);
+                }
             }
         }
     }
-    sessions.sort();
-    sessions
-}
-
-/// 会话文件路径
-pub fn session_path(id: &str) -> PathBuf {
-    sessions_dir().join(format!("{id}.json"))
+    ids.sort();
+    ids
 }
