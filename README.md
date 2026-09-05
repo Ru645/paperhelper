@@ -42,7 +42,30 @@ PDF 解析通过子进程调用 Python 的 PyMuPDF（符合「允许调用其他
 pip install pymupdf
 ```
 
+### 将 paperhelper 加到 PATH
+
+编译产物在上级 workspace 的 `target/debug/` 下，不在系统 PATH 中。建议将其加入 PATH，这样可以直接用 `paperhelper` 命令启动：
+
+```bash
+echo 'export PATH="$(cd "$(dirname "$0")" && pwd)/../target/debug:$PATH"' >> ~/.bashrc
+# 或者直接写绝对路径：
+echo 'export PATH="$HOME/My_Code/Course/Rust/target/debug:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+之后即可在任意目录运行 `paperhelper`。若不加 PATH，需用 `cargo run -p paperhelper` 或 `../target/debug/paperhelper` 启动。
+
 ## 运行
+
+### 启动方式
+
+```bash
+paperhelper                 # 新会话
+paperhelper -s <编号>       # 恢复指定会话（编号在退出时自动告知）
+paperhelper -l              # 列出所有已保存会话
+```
+
+退出 REPL 时会自动保存当前会话，并告知编号和恢复方式。
 
 ### 配置大模型
 
