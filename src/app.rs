@@ -199,8 +199,13 @@ impl App {
         }
         crate::paths::ensure_sessions_dir()?;
 
-        // 让 LLM 给会话取个简短名字
+        // 让 LLM 给会话取个简短名字（带进度条）
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(spinner_style());
+        bar.set_message("保存会话中…");
+        bar.enable_steady_tick(Duration::from_millis(100));
         let session_name = self.generate_session_name().await;
+        bar.finish_and_clear();
         self.session.session_name = session_name;
 
         // 分配固定数字 ID（递增，永不变）
