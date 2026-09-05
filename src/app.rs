@@ -26,7 +26,7 @@ use crate::session::Session;
 const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。\n\n回答完毕后，另起一行写 [[概念: 概念名]]，概念名是1-8个词的短语，概括本次问答涉及的核心知识点（如\"BERTScore\"、\"MQAG框架\"、\"语义熵\"）。";
 
 const COMMANDS: &[&str] = &[
-    "ingest", "ask", "blocks", "note", "tree", "goto", "stats", "budget",
+    "ingest", "ask", "check", "blocks", "note", "tree", "goto", "stats", "budget",
     "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
@@ -289,6 +289,7 @@ impl App {
             "export" => self.cmd_export(rest).await,
             "ingest" | "pdf" => self.cmd_ingest(rest).await,
             "ask" | "q" => self.cmd_ask(rest).await,
+            "check" => self.cmd_check(rest).await,
             _ => {
                 println!("未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
@@ -303,6 +304,8 @@ PaperHelper 命令：
   ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
+  check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
+                          例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -674,76 +677,8 @@ PaperHelper 命令：
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
 
-        // 1. 取出笔记原文 + 定位 block
-        //    - 若用户给了编号(如 "3.2")：按编号精确匹配 Section
-        //    - 否则：退化为关键词匹配 locate
-        let (raw_text, notes_md, block_id) = {
-            let note = self.session.notes.as_ref().unwrap();
-            let blk = if let Some(num) = &block_num {
-                note.find_section_by_number(num)
-                    .or_else(|| note.locate(question))
-            } else {
-                note.locate(question)
-            };
-            let bid = blk.map(|b| b.id.clone());
-            (note.raw_text.clone(), note.to_markdown(), bid)
-        };
-
-        // 2. 拼对话上下文：根路径上的所有 Q&A
-        let path: Vec<(String, String)> = self
-            .session
-            .conversation
-            .path_to_current()
-            .iter()
-            .map(|n| (n.question.clone(), n.answer.clone()))
-            .collect();
-
-        // 3. 上下文长度检查：超长则丢弃最早的对话轮
-        let ctx = self.config.llm.context_length;
-        let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4;
-        if base_tokens > ctx {
-            eprintln!("{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。建议换更大上下文的模型。", "⚠️ ".yellow(), base_tokens, ctx);
-        }
-        // 从最近的对话往前保留，直到 token 用尽；最早的轮次被丢弃。
-        let avail = ctx.saturating_sub(base_tokens + question.chars().count() / 4 + 200);
-        let mut used = 0usize;
-        let mut keep_from = path.len();
-        while keep_from > 0 {
-            let (q, a) = &path[keep_from - 1];
-            let t = (q.chars().count() + a.chars().count()) / 4;
-            if used + t > avail {
-                break;
-            }
-            used += t;
-            keep_from -= 1;
-        }
-        let dropped = keep_from;
-        let kept_pairs: Vec<(String, String)> = path[keep_from..].to_vec();
-        if dropped > 0 {
-            eprintln!("{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
-        }
-
-        let mut msgs = vec![
-            Message { role: "system".into(), content: SYS_ASK.into() },
-            Message { role: "user".into(), content: format!("【论文全文】\n{raw_text}") },
-            Message { role: "assistant".into(), content: format!("【已生成笔记】\n{notes_md}") },
-        ];
-        for (q, a) in &kept_pairs {
-            msgs.push(Message { role: "user".into(), content: q.clone() });
-            msgs.push(Message { role: "assistant".into(), content: a.clone() });
-        }
-
-        // 4. 跨论文已学概念注入
-        let related = self.kb.search(question);
-        let mut q_final = question.to_string();
-        if !related.is_empty() {
-            q_final.push_str("\n\n【你之前学过的相关概念，可参考并建立联系】");
-            for c in &related {
-                let d: String = c.definition.chars().take(80).collect();
-                q_final.push_str(&format!("\n- {}（来自《{}》）: {}", c.name, c.paper_title, d));
-            }
-        }
-        msgs.push(Message { role: "user".into(), content: q_final });
+        // 1-4. 构建上下文消息（论文全文+笔记+对话路径+概念注入）
+        let (msgs, block_id) = self.build_context_messages(question, &block_num);
 
         // 5. 流式调用 LLM
         let mut first_token = true;
@@ -900,6 +835,89 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// check <编号> <想法>：与 ask 类似调 LLM 回答，但不写入笔记、不增加追问嵌套。
+    /// 对话树仍记录此节点（用于上下文），但 explanation_id 为 None。
+    async fn cmd_check(&mut self, args: &str) -> Result<()> {
+        let args = args.trim();
+        if args == "--help" || args == "-h" || args.is_empty() {
+            println!("用法: check <编号> <想法>");
+            println!("  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
+            println!("  <想法>    你想核对/验证的想法或理解");
+            println!("例:");
+            println!("  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
+            println!("说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
+            return Ok(());
+        }
+        let (block_num, question) = parse_ask_args(args);
+        let question = question.trim();
+        if question.is_empty() {
+            bail!("用法: check <编号> <想法>   例: check 3.2 我觉得这个方法等价于余弦相似度");
+        }
+        if self.session.notes.is_none() {
+            bail!("还没有笔记，先 `ingest <pdf>`");
+        }
+        interrupt::reset();
+
+        let budget_ok = self.check_budget()?;
+        if !budget_ok {
+            bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
+        }
+
+        let (msgs, _block_id) = self.build_context_messages(question, &block_num);
+
+        // 流式调用 LLM
+        let mut first_token = true;
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(spinner_style());
+        bar.set_message("核对中…");
+        bar.enable_steady_tick(Duration::from_millis(100));
+        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
+            if first_token {
+                bar.finish_and_clear();
+                first_token = false;
+                print!("\n");
+            }
+            print!("{t}");
+            let _ = io::stdout().flush();
+        }).await;
+        let res = res?;
+        if first_token {
+            bar.finish_and_clear();
+        }
+        println!();
+
+        // 记录统计
+        self.record_usage(res.input_tokens, res.output_tokens);
+
+        // 提取概念名（用于 label）
+        let (clean_answer, concept_name) = extract_concept(&res.content, question);
+        let now = Utc::now().to_rfc3339();
+
+        // 对话树记录节点，但 explanation_id = None（不关联笔记解释）
+        let parent = self.session.conversation.current.clone();
+        let node_id = uuid::Uuid::new_v4().to_string();
+        self.session.conversation.add_exchange(ConvNode {
+            id: node_id.clone(),
+            parent,
+            question: question.to_string(),
+            answer: clean_answer.clone(),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: res.input_tokens,
+            output_tokens: res.output_tokens,
+            cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
+                + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
+            created_at: now,
+            label: format!("[核对] {}", concept_name),
+        });
+        self.session.conversation.current = Some(node_id);
+
+        if res.estimated {
+            println!("[注: 本次 token 数为估算]");
+        }
+        Ok(())
+    }
+
     // ===== 内部辅助 =====
 
     /// 预算检查：返回 false 表示已达上限应中断。
@@ -919,6 +937,75 @@ PaperHelper 命令：
         let cost = input as f64 * in_price / 1_000_000.0 + output as f64 * out_price / 1_000_000.0;
         self.session.stats.add(input, output, cost);
         self.kb.stats.add(input, output, cost);
+    }
+
+    /// 构建 ask/check 共用的上下文消息（论文全文+笔记+对话路径+概念注入）。
+    /// 返回 (messages, block_id)。
+    fn build_context_messages(&self, question: &str, block_num: &Option<String>) -> (Vec<Message>, Option<String>) {
+        let (raw_text, notes_md, block_id) = {
+            let note = self.session.notes.as_ref().unwrap();
+            let blk = if let Some(num) = block_num {
+                note.find_section_by_number(num)
+                    .or_else(|| note.locate(question))
+            } else {
+                note.locate(question)
+            };
+            let bid = blk.map(|b| b.id.clone());
+            (note.raw_text.clone(), note.to_markdown(), bid)
+        };
+
+        let path: Vec<(String, String)> = self
+            .session
+            .conversation
+            .path_to_current()
+            .iter()
+            .map(|n| (n.question.clone(), n.answer.clone()))
+            .collect();
+
+        let ctx = self.config.llm.context_length;
+        let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4;
+        if base_tokens > ctx {
+            eprintln!("{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。", "⚠️ ".yellow(), base_tokens, ctx);
+        }
+        let avail = ctx.saturating_sub(base_tokens + question.chars().count() / 4 + 200);
+        let mut used = 0usize;
+        let mut keep_from = path.len();
+        while keep_from > 0 {
+            let (q, a) = &path[keep_from - 1];
+            let t = (q.chars().count() + a.chars().count()) / 4;
+            if used + t > avail {
+                break;
+            }
+            used += t;
+            keep_from -= 1;
+        }
+        let dropped = keep_from;
+        let kept_pairs: Vec<(String, String)> = path[keep_from..].to_vec();
+        if dropped > 0 {
+            eprintln!("{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
+        }
+
+        let mut msgs = vec![
+            Message { role: "system".into(), content: SYS_ASK.into() },
+            Message { role: "user".into(), content: format!("【论文全文】\n{raw_text}") },
+            Message { role: "assistant".into(), content: format!("【已生成笔记】\n{notes_md}") },
+        ];
+        for (q, a) in &kept_pairs {
+            msgs.push(Message { role: "user".into(), content: q.clone() });
+            msgs.push(Message { role: "assistant".into(), content: a.clone() });
+        }
+
+        let related = self.kb.search(question);
+        let mut q_final = question.to_string();
+        if !related.is_empty() {
+            q_final.push_str("\n\n【你之前学过的相关概念，可参考并建立联系】");
+            for c in &related {
+                let d: String = c.definition.chars().take(80).collect();
+                q_final.push_str(&format!("\n- {}（来自《{}》）: {}", c.name, c.paper_title, d));
+            }
+        }
+        msgs.push(Message { role: "user".into(), content: q_final });
+        (msgs, block_id)
     }
 }
 
