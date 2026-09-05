@@ -865,6 +865,22 @@ PaperHelper 命令：
         self.kb.save()?;
 
         // 自动更新导出的 markdown 文件
+        // 若 export_path 未设置，引导用户输入一次
+        if self.export_path.is_none() {
+            let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+            let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
+            print!("请输入笔记导出文件名（回车默认 {}，输 skip 跳过）: ", default_name);
+            io::stdout().flush()?;
+            let mut name = String::new();
+            io::stdin().lock().read_line(&mut name)?;
+            let name = name.trim();
+            if name == "skip" || name == "s" {
+                eprintln!("{} 已跳过导出，之后可用 `export md <file>` 手动导出。", "".dimmed());
+            } else {
+                let path = if name.is_empty() { default_name } else { name.to_string() };
+                self.export_path = Some(path.clone());
+            }
+        }
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
                 if std::fs::write(p, export::to_markdown(note)).is_ok() {
