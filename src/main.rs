@@ -25,25 +25,38 @@ async fn main() -> Result<()> {
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        // -s <编号> : 恢复指定会话
+        // -s <序号|会话名> : 恢复指定会话
         if args.len() == 2 && args[0] == "-s" {
             let sid = &args[1];
-            let path = paths::session_path(sid);
-            if !path.exists() {
-                eprintln!("会话 {sid} 不存在。可用会话：");
-                let sessions = paths::list_sessions();
-                if sessions.is_empty() {
-                    eprintln!("  （无已保存会话）");
-                } else {
-                    for s in &sessions {
-                        eprintln!("  {s}");
-                    }
+            let sessions = paths::list_sessions();
+            // 纯数字 → 按序号匹配（1-based）
+            let target = if sid.chars().all(|c| c.is_ascii_digit()) {
+                sid.parse::<usize>().ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| sessions.get(i).map(|s| s.clone()))
+            } else {
+                // 非数字 → 按会话名匹配
+                sessions.iter().find(|s| *s == sid).cloned()
+            };
+            match target {
+                Some(name) => {
+                    let path = paths::session_path(&name);
+                    app.session = session::Session::load(&path)?;
+                    println!("已恢复会话：{}（序号 {}）", name, sid);
+                    return app.repl().await;
                 }
-                return Err(anyhow!("会话不存在"));
+                None => {
+                    eprintln!("会话 {sid} 不存在。可用会话：");
+                    if sessions.is_empty() {
+                        eprintln!("  （无已保存会话）");
+                    } else {
+                        for (i, s) in sessions.iter().enumerate() {
+                            eprintln!("  {}  {}", i + 1, s);
+                        }
+                    }
+                    return Err(anyhow!("会话不存在"));
+                }
             }
-            app.session = session::Session::load(&path)?;
-            println!("已恢复会话 {sid}");
-            return app.repl().await;
         }
         // -l : 列出所有会话
         if args.len() == 1 && (args[0] == "-l" || args[0] == "--list") {
@@ -69,7 +82,7 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|| "未知".to_string());
                     println!("{:>4}  {:<30}  {}", i + 1, s, time);
                 }
-                println!("用 paperhelper -s <会话名> 恢复");
+                println!("用 paperhelper -s <序号> 恢复（如 paperhelper -s 1）");
             }
             return Ok(());
         }

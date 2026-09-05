@@ -213,7 +213,7 @@ impl App {
         let path = crate::paths::session_path(&id);
         self.session.save(&path)?;
         println!("{} 会话已自动保存：{}", "✓".green().bold(), id);
-        println!("  恢复方式：paperhelper -s {}", id);
+        println!("  恢复方式：paperhelper -l 查看序号，再 paperhelper -s <序号>");
         println!("  查看所有会话：paperhelper -l");
         Ok(())
     }
@@ -319,7 +319,7 @@ PaperHelper 命令：
 
 启动方式：
   paperhelper              新会话
-  paperhelper -s <编号>    恢复指定会话
+  paperhelper -s <序号>    恢复指定会话（先用 -l 查看序号）
   paperhelper -l           列出所有已保存会话";
         println!("{h}");
         Ok(())
