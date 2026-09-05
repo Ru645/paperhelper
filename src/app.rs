@@ -538,7 +538,17 @@ PaperHelper 命令：
             bail!("已打断");
         }
 
-        // 2. 调用 LLM 生成结构化 Markdown 笔记
+        // 2. 先询问笔记导出文件名（在等待 LLM 时让用户知道笔记存哪）
+        let title_guess: String = path.chars().filter(|c| !c.is_whitespace()).take(20).collect();
+        let default_name = format!("笔记_{title_guess}.md");
+        print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
+        io::stdout().flush()?;
+        let mut name = String::new();
+        io::stdin().lock().read_line(&mut name)?;
+        let name = name.trim();
+        let export_file = if name.is_empty() { default_name.clone() } else { name.to_string() };
+
+        // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
         let budget_ok = self.check_budget()?;
         if !budget_ok {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
@@ -566,21 +576,21 @@ PaperHelper 命令：
         let mut first_token = true;
         let bar2 = ProgressBar::new_spinner();
         bar2.set_style(spinner_style());
-        bar2.set_message("调用 LLM 生成笔记…");
+        bar2.set_message("笔记生成中…");
         bar2.enable_steady_tick(Duration::from_millis(100));
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
                 bar2.finish_and_clear();
                 first_token = false;
-                print!("\n(LLM 输出中) ");
-                let _ = io::stdout().flush();
             }
             print!("{t}");
             let _ = io::stdout().flush();
         }).await;
         println!();
         let res = res?;
-        bar2.finish_and_clear();
+        if first_token {
+            bar2.finish_and_clear();
+        }
 
         // 3. 统计与预算检查
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -624,18 +634,11 @@ PaperHelper 命令：
         });
         self.session.conversation.current = Some(root_id);
 
-        // 7. 询问用户导出文件名，首次生成 markdown 笔记文件
-        let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
-        print!("请输入笔记导出文件名（回车默认 {}）: ", default_name);
-        io::stdout().flush()?;
-        let mut name = String::new();
-        io::stdin().lock().read_line(&mut name)?;
-        let name = name.trim();
-        let path = if name.is_empty() { default_name.clone() } else { name.to_string() };
-        self.export_path = Some(path.clone());
+        // 7. 导出 markdown 笔记（文件名在第 2 步已询问）
+        self.export_path = Some(export_file.clone());
         if let Some(note) = &self.session.notes {
-            std::fs::write(&path, export::to_markdown(note))?;
-            println!("{} 笔记已导出到 {}", "✓".green().bold(), path);
+            std::fs::write(&export_file, export::to_markdown(note))?;
+            println!("{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
         Ok(())
     }
