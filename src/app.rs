@@ -212,9 +212,11 @@ impl App {
         }
         let path = crate::paths::session_path(&id);
         self.session.save(&path)?;
-        println!("{} 会话已自动保存：{}", "✓".green().bold(), id);
-        println!("  恢复方式：paperhelper -l 查看序号，再 paperhelper -s <序号>");
-        println!("  查看所有会话：paperhelper -l");
+        // 计算序号（按 list_sessions 排序后的位置，1-based）
+        let sessions = crate::paths::list_sessions();
+        let idx = sessions.iter().position(|s| s == &id).map(|i| i + 1).unwrap_or(0);
+        println!("{} 会话已保存：{}", "✓".green().bold(), id);
+        println!("  恢复方式：paperhelper -s {}", idx);
         Ok(())
     }
 
