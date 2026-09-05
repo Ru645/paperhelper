@@ -1,88 +1,69 @@
-# 论文学习助手 Agent 选题报告
+# PaperHelper — 论文学习助手
 
-## 现实痛点
+读论文时遇到不懂的概念就追问，追问中又引出新的前置知识，等搞明白已经忘了主线？通用 AI 的对话只会向前延伸，几次深入追问后就丢失上下文。
 
-在我阅读论文时，通用对话 AI 暴露出了几个明显问题。
+PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一个节点，随时跳回主线或其他分支继续提问，根路径自动成为上下文。
 
-- 对话是线性的，而论文阅读的思路更类似于树形。读论文时遇到不懂的概念会去追问，追问中又可能引出新的前置知识，等搞明白之后，往往已经忘了自己原本读到哪一段、上下文是什么。通用 AI 的对话记录只会不断向前延伸，几次深入追问后很容易丢失主线。
-- 通用 AI 无法建立跨论文的知识关联。连续阅读的论文往往会属于相近领域，会反复遇到相似的概念和方法。但对话式 AI 不存储我已经学过的知识，每次都是独立对话。当我读下一篇论文时，它无法提醒我某个概念在之前哪篇论文中出现过、和现在的内容有什么关系。我只能自己翻找以前的对话记录，或者干脆从头再来。
-- 通用 AI 没法把解释插入到笔记的对应位置。当我针对论文中某一段或某个公式提问时，得到的回答只能追加在对话末尾，无法定位到原文附近。几天后回看，根本不知道某条解释对应的是哪一段。我需要反复手动整理上下文、把解释复制粘贴回原文，效率很低。
+## 核心功能
 
-## 预期功能
+- **导入 PDF → 自动生成结构化笔记**：LLM 按固定四段架构（问题/前人方案/本文方案/前景）生成详细 Markdown 笔记，含公式、表格、数值结果
+- **按编号追问**：看笔记里的 `### 3.2 变体一：BERTScore`，直接 `ask 3.2 ...`，解释自动插入对应位置
+- **递归嵌套批注**：对追问的回答再追问，批注层层嵌套（`>` → `> >` → `> > >`），不会断开
+- **核对想法**：`check 3.2 我觉得这本质就是余弦相似度，对吗`，LLM 回答但不写入笔记
+- **对话树**：`tree` 查看全部对话轨迹，`goto 2` 跳到任意节点继续，根路径即上下文
+- **跨论文知识库**：自动积累读过的论文和学过的概念，`concepts` 查看知识清单
+- **会话自动保存**：退出时自动保存，`paperhelper -s 1` 秒级恢复，对话位置不丢
 
-我向 Agent 提供一个 PDF 论文，它能自动分析并生成一份有组织的笔记，把内容整理成章节、段落、公式等逻辑块。我阅读笔记时，可以针对任何不理解的概念或公式用自然语言追问，Agent 会在对应位置附近添加解释，而不是把回答丢在对话末尾。
+## 快速开始
 
-对话不再是线性的，历史对话采用树的结构展示。我深入追问某个前置知识之后，可以返回主线，继续阅读和提问其他部分。Agent 会记录我已经学过的知识和读过的论文。当后续生成笔记或回答问题时，如果涉及已学过的内容或与其他论文相关，会自动标注关联，帮助我建立知识之间的联系。
-
-学习完一篇论文后，Agent 可以将笔记导出为 Markdown 文件，方便线性阅读和编辑；也可以导出为思维导图格式，直观展示论文结构和学习路径。
-
-## 预期实现
-
-项目以 Rust 为主要语言，提供CLI界面。
-
-核心流程是：用户输入 PDF 路径，Agent 解析 PDF 并生成json格式的结构化的笔记；用户通过 CLI 追问，Agent 调用可配置的大模型 API 生成解释，并将解释写入笔记的对应位置；用户可随时将笔记导出为 Markdown 或思维导图文件。
-
-Rust 代码负责确定性部分：PDF 处理、笔记结构管理、定位用户提问对应的位置、记录用户已学过的概念和读过的论文、在生成笔记或回答时检索并标注关联知识、实现笔记到 Markdown 或思维导图的编译器、管理会话历史。LLM 只负责理解用户问题并生成自然语言内容。
-
-## 编译
-
-本项目位于上级 Cargo workspace（`../Cargo.toml` 把所有同级子目录作为成员）下，因此构建/测试**必须**带 `-p paperhelper`，否则会构建整个 workspace：
+### 1. 安装依赖
 
 ```bash
-cargo build -p paperhelper            # 调试构建
-cargo build -p paperhelper --release   # 发布构建
-cargo test  -p paperhelper            # 运行单元测试
-```
+# Rust（需 1.85+）
+rustc --version
 
-编译产物位于上级目录：`../target/debug/paperhelper`（或 `../target/release/paperhelper`）。
-
-PDF 解析通过子进程调用 Python 的 PyMuPDF（符合「允许调用其他语言库」），首次使用前需安装：
-
-```bash
+# PDF 解析依赖（Python 的 PyMuPDF，Rust 通过子进程调用）
 pip install pymupdf
 ```
 
-### 将 paperhelper 加到 PATH
+### 2. 编译
 
-编译产物在上级 workspace 的 `target/debug/` 下，不在系统 PATH 中。建议将其加入 PATH，这样可以直接用 `paperhelper` 命令启动：
+本项目位于上级 Cargo workspace 下，构建需带 `-p paperhelper`：
 
 ```bash
-echo 'export PATH="$(cd "$(dirname "$0")" && pwd)/../target/debug:$PATH"' >> ~/.bashrc
-# 或者直接写绝对路径：
+git clone <仓库地址> && cd paperhelper
+cargo build -p paperhelper          # 调试构建
+cargo test  -p paperhelper          # 运行测试（13 个）
+```
+
+编译产物在 `../target/debug/paperhelper`。
+
+### 3. 加入 PATH（可选，方便直接用 `paperhelper` 命令）
+
+```bash
 echo 'export PATH="$HOME/My_Code/Course/Rust/target/debug:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-之后即可在任意目录运行 `paperhelper`。若不加 PATH，需用 `cargo run -p paperhelper` 或 `../target/debug/paperhelper` 启动。
+不加 PATH 也可用 `cargo run -p paperhelper` 启动。
 
-## 运行
+### 4. 配置大模型
 
-### 启动方式
+首次启动会提示配置，三种方式任选其一（优先级：命令行 > .env > config.toml）：
 
+**交互式配置**（推荐）：
 ```bash
-paperhelper                 # 新会话
-paperhelper -s <编号>       # 恢复指定会话（编号在退出时自动告知）
-paperhelper -l              # 列出所有已保存会话
-```
-
-退出 REPL 时会自动保存当前会话，并告知编号和恢复方式。
-
-### 配置大模型
-
-以下三种方式任选其一（优先级：命令行配置 > .env > .paperhelper/config.toml）：
-
-**方式一：交互式配置**（首次运行推荐）
-```bash
-paperhelper                       # 进入 REPL
-> config set llm.api_key <你的key>
+paperhelper
+> config set llm.api_key sk-xxxxxxxx
 > config set llm.model deepseek-v4-pro
 > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
 ```
-> 注意：`llm.api_endpoint` 需填**完整 URL**（含 `/chat/completions` 路径），不是 DeepSeek 文档里的 `base_url`。DeepSeek 文档写的 `base_url=https://api.deepseek.com` 是给 OpenAI SDK 用的，SDK 会自动补路径；本程序直接调用，需补全为 `https://api.deepseek.com/v1/chat/completions` 或 `https://api.deepseek.com/chat/completions`。
-> config show                     # 查看（key 自动脱敏）
-```
 
-**方式二：.env 文件**（项目根目录，已被 .gitignore 忽略）
+> ⚠️ `api_endpoint` 必须是**完整 URL**（含 `/chat/completions`），不是文档里的 `base_url`。
+> DeepSeek：`https://api.deepseek.com/v1/chat/completions`
+> OpenAI：`https://api.openai.com/v1/chat/completions`
+
+或写 `.env`（已被 gitignore，不会泄露）：
 ```bash
 cat > .env <<'EOF'
 PAPERHELPER_API_KEY=sk-xxxxxxxx
@@ -92,53 +73,116 @@ PAPERHELPER_CONTEXT_LENGTH=64000
 EOF
 ```
 
-**方式三：环境变量**（临时，不落盘）
-```bash
-export PAPERHELPER_API_KEY=sk-xxxxxxxx
-export PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-export PAPERHELPER_MODEL=deepseek-v4-pro
-```
-
-可配置项一览（`config set <key> <value>` 或 .env 同名大写变量）：
-
-| 配置项 | 说明 | 示例 |
-|--------|------|------|
-| `llm.api_key` | API 密钥 | `sk-...` |
-| `llm.api_endpoint` | OpenAI 兼容端点（完整 URL，不是 base_url） | `https://api.deepseek.com/v1/chat/completions` |
-| `llm.model` | 模型名 | `deepseek-v4-pro` |
-| `llm.context_length` | 上下文长度（token） | `64000` |
-| `llm.thinking_mode` | 思考模式（reasoning_effort） | `true` |
-| `pricing.input_price_per_1m` | 输入单价（$/百万token） | `0.27` |
-| `pricing.output_price_per_1m` | 输出单价（$/百万token） | `1.10` |
-| `budget.token_budget` | token 预算，0=不限 | `1000000` |
-
-### 使用
+### 5. 开始使用
 
 ```bash
-paperhelper                       # 进入交互式 REPL
+paperhelper                 # 新会话
+paperhelper -l              # 列出所有已保存会话
+paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 ```
 
-常用命令：
+## 使用流程
 
-```text
-> ingest samples/某论文.pdf          # 解析PDF → LLM生成Markdown笔记 → 树
-> ask 这篇论文的核心方法是什么?      # 基于论文全文+笔记+对话历史回答
-> blocks                            # 查看笔记结构（带序号）
-> note                              # 打印完整笔记(Markdown)
-> tree                              # 以文件树展示对话轨迹（带 [n] 编号）
-> goto 2                            # 跳到节点2，其根路径成为对话上下文
-> stats                             # token 用量 + 成本（本次/累计）
-> budget 1000000                    # 设置 token 预算，到上限自动中断
-> export md note.md                 # 导出笔记为 Markdown
-> export mindmap note.mm            # 导出为思维导图（markmap 兼容）
-> papers                            # 列出已读论文（跨会话累积）
-> concepts                          # 列出已学概念（跨论文关联）
-> save sess.json                    # 保存会话
-> load sess.json                    # 加载会话
-> new                               # 新建会话
-> exit                              # 退出
+```
+> ingest samples/某论文.pdf       # 导入论文，生成笔记
+请输入笔记导出文件名（回车默认 笔记_xxx.md）: my_note.md
+⠋ 笔记生成中…
+✓ 笔记已导出到 my_note.md
+
+> blocks                         # 看笔记结构和编号
+   1   § 一、要解决的问题
+   1.1   § 背景
+   2   § 二、前人方案及其不足
+   3   § 三、本文方案及其优点
+   3.1   § 核心思想
+   3.2   § 变体一：BERTScore
+   3.3   § 变体二：MQAG
+   ...
+
+> ask 3.2 BERTScore的公式里max_k是什么意思   # 按编号追问，解释插入 3.2 节
+> ask 3.2 它和余弦相似度有什么区别            # 对上一个回答再追问，自动嵌套
+> check 3.2 我觉得这就是余弦相似度，对吗      # 核对想法，不写入笔记
+> goto 1                                     # 跳回根节点，开启新追问线
+> tree                                       # 看对话树
+[1] 导入《论文》
+    └── [2] BERTScore
+        └── [3] 余弦相似度区别
+            └── [4] [核对] 余弦相似度 *
+> concepts                                   # 看学过的概念
+> stats                                      # 看 token 用量和成本
+> exit                                       # 退出，自动保存
+✓ 会话已保存：BERTScore与余弦相似度讨论
+  恢复方式：paperhelper -s 3
 ```
 
-也支持单次命令（不进 REPL）：`paperhelper ingest samples/某论文.pdf`。
+## 命令一览
 
-> 提示：Ctrl-C 可打断耗时任务（PDF 解析、LLM 生成）。LLM 输出采用流式实时渲染，超长对话自动截断早期轮次以适配上下文长度。
+| 命令 | 说明 |
+|------|------|
+| `ingest <pdf>` | 导入 PDF，生成结构化笔记（四段架构），自动导出 Markdown |
+| `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
+| `check <编号> <想法>` | 与 ask 类似但不写入笔记，用于核对理解 |
+| `blocks` | 列出笔记结构（带层级编号） |
+| `note` | 打印完整笔记 Markdown 到终端 |
+| `tree` | 以树形展示对话轨迹（带 `[n]` 编号，`*` 标记当前位置） |
+| `goto <n>` | 跳到对话树节点 n，根路径成为上下文 |
+| `stats` | 查看本次/累计 token 用量与成本 |
+| `budget <n>` | 设置 token 预算（0=不限），到上限自动中断 |
+| `export md\|mindmap <file>` | 导出笔记为 Markdown / 思维导图（markmap 兼容） |
+| `papers` | 列出已读论文（跨会话累积） |
+| `concepts` | 列出已学概念（跨论文关联，LLM 自动提取概念名） |
+| `save [file]` | 手动保存会话 |
+| `load <file>` | 加载会话 |
+| `new` | 新建会话 |
+| `config show` | 查看配置 |
+| `config set <k> <v>` | 设置配置项 |
+| `exit` | 退出（自动保存会话，告知恢复方式） |
+
+**REPL 操作**：`↑↓` 切换历史命令，`←→` 移动光标，`Tab` 补全命令名，`Ctrl-C` 打断当前任务。
+
+## 配置项
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `llm.api_key` | API 密钥 | 空 |
+| `llm.api_endpoint` | 完整端点 URL | OpenAI |
+| `llm.model` | 模型名 | gpt-4o-mini |
+| `llm.context_length` | 上下文长度（token） | 8192 |
+| `llm.thinking_mode` | 思考模式 | false |
+| `pricing.input_price_per_1m` | 输入单价 | 0.15 |
+| `pricing.output_price_per_1m` | 输出单价 | 0.60 |
+| `budget.token_budget` | token 预算（0=不限） | 0 |
+
+配置存储在 `.paperhelper/config.toml`（已被 gitignore）。
+
+## 数据目录
+
+```
+.paperhelper/
+├── config.toml          # 配置文件
+├── knowledge.json        # 跨论文知识库（论文+概念+累计用量）
+└── sessions/             # 会话存档
+    ├── counter           # ID 计数器
+    ├── 1.json            # 会话 1
+    └── 2.json            # 会话 2
+```
+
+所有文件已被 `.gitignore` 忽略，不会泄露。
+
+## 技术架构
+
+- **Rust 主控**：PDF 解析、笔记树、对话树、编号、定位、导出、统计——全部 Rust 确定性逻辑
+- **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名
+- **两棵树**：笔记树（Section/Paragraph + 递归 Explanation）+ 对话树（Q&A 节点，路径即上下文）
+- **不自实现 RAG**：单篇论文整篇塞进上下文（长上下文模型装得下），预算功能防超支
+- **流式输出 + 进度条**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
+
+## 开发
+
+```bash
+cargo build -p paperhelper            # 构建
+cargo test  -p paperhelper            # 13 个单元测试
+cargo build -p paperhelper --release  # 发布构建
+```
+
+二进制产物：`../target/debug/paperhelper`
