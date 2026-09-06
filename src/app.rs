@@ -372,6 +372,8 @@ impl App {
         let h = "\
 PaperHelper 命令：
   ingest <pdf>            解析 PDF 并生成结构化笔记
+  ingest --text <txt>     直接读取文本文件（跳过PDF解析）
+  ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
   ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
@@ -588,39 +590,75 @@ PaperHelper 命令：
     // ===== 以下为异步 LLM 相关命令（ingest / ask）=====
 
     async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
-        let path = rest.trim();
-        if path.is_empty() {
-            bail!("用法: ingest <pdf路径>");
+        let rest = rest.trim();
+        // 解析选项
+        let (mode, file_path) = if rest.starts_with("--text ") {
+            ("text", rest[7..].trim())
+        } else if rest.starts_with("--ocr ") {
+            ("ocr", rest[6..].trim())
+        } else if rest == "--text" || rest == "--ocr" {
+            bail!("用法: ingest --text <txt路径>  或  ingest --ocr <pdf路径>  或  ingest <pdf路径>");
+        } else {
+            ("pdf", rest)
+        };
+
+        if file_path.is_empty() {
+            bail!("用法: ingest <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
-        let p = Path::new(path);
+        let p = Path::new(file_path);
         if !p.exists() {
-            bail!("文件不存在: {path}");
+            bail!("文件不存在: {file_path}");
         }
         interrupt::reset();
 
-        // 1. 抽取纯文本（确定性，Rust 完成）
+        // 1. 抽取文本
         let bar = ProgressBar::new_spinner();
         bar.set_style(spinner_style());
-        bar.set_message("解析 PDF…");
         bar.enable_steady_tick(Duration::from_millis(100));
-        let pages = pdf::extract_pages(p)?;
-        let raw_text = pages.join("\n\n");
+
+        let raw_text = match mode {
+            "text" => {
+                bar.set_message("读取文本文件…");
+                std::fs::read_to_string(p)?
+            }
+            "ocr" => {
+                bar.set_message("OCR 识别中（可能较慢）…");
+                pdf::ocr_extract(p)?
+            }
+            _ => {
+                bar.set_message("解析 PDF…");
+                let pages = pdf::extract_pages(p)?;
+                pages.join("\n\n")
+            }
+        };
         bar.finish_and_clear();
-        println!("{} PDF 已解析: {} 页, {} 字符", "✓".green().bold(), pages.len(), raw_text.chars().count());
+        if raw_text.trim().is_empty() {
+            bail!("文本内容为空（可能是扫描件，试试 ingest --ocr <pdf>）");
+        }
+        let char_count = raw_text.chars().count();
+        println!("{} 文本已就绪: {} 字符", "✓".green().bold(), char_count);
 
         if interrupt::is_interrupted() {
             bail!("已打断");
         }
 
         // 2. 先询问笔记导出文件名（在等待 LLM 时让用户知道笔记存哪）
-        let title_guess: String = path.chars().filter(|c| !c.is_whitespace()).take(20).collect();
+        let stem = Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("note");
+        let title_guess: String = stem.chars().take(20).collect();
         let default_name = format!("笔记_{title_guess}.md");
         print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
         io::stdout().flush()?;
         let mut name = String::new();
         io::stdin().lock().read_line(&mut name)?;
         let name = name.trim();
-        let export_file = if name.is_empty() { default_name.clone() } else { name.to_string() };
+        let export_file = if name.is_empty() {
+            default_name.clone()
+        } else {
+            sanitize_filename(name)
+        };
 
         // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
         let budget_ok = self.check_budget()?;
@@ -684,7 +722,7 @@ PaperHelper 命令：
         self.kb.add_paper(Paper {
             id: paper_id.clone(),
             title: title.clone(),
-            path: path.to_string(),
+            path: file_path.to_string(),
             read_at: Utc::now().to_rfc3339(),
         });
         self.kb.save()?;
@@ -751,6 +789,7 @@ PaperHelper 命令：
 
         // 1-4. 构建上下文消息（论文全文+笔记+对话路径+概念注入）
         let (msgs, block_id) = self.build_context_messages(question, &block_num);
+        let block_id_for_hint = block_id.clone();
 
         // 5. 流式调用 LLM
         let mut first_token = true;
@@ -896,7 +935,17 @@ PaperHelper 命令：
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
                 if std::fs::write(p, export::to_markdown(note)).is_ok() {
-                    println!("{} 笔记已同步更新到 {}", "✓".green().bold(), p);
+                    // 查更新位置（block_id 对应的 section 编号+标题）
+                    let location = block_id_for_hint.as_ref().and_then(|bid| {
+                        note.find_block(bid).map(|b| {
+                            let num = if b.number.is_empty() { String::new() } else { format!("{} ", b.number) };
+                            format!("{num}{}", b.text.chars().take(30).collect::<String>())
+                        })
+                    });
+                    match location {
+                        Some(loc) => println!("{} 笔记已同步更新到 {}（更新位置：{}）", "✓".green().bold(), p, loc),
+                        None => println!("{} 笔记已同步更新到 {}", "✓".green().bold(), p),
+                    }
                 }
             }
         }
@@ -1137,6 +1186,26 @@ fn parse_ask_args(args: &str) -> (Option<String>, String) {
     }
 }
 
+
+/// 文件名安全化：替换路径分隔符等非法字符，限制长度。
+fn sanitize_filename(s: &str) -> String {
+    let s = s.trim();
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            _ => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '_' || c.is_whitespace()).to_string();
+    if cleaned.is_empty() {
+        "note.md".to_string()
+    } else if !cleaned.ends_with(".md") {
+        format!("{}.md", cleaned.chars().take(60).collect::<String>())
+    } else {
+        cleaned.chars().take(63).collect()
+    }
+}
 
 /// 判断是否是章节编号：如 "3", "3.2", "3.2.1"。
 fn is_section_number(s: &str) -> bool {

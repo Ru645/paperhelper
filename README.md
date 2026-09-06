@@ -28,21 +28,22 @@ pip install pymupdf
 
 ### 2. 编译
 
-本项目位于上级 Cargo workspace 下，构建需带 `-p paperhelper`：
+直接 clone 出来就是一个独立 Cargo crate，正常构建即可。如果你的上级目录恰好是 Cargo workspace（`../Cargo.toml` 把子目录当成员），则需加 `-p paperhelper`：
 
 ```bash
 git clone <仓库地址> && cd paperhelper
-cargo build -p paperhelper          # 调试构建
-cargo test  -p paperhelper          # 运行测试（13 个）
+cargo build                 # 独立 crate 直接构建
+cargo build -p paperhelper   # 在 workspace 下时加 -p
+cargo test                  # 运行测试（13 个）
 ```
 
-编译产物在 `../target/debug/paperhelper`。
+编译产物在 `./target/debug/paperhelper`。
 
 ### 3. 加入 PATH（可选，方便直接用 `paperhelper` 命令）
 
 ```bash
-# 把下面的 <项目路径> 替换为你实际的 paperhelper 上级目录
-echo 'export PATH="<项目路径>/../target/debug:$PATH"' >> ~/.bashrc
+# 把下面的 <项目路径> 替换为你实际的 paperhelper 目录
+echo 'export PATH="<项目路径>/target/debug:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -116,11 +117,33 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
   恢复方式：paperhelper -s 3
 ```
 
+### 导入选项
+
+```bash
+> ingest samples/论文.pdf           # 默认：PyMuPDF 提取文本
+> ingest --text samples/论文.txt     # 直接读取文本文件（跳过PDF解析）
+> ingest --ocr samples/扫描件.pdf    # OCR 识别（需安装 tesseract）
+```
+
+- `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果
+- `--ocr`：适合扫描版 PDF（无文本层）。需安装 `tesseract-ocr` 和中文语言包（`apt install tesseract-ocr tesseract-ocr-chi-sim`）
+
+### 推荐工作流：双开窗口
+
+命令行看长笔记不方便，推荐双开：
+
+1. **左窗口**：终端运行 `paperhelper`，对话提问
+2. **右窗口**：用 Markdown 阅读器（如 VS Code 预览、Typora、Obsidian）打开导出的 `.md` 文件
+
+每次 `ask` 后笔记自动同步更新，右窗口刷新即可看到新插入的追问解释。
+
 ## 命令一览
 
 | 命令 | 说明 |
 |------|------|
 | `ingest <pdf>` | 导入 PDF，生成结构化笔记（四段架构），自动导出 Markdown |
+| `ingest --text <txt>` | 直接读取文本文件（跳过 PDF 解析） |
+| `ingest --ocr <pdf>` | OCR 识别扫描件（需 tesseract） |
 | `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
 | `check <编号> <想法>` | 与 ask 类似但不写入笔记，用于核对理解 |
 | `blocks` | 列出笔记结构（带层级编号） |
