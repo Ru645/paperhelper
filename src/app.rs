@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use rustyline::completion::Completer;
+use rustyline::completion::{Completer, FilenameCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::MatchingBracketHighlighter;
 use rustyline::hint::Hinter;
@@ -11,6 +11,7 @@ use rustyline::validate::MatchingBracketValidator;
 use rustyline::{Cmd, Editor, KeyEvent, Helper};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -30,24 +31,80 @@ const COMMANDS: &[&str] = &[
     "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
-/// 命令补全器：补全第一个单词（命令名）。
-struct CommandCompleter;
+/// 命令补全器：
+/// - 第一个词：补全命令名
+/// - ingest/save/load/export 的参数：补全文件路径
+/// - goto/ask/check 的第一个参数：补全节点编号或 section 编号
+struct CommandCompleter {
+    file_completer: FilenameCompleter,
+    /// 当前可用的 section 编号（如 ["1", "1.1", "2", "3.2"]），由 App 在 ingest/ask 后更新
+    section_numbers: Arc<Mutex<Vec<String>>>,
+    /// 当前可用的对话树节点编号（如 ["1", "2", "3"]），由 App 在 ingest/ask/goto 后更新
+    node_numbers: Arc<Mutex<Vec<String>>>,
+}
 
 impl Completer for CommandCompleter {
     type Candidate = String;
     fn complete(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
         let start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
         let word = &line[start..pos];
+
+        // 第一个词：补全命令名
         if line[..start].trim().is_empty() {
             let matches: Vec<String> = COMMANDS
                 .iter()
                 .filter(|c| c.starts_with(word))
                 .map(|c| c.to_string())
                 .collect();
-            Ok((start, matches))
-        } else {
-            Ok((start, Vec::new()))
+            return Ok((start, matches));
         }
+
+        // 解析命令名
+        let cmd = line.trim_start().split_whitespace().next().unwrap_or("");
+        let args_started = line.trim_start().len() > cmd.len() && line[start - 1..start].trim().is_empty();
+
+        // 文件路径补全的命令
+        if matches!(cmd, "ingest" | "save" | "load" | "export") {
+            let (s, pairs) = self.file_completer.complete_path(line, pos)?;
+            let candidates: Vec<String> = pairs.into_iter().map(|p| p.replacement).collect();
+            return Ok((s, candidates));
+        }
+
+        // export 的格式补全：export <md|mindmap> <file>
+        if cmd == "export" && !args_started {
+            let matches: Vec<String> = ["md", "markdown", "mindmap", "mm"]
+                .iter()
+                .filter(|f| f.starts_with(word))
+                .map(|s| s.to_string())
+                .collect();
+            if !matches.is_empty() {
+                return Ok((start, matches));
+            }
+        }
+
+        // goto 的参数：补全对话树节点编号
+        if cmd == "goto" {
+            let nums = self.node_numbers.lock().unwrap();
+            let matches: Vec<String> = nums
+                .iter()
+                .filter(|n| n.starts_with(word))
+                .map(|n| n.to_string())
+                .collect();
+            return Ok((start, matches));
+        }
+
+        // ask/check 的第一个参数：补全 section 编号
+        if matches!(cmd, "ask" | "check") {
+            let nums = self.section_numbers.lock().unwrap();
+            let matches: Vec<String> = nums
+                .iter()
+                .filter(|n| n.starts_with(word))
+                .map(|n| n.to_string())
+                .collect();
+            return Ok((start, matches));
+        }
+
+        Ok((start, Vec::new()))
     }
 }
 
@@ -84,9 +141,13 @@ impl rustyline::validate::Validator for PaperHelperHelper {
 }
 
 impl PaperHelperHelper {
-    fn new() -> Self {
+    fn new(section_numbers: Arc<Mutex<Vec<String>>>, node_numbers: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
-            completer: CommandCompleter,
+            completer: CommandCompleter {
+                file_completer: FilenameCompleter::new(),
+                section_numbers,
+                node_numbers,
+            },
             highlighter: MatchingBracketHighlighter::new(),
             validator: MatchingBracketValidator::new(),
         }
@@ -100,6 +161,10 @@ pub struct App {
     pub client: reqwest::Client,
     /// ask 后自动导出笔记的文件路径（ingest 时由用户指定）。
     pub export_path: Option<String>,
+    /// 当前笔记的 section 编号列表（供补全用）
+    section_numbers: Arc<Mutex<Vec<String>>>,
+    /// 当前对话树节点编号列表（供补全用）
+    node_numbers: Arc<Mutex<Vec<String>>>,
 }
 
 impl App {
@@ -110,6 +175,8 @@ impl App {
             session: Session::default(),
             client,
             export_path: None,
+            section_numbers: Arc::new(Mutex::new(Vec::new())),
+            node_numbers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -143,10 +210,15 @@ impl App {
 
         let hist_path = crate::paths::data_dir().join("history.txt");
         let mut rl = Editor::<PaperHelperHelper, DefaultHistory>::new()?;
-        rl.set_helper(Some(PaperHelperHelper::new()));
+        rl.set_helper(Some(PaperHelperHelper::new(
+            self.section_numbers.clone(),
+            self.node_numbers.clone(),
+        )));
         // 绑定 Ctrl-C 为中断信号（不打断程序，只取消当前输入/任务）
         rl.bind_sequence(KeyEvent::ctrl('c'), Cmd::Interrupt);
         let _ = rl.load_history(&hist_path);
+        // 初始化补全编号（恢复会话后也能补全）
+        self.update_completions();
 
         loop {
             let cur = self.session.conversation.current_label().to_string();
@@ -291,7 +363,9 @@ impl App {
                 println!("未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
             }
-        }
+        }?;
+        self.update_completions();
+        Ok(())
     }
 
     fn cmd_help(&self) -> Result<()> {
@@ -640,6 +714,7 @@ PaperHelper 命令：
             std::fs::write(&export_file, export::to_markdown(note))?;
             println!("{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
+        self.update_completions();
         Ok(())
     }
 
@@ -829,6 +904,7 @@ PaperHelper 命令：
         if res.estimated {
             println!("[注: 本次 token 数为估算]");
         }
+        self.update_completions();
         Ok(())
     }
 
@@ -912,6 +988,7 @@ PaperHelper 命令：
         if res.estimated {
             println!("[注: 本次 token 数为估算]");
         }
+        self.update_completions();
         Ok(())
     }
 
@@ -934,6 +1011,24 @@ PaperHelper 命令：
         let cost = input as f64 * in_price / 1_000_000.0 + output as f64 * out_price / 1_000_000.0;
         self.session.stats.add(input, output, cost);
         self.kb.stats.add(input, output, cost);
+    }
+
+    /// 更新补全用的编号列表（section 编号 + 对话树节点编号）。
+    fn update_completions(&self) {
+        let sections: Vec<String> = if let Some(note) = &self.session.notes {
+            note.flatten()
+                .iter()
+                .filter(|(b, _)| b.kind == notes::BlockKind::Section && !b.number.is_empty())
+                .map(|(b, _)| b.number.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        *self.section_numbers.lock().unwrap() = sections;
+
+        let order = self.session.conversation.dfs_order();
+        let nodes: Vec<String> = (1..=order.len()).map(|i| i.to_string()).collect();
+        *self.node_numbers.lock().unwrap() = nodes;
     }
 
     /// 构建 ask/check 共用的上下文消息（论文全文+笔记+对话路径+概念注入）。
