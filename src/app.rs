@@ -31,6 +31,19 @@ const COMMANDS: &[&str] = &[
     "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
+/// config set 可设置的键名（补全用）
+const CONFIG_KEYS: &[&str] = &[
+    "llm.api_key",
+    "llm.api_endpoint",
+    "llm.model",
+    "llm.context_length",
+    "llm.thinking_mode",
+    "llm.pdf_input",
+    "pricing.input_price_per_1m",
+    "pricing.output_price_per_1m",
+    "budget.token_budget",
+];
+
 /// 命令补全器：
 /// - 第一个词：补全命令名
 /// - ingest/save/load/export 的参数：补全文件路径
@@ -61,6 +74,52 @@ impl Completer for CommandCompleter {
 
         // 解析命令名
         let cmd = line.trim_start().split_whitespace().next().unwrap_or("");
+
+        // config 的子命令/键名/值补全
+        if cmd == "config" {
+            let words_before = line[..start].split_whitespace().count();
+            match words_before {
+                // 第一个参数：补全子命令 set/show
+                1 => {
+                    let matches: Vec<String> = ["set", "show"]
+                        .iter()
+                        .filter(|s| s.starts_with(word))
+                        .map(|s| s.to_string())
+                        .collect();
+                    return Ok((start, matches));
+                }
+                // set 后的键名
+                2 if line[..start].split_whitespace().nth(1) == Some("set") => {
+                    let matches: Vec<String> = CONFIG_KEYS
+                        .iter()
+                        .filter(|k| k.starts_with(word))
+                        .map(|k| k.to_string())
+                        .collect();
+                    return Ok((start, matches));
+                }
+                // set 后的值（按键名给出常用候选）
+                3 if line[..start].split_whitespace().nth(1) == Some("set") => {
+                    let key = line[..start].split_whitespace().nth(2).unwrap_or("");
+                    let candidates: &[&str] = match key {
+                        "llm.thinking_mode" | "llm.pdf_input" => &["true", "false"],
+                        "llm.api_endpoint" => &[
+                            "https://api.deepseek.com/v1/chat/completions",
+                            "https://api.openai.com/v1/chat/completions",
+                        ],
+                        "llm.model" => &["deepseek-v4-pro", "deepseek-v4-flash", "gpt-4o-mini"],
+                        _ => &[],
+                    };
+                    let matches: Vec<String> = candidates
+                        .iter()
+                        .filter(|c| c.starts_with(word))
+                        .map(|s| s.to_string())
+                        .collect();
+                    return Ok((start, matches));
+                }
+                _ => return Ok((start, Vec::new())),
+            }
+        }
+
         let args_started = line.trim_start().len() > cmd.len() && line[start - 1..start].trim().is_empty();
 
         // 文件路径补全的命令
@@ -1251,7 +1310,9 @@ fn mask_key(k: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_concept;
+    use super::{extract_concept, CommandCompleter};
+    use rustyline::completion::Completer;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn extract_concept_from_answer() {
@@ -1267,6 +1328,55 @@ mod tests {
         let (clean, concept) = extract_concept(content, "注意力机制是什么");
         assert_eq!(clean, content);
         assert!(!concept.is_empty());
+    }
+
+    fn make_completer() -> CommandCompleter {
+        CommandCompleter {
+            file_completer: rustyline::completion::FilenameCompleter::new(),
+            section_numbers: Arc::new(Mutex::new(vec!["1".into(), "3.2".into()])),
+            node_numbers: Arc::new(Mutex::new(vec!["1".into(), "2".into()])),
+        }
+    }
+
+    fn complete(line: &str) -> Vec<String> {
+        let c = make_completer();
+        // 模拟光标在行尾
+        let (_, cands) = c.complete(line, line.len(), &mut rustyline::Context::new(&rustyline::history::MemHistory::new())).unwrap();
+        cands
+    }
+
+    #[test]
+    fn config_completes_subcommand() {
+        let cands = complete("config ");
+        assert!(cands.contains(&"set".to_string()), "应有 set: {cands:?}");
+        assert!(cands.contains(&"show".to_string()), "应有 show: {cands:?}");
+        // 前缀过滤（set 和 show 都以 s 开头；用 se 只剩 set）
+        let cands = complete("config se");
+        assert!(cands.contains(&"set".to_string()));
+        assert!(!cands.contains(&"show".to_string()), "se 前缀不应匹配 show: {cands:?}");
+    }
+
+    #[test]
+    fn config_completes_keys() {
+        let cands = complete("config set ");
+        assert!(cands.contains(&"llm.api_key".to_string()), "应有 llm.api_key: {cands:?}");
+        assert!(cands.contains(&"budget.token_budget".to_string()));
+        // 前缀过滤
+        let cands = complete("config set llm.");
+        assert!(cands.iter().all(|c| c.starts_with("llm.")));
+        assert!(cands.contains(&"llm.model".to_string()));
+        // show 后不补键名
+        let cands = complete("config show ");
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn config_completes_values() {
+        let cands = complete("config set llm.thinking_mode ");
+        assert!(cands.contains(&"true".to_string()));
+        assert!(cands.contains(&"false".to_string()));
+        let cands = complete("config set llm.api_endpoint ");
+        assert!(cands.iter().any(|c| c.contains("deepseek")));
     }
 }
 
