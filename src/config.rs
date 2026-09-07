@@ -9,6 +9,9 @@ pub struct Config {
     pub llm: LlmConfig,
     pub pricing: PricingConfig,
     pub budget: BudgetConfig,
+    /// 补全用的预设（模型名/端点候选），用户可在 config.toml 里增删。
+    #[serde(default)]
+    pub presets: PresetsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +38,31 @@ pub struct BudgetConfig {
     pub token_budget: u64, // 0 = unlimited
 }
 
+/// `config set` 的候选值预设（供 Tab 补全）。用户可在 .paperhelper/config.toml 增删。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetsConfig {
+    /// 模型名候选
+    pub models: Vec<String>,
+    /// API 端点候选
+    pub endpoints: Vec<String>,
+}
+
+impl Default for PresetsConfig {
+    fn default() -> Self {
+        PresetsConfig {
+            models: vec![
+                "deepseek-v4-pro".into(),
+                "deepseek-v4-flash".into(),
+                "gpt-4o-mini".into(),
+            ],
+            endpoints: vec![
+                "https://api.deepseek.com/v1/chat/completions".into(),
+                "https://api.openai.com/v1/chat/completions".into(),
+            ],
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -53,6 +81,7 @@ impl Default for Config {
             budget: BudgetConfig {
                 token_budget: 0,
             },
+            presets: PresetsConfig::default(),
         }
     }
 }

@@ -185,6 +185,9 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 .paperhelper/
 ├── config.toml          # 配置文件
 ├── knowledge.json        # 跨论文知识库（论文+概念+累计用量）
+├── prompts/              # 提示词模板（可编辑）
+│   ├── ask.txt           # ask/check 的 system prompt
+│   └── note.txt          # 笔记生成模板（{raw_text} 为论文占位符）
 └── sessions/             # 会话存档
     ├── counter           # ID 计数器
     ├── 1.json            # 会话 1
@@ -192,6 +195,17 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 ```
 
 所有文件已被 `.gitignore` 忽略，不会泄露。
+
+### 自定义提示词与补全预设
+
+- **提示词**：直接编辑 `.paperhelper/prompts/ask.txt` 和 `note.txt`。`note.txt` 中 `{raw_text}` 会被替换为论文全文。改完重启生效；删除文件则恢复内置默认。
+- **补全预设**：`config.toml` 的 `[presets]` 节可增删 `config set llm.model` / `llm.api_endpoint` 的 Tab 补全候选：
+
+```toml
+[presets]
+models = ["deepseek-v4-pro", "deepseek-v4-flash", "gpt-4o-mini"]
+endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai.com/v1/chat/completions"]
+```
 
 ## 技术架构
 

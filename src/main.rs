@@ -8,6 +8,7 @@ mod llm;
 mod notes;
 mod paths;
 mod pdf;
+mod prompts;
 mod session;
 
 use anyhow::{anyhow, Result};

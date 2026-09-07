@@ -24,36 +24,63 @@ use crate::notes::{self, Explanation};
 use crate::pdf;
 use crate::session::Session;
 
-const SYS_ASK: &str = "你是一位耐心的论文学习助手。用户会给你一篇论文的全文、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。\n\n回答完毕后，另起一行写 [[概念: 概念名]]，概念名是1-8个词的短语，概括本次问答涉及的核心知识点（如\"BERTScore\"、\"MQAG框架\"、\"语义熵\"）。";
+/// ask/check 的 system prompt：优先用 .paperhelper/prompts/ask.txt（用户可编辑），
+/// 不存在则用内置默认并首启写出。
+fn sys_ask() -> String {
+    crate::prompts::load_prompt(
+        &crate::prompts::prompts_dir(),
+        "ask.txt",
+        crate::prompts::DEFAULT_ASK_PROMPT,
+    )
+}
 
 const COMMANDS: &[&str] = &[
     "ingest", "ask", "check", "blocks", "note", "tree", "goto", "stats", "budget",
     "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
-/// config set 可设置的键名（补全用）
-const CONFIG_KEYS: &[&str] = &[
-    "llm.api_key",
-    "llm.api_endpoint",
-    "llm.model",
-    "llm.context_length",
-    "llm.thinking_mode",
-    "llm.pdf_input",
-    "pricing.input_price_per_1m",
-    "pricing.output_price_per_1m",
-    "budget.token_budget",
+/// 配置键定义表：补全与用法提示的单一来源。
+/// set_config 的 match 分支与此表保持键名一致。
+struct ConfigKeyDef {
+    key: &'static str,
+    /// bool 型键（补全候选 true/false）；其余按 presets 或不补全
+    is_bool: bool,
+    /// 模型/端点类键（候选来自 config 的 presets）
+    from_presets: Option<PresetKind>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum PresetKind {
+    Models,
+    Endpoints,
+}
+
+const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
+    ConfigKeyDef { key: "llm.api_key", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "llm.api_endpoint", is_bool: false, from_presets: Some(PresetKind::Endpoints) },
+    ConfigKeyDef { key: "llm.model", is_bool: false, from_presets: Some(PresetKind::Models) },
+    ConfigKeyDef { key: "llm.context_length", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "llm.thinking_mode", is_bool: true, from_presets: None },
+    ConfigKeyDef { key: "llm.pdf_input", is_bool: true, from_presets: None },
+    ConfigKeyDef { key: "pricing.input_price_per_1m", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "pricing.output_price_per_1m", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
 ];
 
 /// 命令补全器：
 /// - 第一个词：补全命令名
 /// - ingest/save/load/export 的参数：补全文件路径
 /// - goto/ask/check 的第一个参数：补全节点编号或 section 编号
+/// - config：子命令 / 键名（表驱动）/ 值候选（bool 表驱动，模型与端点来自 presets）
 struct CommandCompleter {
     file_completer: FilenameCompleter,
     /// 当前可用的 section 编号（如 ["1", "1.1", "2", "3.2"]），由 App 在 ingest/ask 后更新
     section_numbers: Arc<Mutex<Vec<String>>>,
     /// 当前可用的对话树节点编号（如 ["1", "2", "3"]），由 App 在 ingest/ask/goto 后更新
     node_numbers: Arc<Mutex<Vec<String>>>,
+    /// 模型名/端点候选（从 config 的 presets 克隆，改 config.toml 后重启生效）
+    preset_models: Vec<String>,
+    preset_endpoints: Vec<String>,
 }
 
 impl Completer for CommandCompleter {
@@ -88,31 +115,32 @@ impl Completer for CommandCompleter {
                         .collect();
                     return Ok((start, matches));
                 }
-                // set 后的键名
+                // set 后的键名（从 CONFIG_KEY_DEFS 表派生）
                 2 if line[..start].split_whitespace().nth(1) == Some("set") => {
-                    let matches: Vec<String> = CONFIG_KEYS
+                    let matches: Vec<String> = CONFIG_KEY_DEFS
                         .iter()
-                        .filter(|k| k.starts_with(word))
-                        .map(|k| k.to_string())
+                        .filter(|d| d.key.starts_with(word))
+                        .map(|d| d.key.to_string())
                         .collect();
                     return Ok((start, matches));
                 }
-                // set 后的值（按键名给出常用候选）
+                // set 后的值：bool 键从表派生；模型/端点从 presets 读
                 3 if line[..start].split_whitespace().nth(1) == Some("set") => {
                     let key = line[..start].split_whitespace().nth(2).unwrap_or("");
-                    let candidates: &[&str] = match key {
-                        "llm.thinking_mode" | "llm.pdf_input" => &["true", "false"],
-                        "llm.api_endpoint" => &[
-                            "https://api.deepseek.com/v1/chat/completions",
-                            "https://api.openai.com/v1/chat/completions",
-                        ],
-                        "llm.model" => &["deepseek-v4-pro", "deepseek-v4-flash", "gpt-4o-mini"],
-                        _ => &[],
+                    let def = CONFIG_KEY_DEFS.iter().find(|d| d.key == key);
+                    let candidates: Vec<String> = match def {
+                        Some(d) if d.is_bool => vec!["true".into(), "false".into()],
+                        Some(d) => match d.from_presets {
+                            Some(PresetKind::Models) => self.preset_models.clone(),
+                            Some(PresetKind::Endpoints) => self.preset_endpoints.clone(),
+                            None => vec![],
+                        },
+                        None => vec![],
                     };
                     let matches: Vec<String> = candidates
                         .iter()
                         .filter(|c| c.starts_with(word))
-                        .map(|s| s.to_string())
+                        .cloned()
                         .collect();
                     return Ok((start, matches));
                 }
@@ -200,12 +228,19 @@ impl rustyline::validate::Validator for PaperHelperHelper {
 }
 
 impl PaperHelperHelper {
-    fn new(section_numbers: Arc<Mutex<Vec<String>>>, node_numbers: Arc<Mutex<Vec<String>>>) -> Self {
+    fn new(
+        section_numbers: Arc<Mutex<Vec<String>>>,
+        node_numbers: Arc<Mutex<Vec<String>>>,
+        preset_models: Vec<String>,
+        preset_endpoints: Vec<String>,
+    ) -> Self {
         Self {
             completer: CommandCompleter {
                 file_completer: FilenameCompleter::new(),
                 section_numbers,
                 node_numbers,
+                preset_models,
+                preset_endpoints,
             },
             highlighter: MatchingBracketHighlighter::new(),
             validator: MatchingBracketValidator::new(),
@@ -228,6 +263,8 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, kb: KnowledgeBase, client: reqwest::Client) -> Self {
+        // 首次启动写出默认提示词模板，供用户在 .paperhelper/prompts/ 编辑
+        let _ = crate::prompts::ensure_prompt_files();
         Self {
             config,
             kb,
@@ -272,6 +309,8 @@ impl App {
         rl.set_helper(Some(PaperHelperHelper::new(
             self.section_numbers.clone(),
             self.node_numbers.clone(),
+            self.config.presets.models.clone(),
+            self.config.presets.endpoints.clone(),
         )));
         // 绑定 Ctrl-C 为中断信号（不打断程序，只取消当前输入/任务）
         rl.bind_sequence(KeyEvent::ctrl('c'), Cmd::Interrupt);
@@ -483,10 +522,8 @@ PaperHelper 命令：
                 let (key, val) = split_cmd(args);
                 if key.is_empty() {
                     println!("用法: config set <key> <value>");
-                    println!("可设: llm.api_key llm.api_endpoint llm.model llm.context_length \
-                              llm.thinking_mode llm.pdf_input \
-                              pricing.input_price_per_1m pricing.output_price_per_1m \
-                              budget.token_budget");
+                    let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
+                    println!("可设: {}", keys.join(" "));
                     println!("常见端点：");
                     println!("  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
                     println!("  OpenAI   : https://api.openai.com/v1/chat/completions    model=gpt-4o-mini");
@@ -515,7 +552,10 @@ PaperHelper 命令：
             "pricing.input_price_per_1m" => self.config.pricing.input_price_per_1m = val.parse().context("需要数字")?,
             "pricing.output_price_per_1m" => self.config.pricing.output_price_per_1m = val.parse().context("需要数字")?,
             "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
-            _ => bail!("未知配置项: {key}（help 可看可设项）"),
+            _ => {
+                let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
+                bail!("未知配置项: {key}。可设: {}", keys.join(" "));
+            }
         }
         Ok(())
     }
@@ -724,21 +764,13 @@ PaperHelper 命令：
         if !budget_ok {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
         }
-        let prompt = format!(
-            "请阅读以下论文全文，生成一份**详细**的学习笔记 Markdown，遵循固定四段架构。\n\n\
-             架构与分块规则：\n\
-             - 第一行 `# 论文标题`。\n\
-             - 用四个一级章节 `## 一、要解决的问题` `## 二、前人方案及其不足` `## 三、本文方案及其优点` `## 四、前景与发展方向`。\n\
-             - 每个一级章节下，用 `###` 三级小标题细分。例如：\n\
-               - 「二、前人方案」下，每个前人方案一个 `###` 小标题，说清做法与不足；\n\
-               - 「三、本文方案」下，若论文提出多个方案/变体（如 5 种变体），**每个变体单独一个 `###` 小标题**，详细说明做法、公式、数据、直觉、优缺点；\n\
-               - 「四、前景」下，每个方向一个 `###` 小标题。\n\
-             - 每个 `###` 小标题下的内容（含多段落、公式、表格）合并为一块，不要为每句话单独成块。\n\
-             - 关键公式用 `$$...$$` 包裹，直接写在所属段落里。\n\
-             - 要详细：保留论文中的关键公式、数值结果、对比表格（用 markdown 表格）、算法步骤。不要泛泛概括，要展开具体内容。\n\
-             - 不要输出额外说明，直接给 Markdown。\n\n\
-             论文全文：\n{raw_text}"
+        // 提示词模板：.paperhelper/prompts/note.txt（用户可编辑），{raw_text} 为占位符
+        let template = crate::prompts::load_prompt(
+            &crate::prompts::prompts_dir(),
+            "note.txt",
+            crate::prompts::DEFAULT_NOTE_PROMPT,
         );
+        let prompt = template.replace("{raw_text}", &raw_text);
         let msgs = vec![
             Message { role: "system".into(), content: "你是论文笔记生成助手，只输出 Markdown。".into() },
             Message { role: "user".into(), content: prompt },
@@ -1186,7 +1218,7 @@ PaperHelper 命令：
         }
 
         let mut msgs = vec![
-            Message { role: "system".into(), content: SYS_ASK.into() },
+            Message { role: "system".into(), content: sys_ask() },
             Message { role: "user".into(), content: format!("【论文全文】\n{raw_text}") },
             Message { role: "assistant".into(), content: format!("【已生成笔记】\n{notes_md}") },
         ];
@@ -1335,6 +1367,8 @@ mod tests {
             file_completer: rustyline::completion::FilenameCompleter::new(),
             section_numbers: Arc::new(Mutex::new(vec!["1".into(), "3.2".into()])),
             node_numbers: Arc::new(Mutex::new(vec!["1".into(), "2".into()])),
+            preset_models: vec!["deepseek-v4-pro".into(), "test-model".into()],
+            preset_endpoints: vec!["https://api.deepseek.com/v1/chat/completions".into()],
         }
     }
 
