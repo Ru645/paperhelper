@@ -27,6 +27,9 @@ pub struct Explanation {
     pub created_at: String,
     #[serde(default)]
     pub children: Vec<Explanation>,
+    /// sum 生成的知识卡片（"总结：……"），渲染在该追问块内。
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,6 +674,7 @@ mod tests {
             concept: "transformer".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             children: Vec::new(),
+            summary: None,
         });
         let md_out = crate::export::to_markdown(&note);
         assert!(md_out.contains("追问"), "export should include explanation: {md_out}");
@@ -698,7 +702,9 @@ mod tests {
                 concept: "方法A参数".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 children: Vec::new(),
+                summary: None,
             }],
+            summary: None,
         });
         let out = crate::export::to_markdown(&note);
         // 顶层用 > ，子层用 > >
@@ -712,8 +718,32 @@ mod tests {
     }
 
     #[test]
-    fn sibling_explanations_separated() {
-        // 同一父亲下的两个儿子之间应有裸空行断开
+    fn summary_rendered_inside_explanation() {
+        // sum 生成的总结应渲染为追问块内的 "**总结**：…"，紧随解答
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "p".into(),
+            question: "父".into(),
+            answer: "父答".into(),
+            concept: "c".into(),
+            created_at: "t".into(),
+            children: vec![],
+            summary: Some("n-gram 用采样频率近似概率，Max(-log p) 最有效。".into()),
+        });
+        let out = crate::export::to_markdown(&note);
+        assert!(out.contains("**总结**：n-gram"), "应渲染总结: {out}");
+        // 总结在解答之后、同级前缀（> **总结**）
+        let ia = out.find("**解答**：父答").expect("解答");
+        let is = out.find("**总结**：n-gram").expect("总结");
+        assert!(ia < is, "总结应在解答后");
+        assert!(out[..is].ends_with(">\n> "), "总结应与解答同级连续: {}",
+            out[..is].chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+    }
+
+    #[test]
+    fn sibling_explanations_separated() {        // 同一父亲下的两个儿子之间应有裸空行断开
         let md = "# T\n## M\nSome method.\n";
         let mut note = parse_markdown_note(md, "raw");
         let bid = note.locate("method").unwrap().id.clone();
@@ -724,9 +754,10 @@ mod tests {
             concept: "c".into(),
             created_at: "t".into(),
             children: vec![
-                Explanation { id: "c1".into(), question: "儿1".into(), answer: "答1".into(), concept: "c".into(), created_at: "t".into(), children: vec![] },
-                Explanation { id: "c2".into(), question: "儿2".into(), answer: "答2".into(), concept: "c".into(), created_at: "t".into(), children: vec![] },
+                Explanation { id: "c1".into(), question: "儿1".into(), answer: "答1".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None },
+                Explanation { id: "c2".into(), question: "儿2".into(), answer: "答2".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None },
             ],
+            summary: None,
         });
         let out = crate::export::to_markdown(&note);
         let i1 = out.find("**追问**：儿1").expect("儿1");
@@ -804,7 +835,9 @@ mod tests {
                 concept: "C2".into(),
                 created_at: "t".into(),
                 children: Vec::new(),
+                summary: None,
             }],
+            summary: None,
         });
         // 找到子解释并修改
         let found = note.find_explanation_mut("child_expl").unwrap();

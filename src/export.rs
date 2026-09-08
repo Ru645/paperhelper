@@ -60,6 +60,19 @@ fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
             s.push_str(&format!("{prefix}{line}\n"));
         }
     }
+    // sum 生成的知识卡片：作为该追问自身的总结，紧随解答（同级前缀连续）
+    if let Some(summary) = &e.summary {
+        s.push_str(&format!("{parent_quote_empty}\n"));
+        let slines: Vec<&str> = summary.lines().collect();
+        if slines.is_empty() {
+            s.push_str(&format!("{prefix}**总结**：\n"));
+        } else {
+            s.push_str(&format!("{prefix}**总结**：{}\n", slines[0]));
+            for line in &slines[1..] {
+                s.push_str(&format!("{prefix}{line}\n"));
+            }
+        }
+    }
     // 递归子追问
     for (i, child) in e.children.iter().enumerate() {
         if i == 0 {

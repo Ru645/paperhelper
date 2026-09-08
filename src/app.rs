@@ -480,7 +480,7 @@ PaperHelper 命令：
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
   check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
                           例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
-  sum                      把当前节点子树的追问概括成知识卡片，追加到 <笔记名>.cards.md
+  sum                      把当前节点子树的追问概括为「总结：…」插入笔记对应追问处
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -952,6 +952,7 @@ PaperHelper 命令：
                         concept: concept_name.clone(),
                         created_at: now.clone(),
                         children: Vec::new(),
+                        summary: None,
                     });
                 }
             }
@@ -978,6 +979,7 @@ PaperHelper 命令：
                                 concept: concept_name.clone(),
                                 created_at: now.clone(),
                                 children: Vec::new(),
+                                summary: None,
                             });
                         }
                     }
@@ -1179,41 +1181,54 @@ PaperHelper 命令：
         let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
         let prompt = format!(
             "以下是一段关于论文《{title}》的递归追问记录（缩进表示追问层级）。\n\
-             请把它概括成一张知识卡片，Markdown 格式：\n\
-             - 首行 `## <核心概念名>`（一个简短概念，如\"BERTScore\"）\n\
-             - 然后用 3-6 条要点（`- ` 列表）概括这段追问弄明白的内容，保留关键公式与结论\n\
-             - 最后若有适用场景/注意事项，加一行 `> 提示：...`\n\
-             只输出卡片本身。\n\n{qa}"
+             请把这段追问弄明白的内容概括成一段总结，直接输出总结正文：\n\
+             - 不要标题头（不要 # 开头），3-6 句或用 `- ` 要点列表\n\
+             - 保留关键公式（用 $...$ / $$...$$）与结论\n\
+             只输出总结本身。\n\n{qa}"
         );
         let msgs = vec![
-            Message { role: "system".into(), content: "你是知识卡片生成助手，只输出 Markdown 卡片。".into() },
+            Message { role: "system".into(), content: "你是学习总结助手，只输出总结正文。".into() },
             Message { role: "user".into(), content: prompt },
         ];
 
         let bar = ProgressBar::new_spinner();
         bar.set_style(spinner_style());
-        bar.set_message("概括知识卡片中…");
+        bar.set_message("概括总结中…");
         bar.enable_steady_tick(Duration::from_millis(100));
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}).await;
         bar.finish_and_clear();
         let res = res?;
         self.record_usage(res.input_tokens, res.output_tokens);
 
-        let card = res.content.trim().to_string();
-        println!("\n{card}\n");
+        let summary = res.content.trim().to_string();
+        println!("\n**总结**：{summary}\n");
 
-        // 追加到 cards 文件：<导出笔记名>.cards.md
-        let cards_path = self.export_path.as_ref().map(|p| {
-            let t = p.trim_end_matches(".html").trim_end_matches(".md");
-            format!("{t}.cards.md")
-        }).unwrap_or_else(|| "知识卡片.cards.md".to_string());
-        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-        let entry = format!("\n---\n\n*{stamp} · 概括自对话节点「{}」及其 {} 条追问*\n\n{card}\n",
-            subtree[0].1.label, subtree.len() - 1);
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&cards_path)?;
-        f.write_all(entry.as_bytes())?;
-        println!("{} 知识卡片已追加到 {}", "✓".green().bold(), cards_path);
+        // 写入笔记：插入当前节点（或其最近有解释的祖先）对应的 Explanation.summary
+        // （从当前节点沿父链找第一个有 explanation_id 的节点）
+        let target_expl_id = {
+            let mut nid = cur.clone();
+            loop {
+                let node = self.session.conversation.nodes.iter().find(|n| n.id == nid);
+                match node {
+                    Some(n) if n.explanation_id.is_some() => break n.explanation_id.clone().unwrap(),
+                    Some(n) if n.parent.is_some() => nid = n.parent.clone().unwrap(),
+                    _ => bail!("当前对话链上没有可插入总结的追问（先 `ask` 产生追问后再 `sum`）"),
+                }
+            }
+        };
+        if let Some(note) = self.session.notes.as_mut() {
+            if let Some(expl) = note.find_explanation_mut(&target_expl_id) {
+                expl.summary = Some(summary);
+            }
+        }
+        // 自动同步导出（与 ask 相同逻辑）
+        if let Some(p) = &self.export_path {
+            if let Some(note) = &self.session.notes {
+                if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
+                    println!("{} 笔记已同步更新到 {}（已插入总结）", "✓".green().bold(), p);
+                }
+            }
+        }
         Ok(())
     }
 
