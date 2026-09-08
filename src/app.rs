@@ -378,12 +378,14 @@ impl App {
         bar.finish_and_clear();
         self.session.session_name = session_name;
 
-        // 分配保存时间戳作为会话标识（文件名 = 恢复用的 -s 参数）
-        let stamp = crate::paths::new_session_stamp();
-        let path = crate::paths::session_path(&stamp);
+        // 会话编号：首次保存时生成（保存时间戳），此后不变；文件按编号覆盖保存
+        if self.session.session_id.is_empty() {
+            self.session.session_id = crate::paths::new_session_stamp();
+        }
+        let path = crate::paths::session_path(&self.session.session_id);
         self.session.save(&path)?;
         println!("{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
-        println!("  恢复方式：paperhelper -s {}", stamp);
+        println!("  恢复会话，请执行：paperhelper -s {}", self.session.session_id);
         Ok(())
     }
 
@@ -424,8 +426,8 @@ impl App {
                 }
             }
             Err(_) => {
-                // LLM 调用失败，用时间戳兜底
-                chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
+                // LLM 调用失败，用"未命名会话"兜底（编号另由 session_id 承担）
+                "未命名会话".to_string()
             }
         }
     }

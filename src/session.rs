@@ -48,6 +48,10 @@ pub struct Session {
     /// 会话名（LLM 退出时生成，用于 -l 展示）。
     #[serde(default)]
     pub session_name: String,
+    /// 会话编号（首次保存时生成的保存时间戳，形如 20260909_020452，此后不变；
+    /// 同时也是会话文件名与 `-s` 的恢复参数）。
+    #[serde(default)]
+    pub session_id: String,
 }
 
 impl Session {
@@ -118,10 +122,13 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             session_name: String::new(),
+            session_id: String::new(),
         };
+        sess.session_id = "20260101_000000".into();
         sess.save(&path).unwrap();
 
         let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.session_id, "20260101_000000", "session_id 应随会话持久化");
         assert!(loaded.notes.is_some());
         assert_eq!(loaded.conversation.nodes.len(), 1);
         assert_eq!(loaded.stats.calls, 1);
