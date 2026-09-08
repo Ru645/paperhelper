@@ -39,11 +39,14 @@ pub struct BudgetConfig {
 }
 
 /// `config set` 的候选值预设（供 Tab 补全）。用户可在 .paperhelper/config.toml 增删。
+/// 字段缺失或为空时回落到内置默认。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresetsConfig {
     /// 模型名候选
+    #[serde(default)]
     pub models: Vec<String>,
     /// API 端点候选
+    #[serde(default)]
     pub endpoints: Vec<String>,
 }
 
@@ -59,6 +62,18 @@ impl Default for PresetsConfig {
                 "https://api.deepseek.com/v1/chat/completions".into(),
                 "https://api.openai.com/v1/chat/completions".into(),
             ],
+        }
+    }
+}
+
+impl PresetsConfig {
+    /// 缺失/为空的项回落默认（允许用户只自定义其中一组）。
+    fn fill_missing_defaults(&mut self) {
+        if self.models.is_empty() {
+            self.models = PresetsConfig::default().models;
+        }
+        if self.endpoints.is_empty() {
+            self.endpoints = PresetsConfig::default().endpoints;
         }
     }
 }
@@ -93,10 +108,13 @@ impl Config {
         let path = paths::config_path();
         let mut cfg = if path.exists() {
             let s = fs::read_to_string(&path).context("读取 config.toml")?;
-            toml::from_str(&s).context("解析 config.toml")?
+            toml::from_str::<Config>(&s)
+                .with_context(|| format!("解析 config.toml 失败（文件可能被改坏，可删除 {} 恢复默认）", path.display()))?
         } else {
             Config::default()
         };
+        // presets 字段缺失/为空时回落默认
+        cfg.presets.fill_missing_defaults();
 
         if let Ok(v) = std::env::var("PAPERHELPER_API_KEY") {
             cfg.llm.api_key = v;

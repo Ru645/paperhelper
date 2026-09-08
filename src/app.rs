@@ -530,10 +530,11 @@ PaperHelper 命令：
                     println!("  本地Ollama: http://localhost:11434/v1/chat/completions    model=qwen2.5:7b");
                     return Ok(());
                 }
-                self.set_config(key, val)?;
+                let val = normalize_path_arg(val);
+                self.set_config(key, &val)?;
                 self.config.save()?;
                 // api_key 脱敏回显，避免明文泄露
-                let display = if key == "llm.api_key" { mask_key(val) } else { val.to_string() };
+                let display = if key == "llm.api_key" { mask_key(&val) } else { val.clone() };
                 println!("已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
             }
             _ => println!("用法: config [show | set <key> <value>]"),
@@ -653,8 +654,8 @@ PaperHelper 命令：
     }
 
     async fn cmd_save(&mut self, rest: &str) -> Result<()> {
-        let path = if rest.trim().is_empty() { "session.json" } else { rest.trim() };
-        self.session.save(Path::new(path))?;
+        let path = if rest.trim().is_empty() { "session.json".to_string() } else { normalize_path_arg(rest) };
+        self.session.save(Path::new(&path))?;
         println!("会话已保存到 {path}");
         Ok(())
     }
@@ -663,7 +664,8 @@ PaperHelper 命令：
         if rest.trim().is_empty() {
             bail!("用法: load <文件>");
         }
-        self.session = Session::load(Path::new(rest.trim()))?;
+        let path = normalize_path_arg(rest);
+        self.session = Session::load(Path::new(&path))?;
         println!("已加载会话: 笔记={}, 对话节点={}",
             self.session.notes.is_some(),
             self.session.conversation.nodes.len());
@@ -675,13 +677,14 @@ PaperHelper 命令：
         if path.is_empty() {
             bail!("用法: export <markdown|mindmap> <文件>");
         }
+        let path = normalize_path_arg(path);
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
         let content = match fmt {
             "md" | "markdown" => export::to_markdown(note),
             "mindmap" | "mm" => export::to_mindmap(note),
             _ => bail!("未知格式: {fmt}（可用: markdown, mindmap）"),
         };
-        std::fs::write(path, content)?;
+        std::fs::write(&path, content)?;
         println!("已导出到 {path}");
         Ok(())
     }
@@ -690,21 +693,21 @@ PaperHelper 命令：
 
     async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
         let rest = rest.trim();
-        // 解析选项
-        let (mode, file_path) = if rest.starts_with("--text ") {
-            ("text", rest[7..].trim())
-        } else if rest.starts_with("--ocr ") {
-            ("ocr", rest[6..].trim())
+        // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
+        let (mode, file_path) = if let Some(r) = rest.strip_prefix("--text ") {
+            ("text", normalize_path_arg(r))
+        } else if let Some(r) = rest.strip_prefix("--ocr ") {
+            ("ocr", normalize_path_arg(r))
         } else if rest == "--text" || rest == "--ocr" {
             bail!("用法: ingest --text <txt路径>  或  ingest --ocr <pdf路径>  或  ingest <pdf路径>");
         } else {
-            ("pdf", rest)
+            ("pdf", normalize_path_arg(rest))
         };
 
         if file_path.is_empty() {
             bail!("用法: ingest <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
-        let p = Path::new(file_path);
+        let p = Path::new(&file_path);
         if !p.exists() {
             bail!("文件不存在: {file_path}");
         }
@@ -742,7 +745,7 @@ PaperHelper 命令：
         }
 
         // 2. 先询问笔记导出文件名（在等待 LLM 时让用户知道笔记存哪）
-        let stem = Path::new(file_path)
+        let stem = Path::new(&file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
@@ -756,7 +759,7 @@ PaperHelper 命令：
         let export_file = if name.is_empty() {
             default_name.clone()
         } else {
-            sanitize_filename(name)
+            sanitize_filename(&normalize_path_arg(name))
         };
 
         // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
@@ -838,6 +841,11 @@ PaperHelper 命令：
         self.session.conversation.current = Some(root_id);
 
         // 7. 导出 markdown 笔记（文件名在第 2 步已询问）
+        if let Some(parent) = Path::new(&export_file).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                bail!("导出目录不存在: {}（请先创建目录，或改用当前目录下的文件名）", parent.display());
+            }
+        }
         self.export_path = Some(export_file.clone());
         if let Some(note) = &self.session.notes {
             std::fs::write(&export_file, export::to_markdown(note))?;
@@ -1243,6 +1251,22 @@ PaperHelper 命令：
 
 // ===== 辅助函数 =====
 
+/// 解析用户输入的文件路径/值参数（shell 风格）：
+/// - 整体被 "..." 包裹 → 剥掉双引号（内部反斜杠转义一并还原）
+/// - 整体被 '...' 包裹 → 剥掉单引号（内部无转义）
+/// - 否则 → 还原反斜杠转义（Tab 补全器对含空格路径插入的 `my\ file.pdf` 形式）
+/// 这样 `ingest my\ file.pdf`、`ingest "my file.pdf"`、`ingest 'my file.pdf'` 均可用。
+fn normalize_path_arg(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        rustyline::completion::unescape(&t[1..t.len() - 1], Some('\\')).into_owned()
+    } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        t[1..t.len() - 1].to_string()
+    } else {
+        rustyline::completion::unescape(t, Some('\\')).into_owned()
+    }
+}
+
 fn split_cmd(line: &str) -> (&str, &str) {
     let mut it = line.splitn(2, char::is_whitespace);
     let cmd = it.next().unwrap_or("");
@@ -1278,23 +1302,25 @@ fn parse_ask_args(args: &str) -> (Option<String>, String) {
 }
 
 
-/// 文件名安全化：替换路径分隔符等非法字符，限制长度。
+/// 文件名安全化：替换非法字符（保留 `/` 目录分隔符与空格，允许用户指定输出目录），
+/// 限制长度。若含路径，父目录需存在。
 fn sanitize_filename(s: &str) -> String {
     let s = s.trim();
     let cleaned: String = s
         .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            // 保留 '/'（目录分隔符）、空格、中文等合法字符
             _ => c,
         })
         .collect();
-    let cleaned = cleaned.trim_matches(|c: char| c == '_' || c.is_whitespace()).to_string();
+    let cleaned = cleaned.trim().to_string();
     if cleaned.is_empty() {
         "note.md".to_string()
     } else if !cleaned.ends_with(".md") {
-        format!("{}.md", cleaned.chars().take(60).collect::<String>())
+        format!("{}.md", cleaned.chars().take(80).collect::<String>())
     } else {
-        cleaned.chars().take(63).collect()
+        cleaned.chars().take(83).collect()
     }
 }
 
@@ -1342,7 +1368,7 @@ fn mask_key(k: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_concept, CommandCompleter};
+    use super::{extract_concept, normalize_path_arg, CommandCompleter};
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
 
@@ -1411,6 +1437,44 @@ mod tests {
         assert!(cands.contains(&"false".to_string()));
         let cands = complete("config set llm.api_endpoint ");
         assert!(cands.iter().any(|c| c.contains("deepseek")));
+    }
+
+    #[test]
+    fn normalize_path_arg_forms() {
+        // 双引号包裹
+        assert_eq!(normalize_path_arg("\"my file.pdf\""), "my file.pdf");
+        // 单引号包裹
+        assert_eq!(normalize_path_arg("'my file.pdf'"), "my file.pdf");
+        // 补全器插入的反斜杠转义
+        assert_eq!(normalize_path_arg("my\\ file.pdf"), "my file.pdf");
+        // 转义的括号/引号（中文文件名常见）
+        assert_eq!(normalize_path_arg("【MIND】\\ paper.pdf"), "【MIND】 paper.pdf");
+        // 普通路径原样
+        assert_eq!(normalize_path_arg("samples/paper.pdf"), "samples/paper.pdf");
+        // 首尾空格剥掉
+        assert_eq!(normalize_path_arg("  a.pdf  "), "a.pdf");
+        // 双引号内转义的引号
+        assert_eq!(normalize_path_arg("\"a\\\"b.pdf\""), "a\"b.pdf");
+    }
+
+    #[test]
+    fn normalize_path_arg_integration() {
+        // 创建带空格文件名的临时文件，验证 normalize 后能命中存在检查
+        let dir = std::env::temp_dir().join("paperhelper_space_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("my file.pdf");
+        std::fs::write(&p, "x").unwrap();
+        let base = dir.to_str().unwrap();
+        // 三种 shell 风格：引号包整体 / 反斜杠转义
+        for form in [
+            format!("\"{base}/my file.pdf\""),
+            format!("'{base}/my file.pdf'"),
+            format!("{base}/my\\ file.pdf"),
+        ] {
+            let normalized = normalize_path_arg(&form);
+            assert!(std::path::Path::new(&normalized).exists(), "应存在: {normalized} (from {form})");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
