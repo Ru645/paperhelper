@@ -30,6 +30,9 @@ pub struct Explanation {
     /// sum 生成的知识卡片（"总结：……"），渲染在该追问块内。
     #[serde(default)]
     pub summary: Option<String>,
+    /// sum 后折叠：追问子树包进 <details>，总结显示在外。
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +678,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             children: Vec::new(),
             summary: None,
+            collapsed: false,
         });
         let md_out = crate::export::to_markdown(&note);
         assert!(md_out.contains("追问"), "export should include explanation: {md_out}");
@@ -703,8 +707,10 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 children: Vec::new(),
                 summary: None,
+                collapsed: false,
             }],
             summary: None,
+            collapsed: false,
         });
         let out = crate::export::to_markdown(&note);
         // 顶层用 > ，子层用 > >
@@ -715,6 +721,76 @@ mod tests {
             .and_then(|p| out[p..].find('\n').map(|n| out[p + n..].chars().take(6).collect()))
             .unwrap_or_default();
         assert!(after.starts_with("\n>\n> >"), "父子应以父级空引用行连续衔接: {after:?}\n{out}");
+    }
+
+    #[test]
+    fn collapsed_explanation_renders_details_and_summary() {
+        // sum 折叠：子树包进 <details>，总结在折叠块外
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "p".into(),
+            question: "n-gram是什么".into(),
+            answer: "父答。".into(),
+            concept: "c".into(),
+            created_at: "t".into(),
+            children: vec![Explanation {
+                id: "c1".into(),
+                question: "子问".into(),
+                answer: "子答".into(),
+                concept: "c".into(),
+                created_at: "t".into(),
+                children: vec![],
+                summary: None,
+                collapsed: false,
+            }],
+            summary: Some("总结内容：Max(-log p) 最有效。".into()),
+            collapsed: true,
+        });
+        let out = crate::export::to_markdown(&note);
+        assert!(out.contains("<details>"), "应有折叠开始: {out}");
+        assert!(out.contains("</details>"), "应有折叠结束: {out}");
+        assert!(out.contains("已概括，点击展开"), "应有提示: {out}");
+        // 子树在折叠块内
+        let d_open = out.find("<details>").unwrap();
+        let d_close = out.find("</details>").unwrap();
+        let child_pos = out.find("**追问**：子问").unwrap();
+        assert!(d_open < child_pos && child_pos < d_close, "子树应在 details 内");
+        // 总结在折叠块外
+        let sum_pos = out.find("**总结**：总结内容").unwrap();
+        assert!(sum_pos > d_close, "总结应在 details 外: {sum_pos} vs {d_close}");
+    }
+
+    #[test]
+    fn explanation_ancestor_skips_check() {
+        // check 节点（explanation_id=None）的儿子向上找父时应跳过 check
+        use crate::conversation::{Conversation, ConvNode};
+        let mk = |id: &str, parent: Option<&str>, expl: Option<&str>| ConvNode {
+            id: id.into(),
+            parent: parent.map(String::from),
+            question: format!("Q{id}"),
+            answer: format!("A{id}"),
+            block_id: None,
+            explanation_id: expl.map(String::from),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: "t".into(),
+            label: format!("L{id}"),
+        };
+        let nodes = vec![
+            mk("root", None, None),
+            mk("ask1", Some("root"), Some("e1")),
+            mk("chk", Some("ask1"), None),       // check 节点
+            mk("ask2", Some("chk"), None),       // check 的儿子（ask）
+        ];
+        // 从 ask2 向上：跳过 chk，命中 ask1 的 e1
+        assert_eq!(Conversation::explanation_ancestor(&nodes, "ask2").as_deref(), Some("e1"));
+        // 从 chk 向上：命中 ask1 的 e1
+        assert_eq!(Conversation::explanation_ancestor(&nodes, "chk").as_deref(), Some("e1"));
+        // 从 root：无
+        assert_eq!(Conversation::explanation_ancestor(&nodes, "root"), None);
     }
 
     #[test]
@@ -731,6 +807,7 @@ mod tests {
             created_at: "t".into(),
             children: vec![],
             summary: Some("n-gram 用采样频率近似概率，Max(-log p) 最有效。".into()),
+            collapsed: false,
         });
         let out = crate::export::to_markdown(&note);
         assert!(out.contains("**总结**：n-gram"), "应渲染总结: {out}");
@@ -754,10 +831,11 @@ mod tests {
             concept: "c".into(),
             created_at: "t".into(),
             children: vec![
-                Explanation { id: "c1".into(), question: "儿1".into(), answer: "答1".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None },
-                Explanation { id: "c2".into(), question: "儿2".into(), answer: "答2".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None },
+                Explanation { id: "c1".into(), question: "儿1".into(), answer: "答1".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None, collapsed: false },
+                Explanation { id: "c2".into(), question: "儿2".into(), answer: "答2".into(), concept: "c".into(), created_at: "t".into(), children: vec![], summary: None, collapsed: false },
             ],
             summary: None,
+            collapsed: false,
         });
         let out = crate::export::to_markdown(&note);
         let i1 = out.find("**追问**：儿1").expect("儿1");
@@ -836,8 +914,10 @@ mod tests {
                 created_at: "t".into(),
                 children: Vec::new(),
                 summary: None,
+                collapsed: false,
             }],
             summary: None,
+            collapsed: false,
         });
         // 找到子解释并修改
         let found = note.find_explanation_mut("child_expl").unwrap();

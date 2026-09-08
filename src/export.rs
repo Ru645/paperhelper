@@ -42,36 +42,43 @@ fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
 /// - 父亲与它的第一个儿子之间用「父级空引用行」（如 `>`）连接，保持嵌套结构连续；
 /// - 兄弟儿子之间用裸空行断开（分支分隔），`> >` 前缀仍保证渲染为嵌套层级；
 /// - 多行 answer 每行都加当前层级前缀，避免引用块断裂。
+/// - collapsed（sum 折叠）：整个追问子树包进 <details>，总结显示在折叠块外。
 /// 块与块之间的顶层分隔由调用者处理。
 fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
     let prefix = "> ".repeat(depth);
     let parent_quote_empty = "> ".repeat(depth - 1) + ">"; // depth 个 >，无尾空格
-    // 追问行
-    s.push_str(&format!("{prefix}**追问**：{}\n", e.question));
-    s.push_str(&parent_quote_empty);
-    s.push('\n');
-    // 解答：首行加 **解答**：前缀，后续行也加 prefix
-    let lines: Vec<&str> = e.answer.lines().collect();
-    if lines.is_empty() {
-        s.push_str(&format!("{prefix}**解答**：\n", prefix = prefix));
-    } else {
-        s.push_str(&format!("{prefix}**解答**：{}\n", lines[0]));
-        for line in &lines[1..] {
-            s.push_str(&format!("{prefix}{line}\n"));
+
+    if e.collapsed {
+        // 折叠块：<details> 包裹 追问+解答+子树，总结在外
+        let q_short: String = e.question.chars().take(30).collect();
+        s.push_str(&format!("{prefix}<details>\n"));
+        s.push_str(&format!("{prefix}<summary>追问：{q_short}…（已概括，点击展开）</summary>\n"));
+        // details 内需要空行才能渲染 markdown
+        s.push_str(&format!("{parent_quote_empty}\n"));
+        render_qa_body(e, depth, s);
+        // 子树也在折叠块内
+        for (i, child) in e.children.iter().enumerate() {
+            if i == 0 {
+                s.push_str(&format!("{parent_quote_empty}\n"));
+            } else {
+                s.push('\n');
+            }
+            render_explanation(child, depth + 1, s);
         }
+        s.push_str(&format!("{prefix}</details>\n"));
+        // 总结显示在折叠块外
+        if let Some(summary) = &e.summary {
+            s.push_str(&format!("{parent_quote_empty}\n"));
+            render_summary(summary, &prefix, s);
+        }
+        return;
     }
-    // sum 生成的知识卡片：作为该追问自身的总结，紧随解答（同级前缀连续）
+
+    render_qa_body(e, depth, s);
+    // sum 生成的总结（未折叠时）：紧随解答，同级前缀连续
     if let Some(summary) = &e.summary {
         s.push_str(&format!("{parent_quote_empty}\n"));
-        let slines: Vec<&str> = summary.lines().collect();
-        if slines.is_empty() {
-            s.push_str(&format!("{prefix}**总结**：\n"));
-        } else {
-            s.push_str(&format!("{prefix}**总结**：{}\n", slines[0]));
-            for line in &slines[1..] {
-                s.push_str(&format!("{prefix}{line}\n"));
-            }
-        }
+        render_summary(summary, &prefix, s);
     }
     // 递归子追问
     for (i, child) in e.children.iter().enumerate() {
@@ -83,6 +90,37 @@ fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
             s.push('\n');
         }
         render_explanation(child, depth + 1, s);
+    }
+}
+
+/// 渲染单条追问的 问答 主体（不含 summary/children）。
+fn render_qa_body(e: &Explanation, depth: usize, s: &mut String) {
+    let prefix = "> ".repeat(depth);
+    let parent_quote_empty = "> ".repeat(depth - 1) + ">";
+    s.push_str(&format!("{prefix}**追问**：{}\n", e.question));
+    s.push_str(&parent_quote_empty);
+    s.push('\n');
+    let lines: Vec<&str> = e.answer.lines().collect();
+    if lines.is_empty() {
+        s.push_str(&format!("{prefix}**解答**：\n"));
+    } else {
+        s.push_str(&format!("{prefix}**解答**：{}\n", lines[0]));
+        for line in &lines[1..] {
+            s.push_str(&format!("{prefix}{line}\n"));
+        }
+    }
+}
+
+/// 渲染总结块（**总结**：…，多行加前缀）。
+fn render_summary(summary: &str, prefix: &str, s: &mut String) {
+    let slines: Vec<&str> = summary.lines().collect();
+    if slines.is_empty() {
+        s.push_str(&format!("{prefix}**总结**：\n"));
+    } else {
+        s.push_str(&format!("{prefix}**总结**：{}\n", slines[0]));
+        for line in &slines[1..] {
+            s.push_str(&format!("{prefix}{line}\n"));
+        }
     }
 }
 

@@ -480,7 +480,7 @@ PaperHelper 命令：
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
   check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
                           例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
-  sum                      把当前节点子树的追问概括为「总结：…」插入笔记对应追问处
+  sum                      把当前节点子树的追问折叠并替换为「总结：…」（可点击展开）
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -927,24 +927,22 @@ PaperHelper 命令：
         let expl_id = uuid::Uuid::new_v4().to_string();
 
         // 7. 把解释插入笔记
-        //    判断父节点类型：若父是对话节点且有 explanation_id → 嵌套追问；若父是根(导入)→ 顶层追问
-        let parent_node = self
+        //    嵌套判断：从当前节点沿父链向上找第一个有 explanation_id 的祖先（跳过
+        //    check 等核对节点）——check 的儿子在笔记中的父亲是 check 的父亲。
+        let parent_expl_id = self
             .session
             .conversation
             .current
-            .as_ref()
-            .and_then(|id| self.session.conversation.nodes.iter().find(|n| n.id == *id).cloned());
+            .as_deref()
+            .and_then(|cur| {
+                Conversation::explanation_ancestor(&self.session.conversation.nodes, cur)
+            });
 
-        let is_nested = parent_node
-            .as_ref()
-            .and_then(|p| p.explanation_id.as_ref())
-            .is_some();
-
-        if is_nested {
+        let is_nested = parent_expl_id.is_some();
+        if let Some(parent_eid) = parent_expl_id {
             // 嵌套追问：找到父解释，插入其 children
-            let parent_expl_id = parent_node.as_ref().unwrap().explanation_id.as_ref().unwrap().clone();
             if let Some(note) = self.session.notes.as_mut() {
-                if let Some(parent_expl) = note.find_explanation_mut(&parent_expl_id) {
+                if let Some(parent_expl) = note.find_explanation_mut(&parent_eid) {
                     parent_expl.children.push(Explanation {
                         id: expl_id.clone(),
                         question: question.to_string(),
@@ -953,6 +951,7 @@ PaperHelper 命令：
                         created_at: now.clone(),
                         children: Vec::new(),
                         summary: None,
+                        collapsed: false,
                     });
                 }
             }
@@ -980,6 +979,7 @@ PaperHelper 命令：
                                 created_at: now.clone(),
                                 children: Vec::new(),
                                 summary: None,
+                                collapsed: false,
                             });
                         }
                     }
@@ -1203,22 +1203,14 @@ PaperHelper 命令：
         let summary = res.content.trim().to_string();
         println!("\n**总结**：{summary}\n");
 
-        // 写入笔记：插入当前节点（或其最近有解释的祖先）对应的 Explanation.summary
-        // （从当前节点沿父链找第一个有 explanation_id 的节点）
-        let target_expl_id = {
-            let mut nid = cur.clone();
-            loop {
-                let node = self.session.conversation.nodes.iter().find(|n| n.id == nid);
-                match node {
-                    Some(n) if n.explanation_id.is_some() => break n.explanation_id.clone().unwrap(),
-                    Some(n) if n.parent.is_some() => nid = n.parent.clone().unwrap(),
-                    _ => bail!("当前对话链上没有可插入总结的追问（先 `ask` 产生追问后再 `sum`）"),
-                }
-            }
-        };
+        // 写入笔记：插入当前节点（或其最近有解释的祖先，跳过 check）对应的
+        // Explanation：折叠其子树 + 挂总结
+        let target_expl_id = Conversation::explanation_ancestor(&self.session.conversation.nodes, &cur)
+            .ok_or_else(|| anyhow!("当前对话链上没有可插入总结的追问（先 `ask` 产生追问后再 `sum`）"))?;
         if let Some(note) = self.session.notes.as_mut() {
             if let Some(expl) = note.find_explanation_mut(&target_expl_id) {
                 expl.summary = Some(summary);
+                expl.collapsed = true;
             }
         }
         // 自动同步导出（与 ask 相同逻辑）

@@ -38,6 +38,21 @@ impl Conversation {
         self.nodes.push(node);
     }
 
+    /// 从 from 节点沿父链向上找第一个携带 explanation_id 的节点（跳过 check 等
+    /// 无解释节点），返回其 explanation_id。用于笔记嵌套定位：check 节点的儿子，
+    /// 其笔记中的父亲应是 check 往上第一个非 check 节点。
+    pub fn explanation_ancestor(nodes: &[ConvNode], from: &str) -> Option<String> {
+        let mut cur = Some(from.to_string());
+        while let Some(id) = cur {
+            let node = nodes.iter().find(|n| n.id == id)?;
+            if let Some(e) = &node.explanation_id {
+                return Some(e.clone());
+            }
+            cur = node.parent.clone();
+        }
+        None
+    }
+
     /// 按 DFS 编号跳转（1-based）。返回跳转到的节点。
     pub fn goto_index(&mut self, idx: usize) -> Option<&ConvNode> {
         let target = self.dfs_order().get(idx.wrapping_sub(1))?.id.clone();
