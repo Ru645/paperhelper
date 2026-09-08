@@ -18,13 +18,27 @@ PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一�
 
 ### 1. 安装依赖
 
+| 依赖 | 用途 | 必需性 |
+|------|------|--------|
+| Rust 1.85+ | 编译 | 必需 |
+| Python 3 + PyMuPDF | PDF 文本层提取（`ingest <pdf>`） | 必需 |
+| tesseract + 中文语言包 | OCR 扫描件（`ingest --ocr`） | 可选（仅处理扫描版 PDF 时需要） |
+
 ```bash
-# Rust（需 1.85+）
+# ① Rust（需 1.85+）
 rustc --version
 
-# PDF 解析依赖（Python 的 PyMuPDF，Rust 通过子进程调用）
+# ② PDF 解析（Python 的 PyMuPDF，Rust 通过子进程调用）
 pip install pymupdf
+
+# ③ OCR（可选，仅 ingest --ocr 需要）
+sudo apt install tesseract-ocr tesseract-ocr-chi-sim    # Debian/Ubuntu
+brew install tesseract tesseract-lang                    # macOS
+# 无 sudo 权限时可用 conda 装用户级：
+# conda install -c conda-forge tesseract tesseract-data-chi_sim
 ```
+
+> 没装 tesseract 时 `ingest --ocr` 会提示安装方式，其余功能不受影响。
 
 ### 2. 编译
 
