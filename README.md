@@ -140,7 +140,9 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 ```
 
 - `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果
-- `--ocr`：适合扫描版 PDF（无文本层）。需安装 `tesseract-ocr` 和中文语言包（`apt install tesseract-ocr tesseract-ocr-chi-sim`）
+- `--ocr`：适合扫描版 PDF（无文本层）
+  - tesseract 是**可选依赖**：执行 `--ocr` 时才检测，未安装会给出对应系统的安装指引，不影响其他功能
+  - 已装 tesseract 但缺中文语言包（chi_sim）时，自动降级为仅英文识别并提示安装 `tesseract-ocr-chi-sim`
 
 ### 推荐工作流：双开窗口
 
