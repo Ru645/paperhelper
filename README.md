@@ -144,14 +144,21 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
   - tesseract 是**可选依赖**：执行 `--ocr` 时才检测，未安装会给出对应系统的安装指引，不影响其他功能
   - 已装 tesseract 但缺中文语言包（chi_sim）时，自动降级为仅英文识别并提示安装 `tesseract-ocr-chi-sim`
 
-### 推荐工作流：双开窗口
+### 推荐工作流：双开窗口 + HTML 笔记
 
 命令行看长笔记不方便，推荐双开：
 
 1. **左窗口**：终端运行 `paperhelper`，对话提问
-2. **右窗口**：用 Markdown 阅读器（如 VS Code 预览、Typora、Obsidian）打开导出的 `.md` 文件
+2. **右窗口**：浏览器打开导出的 `.html` 笔记（或 Markdown 阅读器打开 `.md`）
 
 每次 `ask` 后笔记自动同步更新，右窗口刷新即可看到新插入的追问解释。
+
+**HTML 笔记（推荐）**：ingest 时文件名输 `xxx.html`（或 `export html note.html`），生成单文件 HTML：
+
+- 浏览器打开即得完整排版，**LaTeX 公式由 KaTeX 渲染**（终端/纯 Markdown 阅读器做不到）
+- 左侧对话树面板（当前节点高亮、显示 token 用量），右侧笔记正文
+- 浏览器 `Ctrl+F` 全文搜索
+- 加载 marked/KaTeX 走 CDN；离线时自动降级为纯文本显示
 
 ## 命令一览
 
@@ -168,7 +175,7 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 | `goto <n>` | 跳到对话树节点 n，根路径成为上下文 |
 | `stats` | 查看本次/累计 token 用量与成本 |
 | `budget <n>` | 设置 token 预算（0=不限），到上限自动中断 |
-| `export md\|mindmap <file>` | 导出笔记为 Markdown / 思维导图（markmap 兼容） |
+| `export md\|mindmap\|html <file>` | 导出笔记为 Markdown / 思维导图（markmap 兼容）/ 自包含 HTML（KaTeX 公式渲染） |
 | `papers` | 列出已读论文（跨会话累积） |
 | `concepts` | 列出已学概念（跨论文关联，LLM 自动提取概念名） |
 | `save [file]` | 手动保存会话 |

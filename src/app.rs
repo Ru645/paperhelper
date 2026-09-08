@@ -157,9 +157,9 @@ impl Completer for CommandCompleter {
             return Ok((s, candidates));
         }
 
-        // export 的格式补全：export <md|mindmap> <file>
+        // export 的格式补全：export <md|mindmap|html> <file>
         if cmd == "export" && !args_started {
-            let matches: Vec<String> = ["md", "markdown", "mindmap", "mm"]
+            let matches: Vec<String> = ["md", "markdown", "mindmap", "mm", "html"]
                 .iter()
                 .filter(|f| f.starts_with(word))
                 .map(|s| s.to_string())
@@ -675,14 +675,15 @@ PaperHelper 命令：
     async fn cmd_export(&self, rest: &str) -> Result<()> {
         let (fmt, path) = split_cmd(rest);
         if path.is_empty() {
-            bail!("用法: export <markdown|mindmap> <文件>");
+            bail!("用法: export <md|mindmap|html> <文件>");
         }
         let path = normalize_path_arg(path);
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
         let content = match fmt {
             "md" | "markdown" => export::to_markdown(note),
             "mindmap" | "mm" => export::to_mindmap(note),
-            _ => bail!("未知格式: {fmt}（可用: markdown, mindmap）"),
+            "html" | "htm" => export::to_html(note, &self.session.conversation),
+            _ => bail!("未知格式: {fmt}（可用: markdown, mindmap, html）"),
         };
         std::fs::write(&path, content)?;
         println!("已导出到 {path}");
@@ -848,7 +849,7 @@ PaperHelper 命令：
         }
         self.export_path = Some(export_file.clone());
         if let Some(note) = &self.session.notes {
-            std::fs::write(&export_file, export::to_markdown(note))?;
+            std::fs::write(&export_file, export::render_for(&export_file, note, &self.session.conversation))?;
             println!("{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
         self.update_completions();
@@ -1033,7 +1034,7 @@ PaperHelper 命令：
         }
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
-                if std::fs::write(p, export::to_markdown(note)).is_ok() {
+                if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
                     // 查更新位置（block_id 对应的 section 编号+标题）
                     let location = block_id_for_hint.as_ref().and_then(|bid| {
                         note.find_block(bid).map(|b| {
@@ -1317,7 +1318,7 @@ fn sanitize_filename(s: &str) -> String {
     let cleaned = cleaned.trim().to_string();
     if cleaned.is_empty() {
         "note.md".to_string()
-    } else if !cleaned.ends_with(".md") {
+    } else if !cleaned.ends_with(".md") && !cleaned.ends_with(".html") {
         format!("{}.md", cleaned.chars().take(80).collect::<String>())
     } else {
         cleaned.chars().take(83).collect()

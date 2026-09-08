@@ -658,6 +658,43 @@ mod tests {
     }
 
     #[test]
+    fn html_export_contains_note_and_tree() {
+        use crate::conversation::{Conversation, ConvNode};
+        let md = "# T\n## M\nSome method with $E=mc^2$.\n";
+        let note = parse_markdown_note(md, "raw");
+        let mut conv = Conversation::default();
+        conv.add_exchange(ConvNode {
+            id: "n1".into(),
+            parent: None,
+            question: "Q".into(),
+            answer: "A".into(),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: 10,
+            output_tokens: 20,
+            cost: 0.001,
+            created_at: "t".into(),
+            label: "概念X".into(),
+        });
+        conv.current = Some("n1".into());
+        let html = crate::export::to_html(&note, &conv);
+        // 结构完整
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("katex"), "应引 KaTeX");
+        assert!(html.contains("marked"), "应引 marked");
+        // 标题与树节点（label 转义后）
+        assert!(html.contains("对话轨迹"));
+        assert!(html.contains("概念X"), "树应含节点 label");
+        assert!(html.contains("class=\"current\""), "当前节点应高亮");
+        assert!(html.contains("10→20tok"), "应显示 token");
+        // markdown 以 JS 字符串嵌入
+        assert!(html.contains("const MD = "));
+        // render_for 按扩展名分流
+        assert!(crate::export::render_for("a.html", &note, &conv).contains("<!DOCTYPE"));
+        assert!(crate::export::render_for("a.md", &note, &conv).contains("# T"));
+    }
+
+    #[test]
     fn find_explanation_mut_works() {
         let md = "# T\n## M\nSome method.\n";
         let mut note = parse_markdown_note(md, "raw");
