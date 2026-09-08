@@ -37,27 +37,19 @@ pub fn ensure_sessions_dir() -> Result<()> {
     Ok(())
 }
 
-/// 分配一个新的会话 ID（递增数字，持久化在 .paperhelper/sessions/counter）。
-/// ID 一旦分配永不变，保证 -s <ID> 稳定。
-pub fn next_session_id() -> Result<u64> {
-    let counter = sessions_dir().join("counter");
-    let id = if counter.exists() {
-        fs::read_to_string(&counter)?.trim().parse::<u64>().unwrap_or(0) + 1
-    } else {
-        1
-    };
-    ensure_sessions_dir()?;
-    fs::write(&counter, id.to_string())?;
-    Ok(id)
+/// 生成保存时间戳 ID（本地时间 %Y%m%d_%H%M%S），作为会话文件名与恢复标识。
+pub fn new_session_stamp() -> String {
+    chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
-/// 会话文件路径（按数字 ID）
-pub fn session_path(id: u64) -> PathBuf {
+/// 会话文件路径（按文件名标识，如时间戳）
+pub fn session_path(id: &str) -> PathBuf {
     sessions_dir().join(format!("{id}.json"))
 }
 
-/// 列出所有会话 ID（数字，升序）
-pub fn list_sessions() -> Vec<u64> {
+/// 列出所有会话文件名标识（去 .json，按名称排序）。
+/// 新会话为时间戳（如 20260908_175624）；历史遗留的纯数字 ID 同样按文件名匹配。
+pub fn list_sessions() -> Vec<String> {
     let dir = sessions_dir();
     if !dir.exists() {
         return Vec::new();
@@ -65,9 +57,9 @@ pub fn list_sessions() -> Vec<u64> {
     let mut ids = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                if let Ok(id) = stem.parse::<u64>() {
-                    ids.push(id);
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    ids.push(stem.to_string());
                 }
             }
         }

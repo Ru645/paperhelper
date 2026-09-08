@@ -378,19 +378,12 @@ impl App {
         bar.finish_and_clear();
         self.session.session_name = session_name;
 
-        // 分配固定数字 ID（递增，永不变）
-        let id = crate::paths::next_session_id()?;
-        let path = crate::paths::session_path(id);
+        // 分配保存时间戳作为会话标识（文件名 = 恢复用的 -s 参数）
+        let stamp = crate::paths::new_session_stamp();
+        let path = crate::paths::session_path(&stamp);
         self.session.save(&path)?;
-        // 恢复提示的参数：会话名是纯 ASCII（如时间戳）时直接用名字（显示什么就能输什么）；
-        // 中文名不方便输入，用数字 ID。
-        let resume_key = if self.session.session_name.is_ascii() && !self.session.session_name.is_empty() {
-            self.session.session_name.clone()
-        } else {
-            id.to_string()
-        };
         println!("{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
-        println!("  恢复方式：paperhelper -s {}", resume_key);
+        println!("  恢复方式：paperhelper -s {}", stamp);
         Ok(())
     }
 

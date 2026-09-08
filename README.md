@@ -12,7 +12,7 @@ PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一�
 - **核对想法**：`check 3.2 我觉得这本质就是余弦相似度，对吗`，LLM 回答但不写入笔记
 - **对话树**：`tree` 查看全部对话轨迹，`goto 2` 跳到任意节点继续，根路径即上下文
 - **跨论文知识库**：自动积累读过的论文和学过的概念，`concepts` 查看知识清单
-- **会话自动保存**：退出时自动保存，`paperhelper -s 1` 直接恢复，对话位置不丢
+- **会话自动保存**：退出时自动保存，`paperhelper -s <时间戳>` 直接恢复，对话位置不丢
 
 ## 快速开始
 
@@ -93,8 +93,18 @@ EOF
 
 ```bash
 paperhelper                 # 新会话
-paperhelper -l              # 列出所有已保存会话
-paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
+paperhelper -l              # 列出所有已保存会话（标识+会话名+时间）
+paperhelper -s 20260909_020452   # 按时间戳标识恢复（支持唯一前缀，如 -s 20260909_02）
+```
+
+会话的恢复标识是**保存时间戳**（退出时显示），会话名仅作展示。
+
+**Shell 补全（可选，推荐）**：`-s` 后 Tab 补全时间戳：
+
+```bash
+paperhelper --completions >> ~/.bashrc   # 安装 bash 补全
+source ~/.bashrc
+# 之后：paperhelper -s 2026<Tab> 自动补全时间戳
 ```
 
 ## 使用流程
@@ -128,7 +138,7 @@ paperhelper -s 1            # 恢复会话 1（对话位置自动恢复）
 > stats                                      # 看 token 用量和成本
 > exit                                       # 退出，自动保存
 ✓ 会话已保存：BERTScore与余弦相似度讨论
-  恢复方式：paperhelper -s 3
+  恢复方式：paperhelper -s 20260908_175624
 ```
 
 ### 导入选项
