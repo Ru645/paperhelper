@@ -26,38 +26,49 @@ fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
                 s.push_str(&format!("$$\n{}\n$$\n\n", b.text));
             }
         }
-        for e in &b.explanations {
+        for (i, e) in b.explanations.iter().enumerate() {
+            if i > 0 {
+                s.push('\n'); // 顶层追问之间空行分隔（上块尾已有 \n）
+            }
             render_explanation(e, 1, s);
+            s.push('\n');
         }
         walk_md(&b.children, depth + 1, s);
     }
 }
 
 /// 递归渲染追问，depth=1 为顶层（`> `），depth=2 为子追问（`> > `），以此类推。
-/// 多行 answer 每行都加当前层级的前缀，避免 markdown 引用块断裂。
+/// 排版规则（体现父子关系）：
+/// - 父亲与它的第一个儿子之间用「父级空引用行」（如 `>`）连接，保持嵌套结构连续；
+/// - 兄弟儿子之间用裸空行断开（分支分隔），`> >` 前缀仍保证渲染为嵌套层级；
+/// - 多行 answer 每行都加当前层级前缀，避免引用块断裂。
+/// 块与块之间的顶层分隔由调用者处理。
 fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
-    let prefix = if depth == 1 {
-        "> ".to_string()
-    } else {
-        format!("{}> ", "> ".repeat(depth - 1))
-    };
+    let prefix = "> ".repeat(depth);
+    let parent_quote_empty = "> ".repeat(depth - 1) + ">"; // depth 个 >，无尾空格
     // 追问行
-    s.push_str(&format!("{}**追问**：{}\n", prefix, e.question));
-    s.push_str(&prefix.trim_end_matches(' '));
+    s.push_str(&format!("{prefix}**追问**：{}\n", e.question));
+    s.push_str(&parent_quote_empty);
     s.push('\n');
     // 解答：首行加 **解答**：前缀，后续行也加 prefix
     let lines: Vec<&str> = e.answer.lines().collect();
     if lines.is_empty() {
-        s.push_str(&format!("{}**解答**：\n", prefix));
+        s.push_str(&format!("{prefix}**解答**：\n", prefix = prefix));
     } else {
-        s.push_str(&format!("{}**解答**：{}\n", prefix, lines[0]));
+        s.push_str(&format!("{prefix}**解答**：{}\n", lines[0]));
         for line in &lines[1..] {
-            s.push_str(&format!("{}{}\n", prefix, line));
+            s.push_str(&format!("{prefix}{line}\n"));
         }
     }
-    s.push('\n');
     // 递归子追问
-    for child in &e.children {
+    for (i, child) in e.children.iter().enumerate() {
+        if i == 0 {
+            // 父子连续：父级空引用行衔接（解答行尾已有 \n），同一引用块内继续
+            s.push_str(&format!("{parent_quote_empty}\n"));
+        } else {
+            // 兄弟之间：裸空行断开（上一块尾已有 \n，再补一个成空行）
+            s.push('\n');
+        }
         render_explanation(child, depth + 1, s);
     }
 }
@@ -106,8 +117,9 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation) -> String {
 
 /// 生成自包含 HTML：单文件，CDN 引入 marked + KaTeX 渲染 Markdown 与公式；
 /// 左侧对话树（当前节点高亮），右侧笔记；CDN 不可用时降级显示原文。
+/// 资源加载带 fallback：jsdelivr 失败自动切 npmmirror。
 pub fn to_html(note: &Note, conv: &Conversation) -> String {
-    let md = to_markdown(note);
+    let md = convert_inline_math_delims(&to_markdown(note));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
     let tree = conv_tree_html(conv);
     let title = html_escape(&note.title);
@@ -118,7 +130,7 @@ pub fn to_html(note: &Note, conv: &Conversation) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — PaperHelper 笔记</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<style>/* 占位：KaTeX 样式由 JS loader 按需注入（带 CDN fallback） */</style>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif; color: #1a1a1a; background: #fafafa; }}
@@ -156,32 +168,79 @@ pub fn to_html(note: &Note, conv: &Conversation) -> String {
     <pre id="fallback"></pre>
   </main>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
 <script>
+// 资源加载器：按序尝试多个 CDN（jsdelivr → npmmirror），全部失败走降级
+const CDNS = [
+  'https://cdn.jsdelivr.net/npm',
+  'https://registry.npmmirror.com'
+];
+function cssUrl(cdn, path) {{
+  // path 形如 "name@version/rest"；npmmirror 用 files API 映射
+  if (cdn.includes('npmmirror')) {{
+    const slash = path.indexOf('/');
+    const pkg = path.slice(0, slash);
+    const rest = path.slice(slash + 1);
+    const parts = pkg.split('@');
+    const name = parts[0], ver = parts[parts.length - 1];
+    return `https://registry.npmmirror.com/${{name}}/${{ver}}/files/${{rest}}`;
+  }}
+  return cdn + '/' + path;
+}}
+function loadCss(paths) {{
+  return new Promise(resolve => {{
+    let i = 0;
+    const tryNext = () => {{
+      if (i >= CDNS.length) return resolve(false);
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = cssUrl(CDNS[i % CDNS.length], paths[0]);
+      link.onload = () => resolve(true);
+      link.onerror = () => {{ i++; tryNext(); }};
+      document.head.appendChild(link);
+    }};
+    tryNext();
+  }});
+}}
+function loadScripts(paths) {{
+  // 串行加载，每个脚本依次尝试各 CDN
+  return paths.reduce((p, path) => p.then(() => new Promise(resolve => {{
+    let i = 0;
+    const tryNext = () => {{
+      if (i >= CDNS.length) return resolve(false);
+      const s = document.createElement('script');
+      s.src = cssUrl(CDNS[i], path);
+      s.onload = () => resolve(true);
+      s.onerror = () => {{ i++; tryNext(); }};
+      document.body.appendChild(s);
+    }};
+    tryNext();
+  }})), Promise.resolve(true));
+}}
 const MD = {md_json};
-function render() {{
+(async () => {{
+  await loadCss(['katex@0.16.9/dist/katex.min.css']);
+  await loadScripts([
+    'marked@12.0.2/marked.min.js',
+    'katex@0.16.9/dist/katex.min.js',
+    'katex@0.16.9/dist/contrib/auto-render.min.js'
+  ]);
   if (window.marked) {{
     document.getElementById('note').innerHTML = marked.parse(MD);
     if (window.renderMathInElement) {{
       renderMathInElement(document.getElementById('note'), {{
         delimiters: [
           {{left: '$$', right: '$$', display: true}},
-          {{left: '$', right: '$', display: false}},
-          {{left: '\\\\(', right: '\\\\)', display: false}},
-          {{left: '\\\\[', right: '\\\\]', display: true}}
+          {{left: '$', right: '$', display: false}}
         ],
         throwOnError: false
       }});
     }}
   }} else {{
-    // CDN 不可用时降级为纯文本
+    // CDN 全部不可用时降级为纯文本
     document.getElementById('fallback').style.display = 'block';
     document.getElementById('fallback').textContent = MD;
   }}
-}}
-render();
+}})();
 </script>
 </body>
 </html>
@@ -235,4 +294,32 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// 把 `\(` `\)` `\[` `\]` 定界符统一转换为 `$` `$$`。
+/// 原因：markdown 中 `\(` 是合法反斜杠转义，marked 会将其吃成 `(`，
+/// 导致 KaTeX auto-render 找不到行内公式定界符。按 ``` 代码围栏切分，
+/// 只转换非代码段，避免破坏代码示例。
+pub(crate) fn convert_inline_math_delims(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut in_code = false;
+    for line in md.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            in_code = !in_code;
+            out.push_str(line);
+            continue;
+        }
+        if in_code {
+            out.push_str(line);
+            continue;
+        }
+        let converted = line
+            .replace("\\[", "$$")
+            .replace("\\]", "$$")
+            .replace("\\(", "$")
+            .replace("\\)", "$");
+        out.push_str(&converted);
+    }
+    out
 }

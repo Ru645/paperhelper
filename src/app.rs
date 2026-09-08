@@ -35,7 +35,7 @@ fn sys_ask() -> String {
 }
 
 const COMMANDS: &[&str] = &[
-    "ingest", "ask", "check", "blocks", "note", "tree", "goto", "stats", "budget",
+    "ingest", "ask", "check", "sum", "blocks", "note", "tree", "goto", "stats", "budget",
     "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
@@ -459,6 +459,7 @@ impl App {
             "ingest" | "pdf" => self.cmd_ingest(rest).await,
             "ask" | "q" => self.cmd_ask(rest).await,
             "check" => self.cmd_check(rest).await,
+            "sum" => self.cmd_sum().await,
             _ => {
                 println!("未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
@@ -479,6 +480,7 @@ PaperHelper 命令：
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
   check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
                           例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
+  sum                      把当前节点子树的追问概括成知识卡片，追加到 <笔记名>.cards.md
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -1143,6 +1145,105 @@ PaperHelper 命令：
         }
         self.update_completions();
         Ok(())
+    }
+
+    /// sum：把当前对话节点子树（含自己）的全部问答概括成知识卡片。
+    /// 终端显示 + 追加写入 <笔记名>.cards.md。
+    async fn cmd_sum(&mut self) -> Result<()> {
+        if self.session.notes.is_none() {
+            bail!("还没有笔记，先 `ingest <pdf>`");
+        }
+        let cur = self
+            .session
+            .conversation
+            .current
+            .clone()
+            .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?;
+        // 收集子树（含自己），DFS 顺序
+        let subtree = self.collect_subtree(&cur);
+        if subtree.is_empty() {
+            bail!("当前节点无问答内容");
+        }
+        interrupt::reset();
+        let budget_ok = self.check_budget()?;
+        if !budget_ok {
+            bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
+        }
+
+        // 组 prompt：按层级缩进列出 Q&A
+        let mut qa = String::new();
+        for (depth, n) in &subtree {
+            let indent = "  ".repeat(*depth);
+            qa.push_str(&format!("{indent}问：{}\n{indent}答：{}\n\n", n.question, n.answer));
+        }
+        let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+        let prompt = format!(
+            "以下是一段关于论文《{title}》的递归追问记录（缩进表示追问层级）。\n\
+             请把它概括成一张知识卡片，Markdown 格式：\n\
+             - 首行 `## <核心概念名>`（一个简短概念，如\"BERTScore\"）\n\
+             - 然后用 3-6 条要点（`- ` 列表）概括这段追问弄明白的内容，保留关键公式与结论\n\
+             - 最后若有适用场景/注意事项，加一行 `> 提示：...`\n\
+             只输出卡片本身。\n\n{qa}"
+        );
+        let msgs = vec![
+            Message { role: "system".into(), content: "你是知识卡片生成助手，只输出 Markdown 卡片。".into() },
+            Message { role: "user".into(), content: prompt },
+        ];
+
+        let bar = ProgressBar::new_spinner();
+        bar.set_style(spinner_style());
+        bar.set_message("概括知识卡片中…");
+        bar.enable_steady_tick(Duration::from_millis(100));
+        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}).await;
+        bar.finish_and_clear();
+        let res = res?;
+        self.record_usage(res.input_tokens, res.output_tokens);
+
+        let card = res.content.trim().to_string();
+        println!("\n{card}\n");
+
+        // 追加到 cards 文件：<导出笔记名>.cards.md
+        let cards_path = self.export_path.as_ref().map(|p| {
+            let t = p.trim_end_matches(".html").trim_end_matches(".md");
+            format!("{t}.cards.md")
+        }).unwrap_or_else(|| "知识卡片.cards.md".to_string());
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let entry = format!("\n---\n\n*{stamp} · 概括自对话节点「{}」及其 {} 条追问*\n\n{card}\n",
+            subtree[0].1.label, subtree.len() - 1);
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&cards_path)?;
+        f.write_all(entry.as_bytes())?;
+        println!("{} 知识卡片已追加到 {}", "✓".green().bold(), cards_path);
+        Ok(())
+    }
+
+    /// 收集以 id 为根的子树（含自己），返回 (相对深度, 节点) 的 DFS 序。
+    fn collect_subtree(&self, root: &str) -> Vec<(usize, crate::conversation::ConvNode)> {
+        use std::collections::HashMap;
+        let mut kids: HashMap<&str, Vec<&crate::conversation::ConvNode>> = HashMap::new();
+        let mut by_id: HashMap<&str, &crate::conversation::ConvNode> = HashMap::new();
+        for n in &self.session.conversation.nodes {
+            by_id.insert(n.id.as_str(), n);
+            if let Some(p) = n.parent.as_deref() {
+                kids.entry(p).or_default().push(n);
+            }
+        }
+        let mut out = Vec::new();
+        let Some(root_node) = by_id.get(root) else { return out };
+        // DFS 栈：(id, depth)
+        let mut stack = vec![(root_node.id.as_str(), 0usize)];
+        while let Some((id, depth)) = stack.pop() {
+            if let Some(n) = by_id.get(id) {
+                out.push((depth, (*n).clone()));
+                // 逆序压栈保持 DFS 原顺序
+                if let Some(ks) = kids.get(id) {
+                    for k in ks.iter().rev() {
+                        stack.push((k.id.as_str(), depth + 1));
+                    }
+                }
+            }
+        }
+        out
     }
 
     // ===== 内部辅助 =====

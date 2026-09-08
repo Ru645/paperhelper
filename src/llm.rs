@@ -73,7 +73,12 @@ fn build_body(
     body
 }
 
-async fn post(
+/// 判断错误是否可安全重试（连接/超时类，请求未达服务端或可重发）。
+fn is_retryable(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout() || e.is_request()
+}
+
+async fn post_with_retry(
     client: &reqwest::Client,
     cfg: &LlmConfig,
     body: serde_json::Value,
@@ -84,14 +89,33 @@ async fn post(
              或在 .env 中设置 PAPERHELPER_API_KEY。"
         );
     }
-    let resp = client
-        .post(&cfg.api_endpoint)
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("请求 LLM 端点失败: {}", cfg.api_endpoint))?;
-    Ok(resp)
+    const MAX_RETRIES: usize = 2; // 共 1+2 次尝试
+    for attempt in 0..=MAX_RETRIES {
+        let result = client
+            .post(&cfg.api_endpoint)
+            .bearer_auth(&cfg.api_key)
+            .json(&body)
+            .send()
+            .await;
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(e) if is_retryable(&e) && attempt < MAX_RETRIES => {
+                let wait = std::time::Duration::from_secs(1 << attempt); // 1s, 2s
+                eprintln!(
+                    "[网络抖动，{:.0}s 后重试 ({}/{}): {e}]",
+                    wait.as_secs_f64(),
+                    attempt + 1,
+                    MAX_RETRIES,
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("请求 LLM 端点失败: {}", cfg.api_endpoint)));
+            }
+        }
+    }
+    unreachable!("重试循环必有限定次数")
 }
 
 fn estimate_tokens(s: &str) -> u64 {
@@ -110,13 +134,13 @@ pub async fn chat(
     thinking: bool,
     on_token: &mut impl FnMut(&str),
 ) -> Result<LlmResult> {
-    let mut resp = post(client, cfg, build_body(cfg, messages, json_mode, thinking, true)).await?;
+    let mut resp = post_with_retry(client, cfg, build_body(cfg, messages, json_mode, thinking, true)).await?;
 
     // 兼容本地模型：若服务端不认 stream_options / response_format / reasoning_effort
     // (返回 400/422)，则去掉这些字段重试一次。
     if resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
     {
-        resp = post(client, cfg, build_body(cfg, messages, json_mode, thinking, false)).await?;
+        resp = post_with_retry(client, cfg, build_body(cfg, messages, json_mode, thinking, false)).await?;
     }
 
     if !resp.status().is_success() {

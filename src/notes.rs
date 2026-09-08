@@ -704,6 +704,49 @@ mod tests {
         // 顶层用 > ，子层用 > >
         assert!(out.contains("> **追问**：这个方法是什么"), "应有顶层追问: {out}");
         assert!(out.contains("> > **追问**：方法A的参数怎么调"), "应有嵌套追问: {out}");
+        // 父子连续：父亲解答行后紧跟父级空引用行再接儿子（无裸空行）
+        let after: String = out.find("是方法A。")
+            .and_then(|p| out[p..].find('\n').map(|n| out[p + n..].chars().take(6).collect()))
+            .unwrap_or_default();
+        assert!(after.starts_with("\n>\n> >"), "父子应以父级空引用行连续衔接: {after:?}\n{out}");
+    }
+
+    #[test]
+    fn sibling_explanations_separated() {
+        // 同一父亲下的两个儿子之间应有裸空行断开
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "p".into(),
+            question: "父".into(),
+            answer: "父答".into(),
+            concept: "c".into(),
+            created_at: "t".into(),
+            children: vec![
+                Explanation { id: "c1".into(), question: "儿1".into(), answer: "答1".into(), concept: "c".into(), created_at: "t".into(), children: vec![] },
+                Explanation { id: "c2".into(), question: "儿2".into(), answer: "答2".into(), concept: "c".into(), created_at: "t".into(), children: vec![] },
+            ],
+        });
+        let out = crate::export::to_markdown(&note);
+        let i1 = out.find("**追问**：儿1").expect("儿1");
+        let i2 = out.find("**追问**：儿2").expect("儿2");
+        let between = &out[i1..i2];
+        assert!(between.contains("\n\n> > "), "兄弟之间应有裸空行断开: {between:?}\n{out}");
+    }
+
+    #[test]
+    fn convert_inline_math_delims_works() {
+        use crate::export::convert_inline_math_delims;
+        // 行内 \( \) 与块级 \[ \] 都转成 $ / $$
+        let md = "行内 \\(E=mc^2\\) 公式，块级：\n\\[H = -\\sum p\\log p\\]\n";
+        let out = convert_inline_math_delims(md);
+        assert!(out.contains("$E=mc^2$"), "{out}");
+        assert!(out.contains("$$H = -\\sum p\\log p$$"), "{out}");
+        // 代码块内不转换
+        let md2 = "```\ncode \\(x\\) here\n```\n";
+        let out2 = convert_inline_math_delims(md2);
+        assert!(out2.contains("code \\(x\\) here"), "{out2}");
     }
 
     #[test]
