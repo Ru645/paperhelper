@@ -205,9 +205,9 @@ impl Note {
     }
 }
 
-/// 去掉标题开头的编号前缀（如 "1.1 标题" → "标题"；"1.1 1.1 标题" → "标题"），
-/// 因为编号由 Rust 后处理统一赋值，避免 LLM 自带编号导致重复。
-/// 循环去除，防止 LLM 写了 "1.1 1.1" 这种重复。
+/// 去掉标题开头的编号前缀（数字 "1.1 " 与中文序号 "一、"），
+/// 因为编号由 Rust 后处理统一赋值，避免 LLM 自带编号导致重复（如 "3 三、本文方案"）。
+/// 循环去除，防止 LLM 写了 "1.1 1.1"、"一、 二、" 这类重复。
 fn strip_leading_number(s: &str) -> String {
     let mut s = s.trim().to_string();
     loop {
@@ -222,6 +222,10 @@ fn strip_leading_number(s: &str) -> String {
 
 fn strip_one_leading_number(s: &str) -> String {
     let s = s.trim();
+    // 中文序号前缀："一、" "十二、"
+    if let Some(rest) = strip_chinese_ordinal(s) {
+        return rest.to_string();
+    }
     let mut chars = s.chars().peekable();
     let mut consumed = 0usize;
     let mut saw_digit = false;
@@ -248,6 +252,30 @@ fn strip_one_leading_number(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// 剥除中文序号前缀："一、xxx" → "xxx"，"十二、xxx" → "xxx"。
+/// 仅当 中文数字(≥1个) + 分隔符(、：:．.) 出现在开头时剥除，
+/// 避免误伤 "三体问题" 这类以汉字数字开头但非序号的标题。
+fn strip_chinese_ordinal(s: &str) -> Option<&str> {
+    let mut consumed = 0usize;
+    let mut n_digits = 0usize;
+    for c in s.chars() {
+        if matches!(c, '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百' | '零' | '〇') {
+            n_digits += 1;
+            consumed += c.len_utf8();
+        } else if n_digits > 0 && matches!(c, '、' | '：' | ':' | '．' | '.') {
+            consumed += c.len_utf8();
+            let rest = &s[consumed..];
+            if !rest.trim().is_empty() {
+                return Some(rest.trim_start());
+            }
+            return None; // 序号后没有内容，保守不剥
+        } else {
+            return None; // 数字后不是分隔符（如 "三体问题"），不剥
+        }
+    }
+    None
 }
 
 fn uid() -> String {
@@ -591,9 +619,30 @@ mod tests {
         let secs: Vec<&Block> = note.flatten().iter().map(|(b, _)| *b).filter(|b| b.kind == BlockKind::Section).collect();
         for s in &secs {
             assert!(!s.text.starts_with("1."), "标题不应含 LLM 残留编号: {}", s.text);
+            assert!(!s.text.starts_with("一、"), "中文序号也应剥除: {}", s.text);
         }
-        // 中文"一、"保留
-        assert!(secs.iter().any(|s| s.text.contains("一、问题")), "中文序号应保留: {:?}", secs.iter().map(|s| &s.text).collect::<Vec<_>>());
+        assert!(secs.iter().any(|s| s.text == "问题"), "应剥成 '问题': {:?}", secs.iter().map(|s| &s.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn strips_chinese_ordinal_prefix() {
+        use super::{strip_chinese_ordinal, strip_leading_number};
+        // 常见中文序号
+        assert_eq!(strip_chinese_ordinal("一、要解决的问题"), Some("要解决的问题"));
+        assert_eq!(strip_chinese_ordinal("十二、实验与分析"), Some("实验与分析"));
+        assert_eq!(strip_chinese_ordinal("三：方法"), Some("方法"));
+        // 非序号场景不误伤
+        assert_eq!(strip_chinese_ordinal("三体问题"), None, "'三'后无分隔符不剥");
+        assert_eq!(strip_chinese_ordinal("十维向量"), None);
+        // 循环剥重复 "一、 二、"
+        assert_eq!(strip_leading_number("一、 二、标题"), "标题");
+        // 端到端：一级标题带中文序号，导出标题只剩 Rust 编号
+        let md = "# T\n## 一、要解决的问题\npara\n## 三、本文方案\npara\n";
+        let note = parse_markdown_note(md, "raw");
+        let out = note.to_markdown();
+        assert!(out.contains("## 1 要解决的问题"), "应为 '## 1 要解决的问题': {out}");
+        assert!(out.contains("## 2 本文方案"), "应为 '## 2 本文方案': {out}");
+        assert!(!out.contains("三、本文方案"), "不应残留中文序号: {out}");
     }
 
     #[test]
