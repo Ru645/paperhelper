@@ -26,28 +26,57 @@ async fn main() -> Result<()> {
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        // -s <ID> : 恢复指定会话（ID 是固定数字，不会变）
+        // -s <会话名|ID|序号> : 恢复指定会话
+        // 匹配优先级：会话名精确匹配（含时间戳名）→ 文件 ID → 列表序号(1-based)
         if args.len() == 2 && args[0] == "-s" {
             let sid = &args[1];
-            let id: u64 = sid.parse().map_err(|_| anyhow!("ID 必须是数字"))?;
-            let path = paths::session_path(id);
-            if !path.exists() {
-                eprintln!("会话 {id} 不存在。可用会话：");
-                let sessions = paths::list_sessions();
-                if sessions.is_empty() {
-                    eprintln!("  （无已保存会话）");
-                } else {
-                    for s in &sessions {
-                        let name = session_name_of(*s);
-                        eprintln!("  {s}  {name}");
+            let sessions = paths::list_sessions();
+
+            // ① 按会话名精确匹配（时间戳 fallback 名、自定义 ASCII 名可直接用）
+            let mut target: Option<(u64, String)> = sessions
+                .iter()
+                .find(|&&id| session_name_of(id) == *sid)
+                .map(|&id| (id, sid.clone()));
+
+            // ② 纯数字：按文件 ID（id.json 存在）
+            if target.is_none() && sid.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(id) = sid.parse::<u64>() {
+                    if paths::session_path(id).exists() {
+                        target = Some((id, sid.clone()));
                     }
                 }
-                return Err(anyhow!("会话不存在"));
             }
-            app.session = session::Session::load(&path)?;
-            let name = app.session.session_name.clone();
-            println!("已恢复会话 {id}：{}", if name.is_empty() { "（未命名）".into() } else { name });
-            return app.repl().await;
+
+            // ③ 纯数字：按列表序号（1-based，向后兼容）
+            if target.is_none() && sid.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(n) = sid.parse::<usize>() {
+                    if let Some(&id) = n.checked_sub(1).and_then(|i| sessions.get(i)) {
+                        target = Some((id, sid.clone()));
+                    }
+                }
+            }
+
+            match target {
+                Some((id, _)) => {
+                    let path = paths::session_path(id);
+                    app.session = session::Session::load(&path)?;
+                    let name = app.session.session_name.clone();
+                    println!("已恢复会话 {id}：{}", if name.is_empty() { "（未命名）".into() } else { name });
+                    return app.repl().await;
+                }
+                None => {
+                    eprintln!("会话 {sid} 不存在。可用会话（ID  会话名）：");
+                    if sessions.is_empty() {
+                        eprintln!("  （无已保存会话）");
+                    } else {
+                        for s in &sessions {
+                            let name = session_name_of(*s);
+                            eprintln!("  {s}  {name}");
+                        }
+                    }
+                    return Err(anyhow!("会话不存在"));
+                }
+            }
         }
         // -l : 列出所有会话
         if args.len() == 1 && (args[0] == "-l" || args[0] == "--list") {

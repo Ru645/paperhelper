@@ -382,8 +382,15 @@ impl App {
         let id = crate::paths::next_session_id()?;
         let path = crate::paths::session_path(id);
         self.session.save(&path)?;
+        // 恢复提示的参数：会话名是纯 ASCII（如时间戳）时直接用名字（显示什么就能输什么）；
+        // 中文名不方便输入，用数字 ID。
+        let resume_key = if self.session.session_name.is_ascii() && !self.session.session_name.is_empty() {
+            self.session.session_name.clone()
+        } else {
+            id.to_string()
+        };
         println!("{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
-        println!("  恢复方式：paperhelper -s {}", id);
+        println!("  恢复方式：paperhelper -s {}", resume_key);
         Ok(())
     }
 
@@ -485,7 +492,9 @@ PaperHelper 命令：
   budget <n>              设置 token 预算(0=不限)，到上限自动中断
   save [file]              保存会话(默认 session.json)
   load <file>              加载会话
-  export md|mindmap <file> 导出笔记为 Markdown / 思维导图
+  export md|mindmap|html <file> 导出笔记为 Markdown / 思维导图 / HTML
+                          html: 自包含网页(KaTeX公式渲染+对话树侧栏)，浏览器打开；
+                          也是实验特性，仅供测试体验，正式笔记建议用 md
   papers                   列出已读论文
   concepts                 列出已学概念(跨论文)
   config show              查看配置
