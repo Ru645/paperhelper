@@ -680,16 +680,35 @@ PaperHelper 命令：
 
     async fn cmd_export(&self, rest: &str) -> Result<()> {
         let (fmt, path) = split_cmd(rest);
-        if path.is_empty() {
-            bail!("用法: export <md|mindmap|html> <文件>");
+        // 格式 → 默认后缀
+        let default_ext = match fmt {
+            "md" | "markdown" => ".md",
+            "mindmap" | "mm" => ".mm",
+            "html" | "htm" => ".html",
+            _ => bail!("未知格式: {fmt}（可用: markdown, mindmap, html）"),
+        };
+        // 目标路径：无文件名时用 ingest 时设置的笔记名（export_path 去后缀的 stem）
+        let mut path = if path.is_empty() {
+            match &self.export_path {
+                Some(p) => Path::new(p)
+                    .with_extension("") // 去后缀，后续按格式加
+                    .to_string_lossy()
+                    .trim_end_matches('.').to_string(),
+                None => "note".to_string(),
+            }
+        } else {
+            normalize_path_arg(path)
+        };
+        // 智能补后缀：已有（任意）后缀则不添加
+        if !Path::new(&path).extension().is_some_and(|e| !e.is_empty()) {
+            path.push_str(default_ext);
         }
-        let path = normalize_path_arg(path);
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
         let content = match fmt {
             "md" | "markdown" => export::to_markdown(note),
             "mindmap" | "mm" => export::to_mindmap(note),
             "html" | "htm" => export::to_html(note, &self.session.conversation),
-            _ => bail!("未知格式: {fmt}（可用: markdown, mindmap, html）"),
+            _ => unreachable!(),
         };
         std::fs::write(&path, content)?;
         println!("已导出到 {path}");

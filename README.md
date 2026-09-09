@@ -186,7 +186,7 @@ source ~/.bashrc
 | `goto <n>` | 跳到对话树节点 n，根路径成为上下文 |
 | `stats` | 查看本次/累计 token 用量与成本 |
 | `budget <n>` | 设置 token 预算（0=不限），到上限自动中断 |
-| `export md\|mindmap\|html <file>` | 导出笔记为 Markdown / 思维导图（markmap 兼容）/ 自包含 HTML（KaTeX 公式渲染） |
+| `export md\|mindmap\|html [file]` | 导出笔记为 Markdown / 思维导图（markmap 兼容）/ 自包含 HTML（KaTeX 公式渲染）。自动补后缀（md→.md、mindmap→.mm、html→.html，已有后缀则不加）；省略文件名时用 ingest 时设置的笔记名 |
 | `papers` | 列出已读论文（跨会话累积） |
 | `concepts` | 列出已学概念（跨论文关联，LLM 自动提取概念名） |
 | `save [file]` | 手动保存会话 |
