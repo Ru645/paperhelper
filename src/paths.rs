@@ -1,3 +1,11 @@
+//! 数据目录与文件路径管理。
+//!
+//! 所有运行时数据集中在当前工作目录的 `.paperhelper/` 下（已被 gitignore）：
+//! - `config.toml`：用户配置（模型/价格/预算/补全预设）
+//! - `knowledge.json`：跨论文知识库（论文清单+已学概念+累计用量）
+//! - `sessions/<编号>.json`：会话存档，编号 = 首次保存的时间戳（如 20260909_021633），
+//!   作为 `-s` 的恢复参数；list_sessions 返回排序后的编号列表
+
 use std::fs;
 use std::path::PathBuf;
 

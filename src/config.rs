@@ -1,3 +1,12 @@
+//! 配置管理：加载、环境变量覆盖、持久化。
+//!
+//! 配置来源优先级：环境变量（PAPERHELPER_*）> `.env` > `.paperhelper/config.toml` > 内置默认。
+//! 实现要点：
+//! - `Config::load()` 依次尝试 dotenvy 注入环境、读 toml、再逐项用 env 覆盖
+//! - `presets` 节是 Tab 补全候选（模型/端点），字段缺失或为空时回落内置默认，
+//!   避免用户手改 toml 导致解析崩溃
+//! - `Config::save()` 全量写回 toml（`config set` / `budget` 命令后调用）
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;

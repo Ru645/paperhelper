@@ -1,3 +1,12 @@
+//! PDF/文本抽取：通过 Python 子进程调用外部工具，Rust 只做编排。
+//!
+//! - `extract_pages`：调 PyMuPDF（`python3 -c <内嵌脚本>`）抽文本层，按页用
+//!   form-feed（\x0c）分隔，返回逐页文本向量——保留页边界便于后续按页引用。
+//! - `ocr_extract`：扫描件处理。内嵌 Python 脚本逐页渲染成高分辨率 PNG 再喂
+//!   tesseract。Rust 侧先预检 tesseract 是否安装、探测语言包（缺 chi_sim
+//!   时降级 eng 并提示），失败时给出分平台的安装指引。
+//! 这样"允许调用其他语言库但主控在 Rust"：解析成功与否、文本流向都由 Rust 决定。
+
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::Command;

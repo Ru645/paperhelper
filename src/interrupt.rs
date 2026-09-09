@@ -1,3 +1,9 @@
+//! Ctrl-C 全局打断机制。
+//!
+//! 实现方式：tokio 任务常驻监听 SIGINT，收到后置位全局 `AtomicBool`；
+//! 长任务（LLM 流式读取、Python 子进程前后）轮询 `is_interrupted()` 自行中止，
+//! REPL 每条命令开始时 `reset()`。这样 Ctrl-C 只打断当前任务而不退出程序。
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 

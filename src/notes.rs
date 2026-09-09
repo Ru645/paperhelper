@@ -1,5 +1,20 @@
+//! 笔记树模型与"Markdown → 树"确定性解析器。
+//!
+//! 笔记树节点有三类（BlockKind）：Section（带层级编号如 3.2）、Paragraph、
+//! Formula。LLM 生成的 Markdown 由 `parse_markdown_note` 解析：`#` 标题、
+//! `##/###…` 按深度压栈成嵌套 Section，段落连续行合并成单个 Paragraph 块、
+//! `$$…$$` 公式并入所在段落（不单独切块）。编号全部由 Rust 的
+//! `assign_numbers` 后处理赋予，故解析前先 `strip_leading_number` 剥掉
+//! LLM 自带编号（含中文"一、"序号）。
+//!
+//! Explanation 是挂在 Block 上的递归追问树（回答→再追问层层嵌套），
+//! 支持 `sum` 折叠（collapsed + summary）。`locate` 用中英混排词袋打分定位
+//! 最相关块，实现 `ask` 的"自动找位置"。
+
 use serde::{Deserialize, Serialize};
 
+/// 笔记块的类型：章节 / 段落 / 公式。
+/// Formula 在解析阶段被并入 Paragraph，通常只在导出渲染细节中使用。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockKind {
@@ -9,6 +24,7 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
+    /// blocks/tree 视图中的小图标。
     pub fn tag(&self) -> &'static str {
         match self {
             BlockKind::Section => "§",
@@ -18,6 +34,9 @@ impl BlockKind {
     }
 }
 
+/// 一次追问的解释（可递归嵌套子追问）。
+/// 由 ask/check 产生并挂到某 Block 的 explanations；`children` 承载对
+/// 本回答的再追问；sum 之后 `collapsed=true` 且 `summary` 为概括文字。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Explanation {
     pub id: String,

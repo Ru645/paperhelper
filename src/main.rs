@@ -1,3 +1,13 @@
+//! 程序入口与命令行参数处理。
+//!
+//! 职责：
+//! - 组装依赖（配置、知识库、HTTP 客户端）并启动 REPL（`app::App`）
+//! - 解析三类命令行参数：
+//!   - `--completions`：输出 bash 补全脚本（`-s` 后补全会话编号）
+//!   - `-s <编号>`：按会话文件名精确/唯一前缀匹配，恢复会话后进入 REPL
+//!   - `-l`：列出所有会话（编号+标题）
+//! - 其余参数按单次 REPL 命令执行（便于脚本化调用）
+
 mod app;
 mod config;
 mod conversation;
@@ -113,7 +123,9 @@ async fn main() -> Result<()> {
     app.repl().await
 }
 
-/// 读取会话文件里的 session_name 字段（不完整反序列化，只取名字）。
+/// 读取会话文件里的 session_name 字段。
+/// 实现方式：不做完整 JSON 反序列化（会话文件可能很大），而是字符串查找
+/// `"session_name"` 键后取下一个 JSON 字符串字面量，轻量且够用。
 fn session_name_of(id: &str) -> String {
     let path = paths::session_path(id);
     let Ok(s) = std::fs::read_to_string(&path) else {

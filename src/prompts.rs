@@ -1,3 +1,10 @@
+//! 提示词模板的落盘与加载。
+//!
+//! LLM 的行为提示词全部外置为 `.paperhelper/prompts/*.txt`，用户可直接编辑
+//! （改完重启生效），删除则回落内置默认。首次运行 `ensure_prompt_files()`
+//! 会把内置默认写盘供编辑。`ask.txt` 约定 LLM 用 `[[概念: 名字]]` 行回报
+//! 核心概念，是知识库自动提取概念的接口协议。
+
 use anyhow::Result;
 use std::fs;
 use std::path::Path;

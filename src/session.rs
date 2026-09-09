@@ -1,3 +1,11 @@
+//! 会话状态（Session）与用量统计（SessionStats）。
+//!
+//! Session 是一次完整可持久化的工作现场：笔记树 + 对话树 + 用量统计 +
+//! 当前论文引用 + 会话名/编号。序列化为 JSON 存档在 `.paperhelper/sessions/`。
+//! 全部字段带 `#[serde(default)]`，保证老版本存档新增字段后仍可向后兼容加载。
+//! `session_id`（首次保存时间戳）同时充当文件名、`-l` 展示键、`-s` 恢复参数；
+//! `save()` 总是覆盖同一编号文件，实现"随时可恢复、对话位置不丢"。
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -6,6 +14,8 @@ use std::path::Path;
 use crate::conversation::Conversation;
 use crate::notes::Note;
 
+/// 每次 API 调用的 token 与成本累计（会话级）。
+/// 由 `ask/check/ingest/…` 在 LLM 返回后累加，退出时并入跨会话 knowledge.json。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionStats {
     #[serde(default)]

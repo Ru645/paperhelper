@@ -1,3 +1,12 @@
+//! 跨论文知识库（persisted in `.paperhelper/knowledge.json`）。
+//!
+//! 记录三件事：已读论文（Paper）、已学概念（Concept）、跨会话累计用量（SessionStats）。
+//! - ingest 成功后在 `papers` 登记论文；ask 回答末尾的 `[[概念: xxx]]` 由 LLM 回报、
+//!   Rust 解析后落入 `concepts`（name+paper_id 去重），definition 取该回答正文。
+//! - ask/check 组织上下文时 `search(query)` 检索相关概念注入 prompt，实现跨论文关联：
+//!   读到第二篇相关论文时，能引用第一篇学过的概念。
+//! 去重策略：papers 按 id、concepts 按 (name, paper_id) 组合判重，避免重复堆积。
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -5,6 +14,7 @@ use std::fs;
 use crate::paths;
 use crate::session::SessionStats;
 
+/// 一篇已读论文的登记信息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Paper {
     pub id: String,
@@ -13,6 +23,7 @@ pub struct Paper {
     pub read_at: String,
 }
 
+/// 一个已学概念：来源论文 + 精确定义 + 首次出现的追问位置（block_id）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Concept {
     pub name: String,
@@ -36,6 +47,7 @@ pub struct KnowledgeBase {
 }
 
 impl KnowledgeBase {
+    /// 从磁盘加载；文件不存在时返回空库（首次使用）。
     pub fn load() -> Result<Self> {
         let p = paths::knowledge_path();
         if !p.exists() {
@@ -46,6 +58,7 @@ impl KnowledgeBase {
         Ok(kb)
     }
 
+    /// 全量写回磁盘（knowledge.json 体积小，无需增量）。
     pub fn save(&self) -> Result<()> {
         paths::ensure_data_dir()?;
         let s = serde_json::to_string_pretty(self)?;
@@ -53,12 +66,14 @@ impl KnowledgeBase {
         Ok(())
     }
 
+    /// 登记一篇论文（按 id 判重，已读不重复入库）。
     pub fn add_paper(&mut self, paper: Paper) {
         if !self.papers.iter().any(|p| p.id == paper.id) {
             self.papers.push(paper);
         }
     }
 
+    /// 登记一个概念（按 name+paper_id 判重：不同论文可分别记录同名概念）。
     pub fn add_concept(&mut self, c: Concept) {
         if !self
             .concepts
@@ -69,7 +84,11 @@ impl KnowledgeBase {
         }
     }
 
-    /// 检索与查询相关的已学概念（关键词重叠，跨论文关联）。
+    /// 检索与查询相关的已学概念（关键词重叠打分，跨论文关联）。
+    ///
+    /// 实现方式：把查询切成 ≥2 字符的单词，对每个概念计算"词项在
+    /// 概念名+定义中出现的次数"之和作为分数，取分最高的 5 条。简单词袋匹配，
+    /// 足够在追问注入场景用；返回带定义供 prompt 拼上下文。
     pub fn search(&self, query: &str) -> Vec<&Concept> {
         let terms: Vec<String> = query
             .to_lowercase()

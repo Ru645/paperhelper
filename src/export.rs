@@ -1,6 +1,19 @@
+//! 笔记导出渲染：Markdown / 思维导图(markmap) / 自包含 HTML。
+//!
+//! 三种格式共享同一棵笔记树与对话树：
+//! - Markdown：递归输出 Section（带 Rust 编号）、Paragraph、Explanation 追问块。
+//!   追问渲染规则见 `render_explanation`（父级空引用连接子追问、兄弟用裸空行
+//!   分隔、sum 后子树进 <details> 且总结在外），保证导出/浏览器折叠一致。
+//! - 思维导图：缩进 markdown，追问以 💬 前缀展示（markmap 兼容）。
+//! - HTML：单文件。把 Markdown 以 JS 字符串嵌入，运行时由 marked 渲染、
+//!   KaTeX 渲染公式；左侧为对话树 <ul>（当前节点高亮 + token 显示）。
+//!   CDN 双源（jsdelivr → npmmirror）自动 fallback，全挂则降级纯文本。
+//!   导出前先 `convert_inline_math_delims` 统一公式定界符，规避 marked 转义。
+
 use crate::conversation::Conversation;
 use crate::notes::{Block, BlockKind, Explanation, Note};
 
+/// 整棵笔记渲染为 Markdown（根标题 + 逐块递归，追问挂在所属块下）。
 pub fn to_markdown(note: &Note) -> String {
     let mut s = format!("# {}\n\n", note.title);
     walk_md(&note.blocks, 0, &mut s);

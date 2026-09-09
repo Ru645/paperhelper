@@ -1,3 +1,17 @@
+//! REPL 主控与业务编排（最大模块）。
+//!
+//! `App` 聚合 Config/KnowledgeBase/Session/client，`repl()` 提供交互循环，
+//! `run_command()` 按命令名分发给各 `cmd_*`。核心业务流程：
+//! - ingest：抽 PDF 文本 → LLM 生成四段笔记 Markdown → Rust 解析成笔记树并编号 →
+//!   登记论文 → 首次交互式询问导出文件名（后续 ask 自动同步导出）。
+//! - ask/check：用 `build_context_messages` 拼上下文（笔记块 + 论文全文 +
+//!   知识库相关概念 + 对话根路径），LLM 流式回答；ask 建 Explanation 挂到
+//!   locate 定位的块并递归嵌套，check 只建对话节点不写笔记。
+//! - sum：把当前节点子树收集后让 LLM 概括，折叠进 Explanation。
+//! - 全程 `record_usage` 累加 token/成本，`check_budget` 超预算即中断；
+//!   所有调用先 `interrupt::reset()` 再 poll 打断标志。
+//! 补全信息（section/node 编号、presets）通过 Arc<Mutex> 与 rustyline helper 共享。
+
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -251,6 +265,7 @@ impl PaperHelperHelper {
 pub struct App {
     pub config: Config,
     pub kb: KnowledgeBase,
+    /// 当前会话现场（笔记树+对话树+用量统计+编号/会话名）。
     pub session: Session,
     pub client: reqwest::Client,
     /// ask 后自动导出笔记的文件路径（ingest 时由用户指定）。
@@ -262,6 +277,7 @@ pub struct App {
 }
 
 impl App {
+    /// 组装 App：写出默认提示词模板、初始化空会话与补全列表。
     pub fn new(config: Config, kb: KnowledgeBase, client: reqwest::Client) -> Self {
         // 首次启动写出默认提示词模板，供用户在 .paperhelper/prompts/ 编辑
         let _ = crate::prompts::ensure_prompt_files();
@@ -276,6 +292,9 @@ impl App {
         }
     }
 
+    /// 主循环：打印横幅与配置引导 → 初始化 rustyline 编辑器（history、
+    /// Ctrl-C 绑定、补全 helper）→ 逐行 `run_command` → 退出前 `autosave_on_exit`。
+    /// Ctrl-C 语义：当前无任务时取消输入行；有 LLM 任务时置打断标志中止流式。
     pub async fn repl(&mut self) -> Result<()> {
         println!("{}", "=== PaperHelper 论文学习助手 ===".bold().cyan());
         println!(
@@ -362,7 +381,8 @@ impl App {
     }
 
     /// 退出时自动保存会话到 .paperhelper/sessions/。
-    /// 用递增数字 ID 作文件名（永不变），会话名存在 JSON 内部供 -l 展示。
+    /// 编号 = 首次保存时间戳（session_id，之后每次退出覆盖保存同一文件不变）。
+    /// 保存前先调 LLM 取一个简短会话名（失败则兜底"未命名会话"）。
     async fn autosave_on_exit(&mut self) -> Result<()> {
         if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
             return Ok(());
@@ -432,6 +452,9 @@ impl App {
         }
     }
 
+    /// 命令分发器：把一行输入拆成 (命令, 剩余参数) 后匹配执行各 cmd_*；
+    /// 每条命令结束后统一刷新补全列表（区块/节点编号可能已变化）。
+    /// 支持别名：tree|trajectory、ingest|pdf、ask|q、help|?。
     pub async fn run_command(&mut self, line: &str) -> Result<()> {
         let (cmd, rest) = split_cmd(line);
         match cmd {
@@ -507,6 +530,9 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// config show / set：查看或修改配置。set 经 `set_config` 改内存再整体
+    /// `Config::save()` 落盘 config.toml；api_key 回显时脱敏。模型/端点可切换
+    /// （OpenAI ⇄ DeepSeek ⇄ 本地 Ollama），这正是"用户可自由改 API 配置"的入口。
     async fn cmd_config(&mut self, rest: &str) -> Result<()> {
         let (sub, args) = split_cmd(rest);
         match sub {
@@ -613,6 +639,8 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// goto <编号|前缀>：跳转对话树节点。数字按 DFS 序（tree 里的 [n]），
+    /// 其它当 id 前缀（唯一前缀即可）。跳转后打印该节点的根路径问答，供确认。
     async fn cmd_goto(&mut self, rest: &str) -> Result<()> {
         let arg = rest.trim();
         if arg.is_empty() {
@@ -678,6 +706,9 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// export <md|mindmap|html> [file]：按格式渲染整篇笔记（md→Markdown、
+    /// mindmap→markmap、html→自包含 HTML），写盘。路径处理见上（自动补后缀、
+    /// 缺省用 ingest 笔记名的 stem）。渲染本身在 export.rs，这里只做分流与落盘。
     async fn cmd_export(&self, rest: &str) -> Result<()> {
         let (fmt, path) = split_cmd(rest);
         // 格式 → 默认后缀
@@ -717,6 +748,12 @@ PaperHelper 命令：
 
     // ===== 以下为异步 LLM 相关命令（ingest / ask）=====
 
+    /// ingest 主流程（PDF/文本/OCR 三种模式）：
+    /// 1. 抽取全文（text 直读 / pdf 走 PyMuPDF / ocr 走 tesseract，均带进度条与打断）；
+    /// 2. 后台线程 `llm::chat` 生成笔记（流式打印到终端便于观察）；
+    /// 3. 成功后 `parse_markdown_note` 解析成树、登记知识库 Paper；
+    ///    首次询问导出文件名（写 export_path，之后 ask 自动同步到该文件）。
+    /// 全程记录 token，超预算/被打断即中止且不写会话。
     async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
         let rest = rest.trim();
         // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
@@ -881,6 +918,15 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// ask 主流程（追问 → 写笔记）：
+    /// 1. 解析 `ask <编号> <问题>`（无编号则 locate 关键词匹配，编号对应
+    ///    build_context_messages 里按 find_section_by_number 定位块文本）；
+    /// 2. 预算检查 → `build_context_messages` 拼上下文 → 后台线程 LLM 流式回答
+    ///    （进度条+实时打印，Ctrl-C 可打断，token 精确统计）；
+    /// 3. 回答写入会话：定位 explanation 父（当前对话节点的 explanation_id），
+    ///    在笔记树对应位置插入/嵌套 Explanation，block_id/explanation_id 落到新对话节点；
+    /// 4. 回答自动提取概念（`extract_concept`，解析 [[概念: …]] 或按问题名兜底）
+    ///    存入知识库；自动导出笔记到 export_path。
     async fn cmd_ask(&mut self, args: &str) -> Result<()> {
         let args = args.trim();
         // ask --help：打印用法
@@ -1168,8 +1214,10 @@ PaperHelper 命令：
         Ok(())
     }
 
-    /// sum：把当前对话节点子树（含自己）的全部问答概括成知识卡片。
-    /// 终端显示 + 追加写入 <笔记名>.cards.md。
+    /// sum：把当前对话节点子树（含自己）的全部问答概括成"总结"，写入笔记。
+    /// 流程：DFS 收集子树 → 预算检查 → LLM 概括（进度条）→ 找到当前节点向上最近
+    /// 带解释的祖先（跳过 check）→ 给该 Explanation 写 summary 并折叠（collapsed）
+    /// → 同步导出。终端先打印总结正文，笔记中体现为 <details> 折叠+总结。
     async fn cmd_sum(&mut self) -> Result<()> {
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
@@ -1311,7 +1359,13 @@ PaperHelper 命令：
         *self.node_numbers.lock().unwrap() = nodes;
     }
 
-    /// 构建 ask/check 共用的上下文消息（论文全文+笔记+对话路径+概念注入）。
+    /// 构建 ask/check 共用的上下文消息序列（论文全文+笔记+对话路径+概念注入）。
+    /// 消息编排：system=ask 提示词；user=论文全文；assistant=已生成笔记
+    /// （把它们放进多轮对话让 LLM"看过"长文，再以多轮 Q&A 追加历史）；
+    /// user=问题（追加检索到的知识库相关概念提示语）。若问题带编号先在
+    /// 笔记里定位该 Section 文本；否则用关键词 `locate`。
+    /// 上下文长度控制：先估算 论文+笔记+问题 的 token 基数，在
+    /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
     fn build_context_messages(&self, question: &str, block_num: &Option<String>) -> (Vec<Message>, Option<String>) {
         let (raw_text, notes_md, block_id) = {
@@ -1400,6 +1454,7 @@ fn normalize_path_arg(s: &str) -> String {
 }
 
 fn split_cmd(line: &str) -> (&str, &str) {
+    // 按首个空白切分：命令 + 其余参数（命令本身不含空格）
     let mut it = line.splitn(2, char::is_whitespace);
     let cmd = it.next().unwrap_or("");
     let rest = it.next().unwrap_or("").trim();

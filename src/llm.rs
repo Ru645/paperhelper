@@ -1,3 +1,14 @@
+//! OpenAI 兼容流式 LLM 客户端（DeepSeek / OpenAI / 本地模型均可）。
+//!
+//! 用法：`chat(client, cfg, messages, json_mode, thinking, on_token)`。
+//! 要点：
+//! - SSE 流式读取：逐 chunk 解析 `data:` 行，内容实时回调给 UI（进度渲染/打断）。
+//!   `stream_options.include_usage` 让服务端在流末回传 usage → 精确统计 token。
+//! - 兼容性降级：本地模型不认 response_format/reasoning_effort 等扩展字段时
+//!   返回 400/422，去掉这些字段重试一次；无 usage 时报文长度估算并标记 estimated。
+//! - 网络重试：连接/超时/请求错误退避重试（1s、2s），不重复计费（请求未达）。
+//!   每次流块之间检查 `interrupt::is_interrupted()`，Ctrl-C 即时中断。
+
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -7,17 +18,20 @@ use serde_json::json;
 use crate::config::LlmConfig;
 use crate::interrupt::is_interrupted;
 
+/// 一次对话消息（OpenAI roles: system / user / assistant）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
 }
 
+/// 一次完成的 LLM 结果：正文 + 精确/估算的 token 计数与成本核算依据。
 #[derive(Debug, Clone, Default)]
 pub struct LlmResult {
     pub content: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// true 表示 usage 缺失、token 数由字符数估算（无 includes_usage 的本地模型）。
     pub estimated: bool,
 }
 

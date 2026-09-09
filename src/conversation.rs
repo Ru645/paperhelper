@@ -1,3 +1,12 @@
+//! 对话树模型：记录每次问答在"哪个上下文下产生"。
+//!
+//! 与线性聊天不同，对话是树：节点 = 一次问答（ConvNode），`parent` 指向
+//! 触发它的节点。`tree`/`goto` 让人跳回任意节点继续，从根到当前节点的路径
+//! 就是下一次 ask 的对话上下文（见 app.rs `build_context_messages`）。
+//! 节点还记录 `block_id`（定位笔记段落）与 `explanation_id`（该回答创建的
+//! Explanation，check 节点为 None）；`explanation_ancestor` 沿父链跳过
+//! check 找到最近的真实解释，供笔记嵌套定位使用。
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -99,6 +108,10 @@ impl Conversation {
 
     /// 以树形（类似 `tree` 命令）渲染整棵对话树，当前节点用 * 标记。
     /// 每个节点带 `[n]` 编号（DFS 顺序，标号在缩进之后），可用 `goto n` 跳转。
+    ///
+    /// 实现方式：先建 (parent → children) 邻接表，再 DFS。渲染时用前缀栈画
+    /// ├──/└── 连接线；非末位孩子的后续行补 `│   ` 竖线、末位补空格。
+    /// 每行附 token 与成本（非 0 时），便于 `stats` 之外看单点开销。
     pub fn render_tree(&self) -> String {
         let order = self.dfs_order();
         if order.is_empty() {

@@ -8,11 +8,13 @@ PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一�
 
 - **导入 PDF → 自动生成结构化笔记**：LLM 按固定四段架构（问题/前人方案/本文方案/前景）生成详细 Markdown 笔记，含公式、表格、数值结果
 - **按编号追问**：看笔记里的 `### 3.2 变体一：BERTScore`，直接 `ask 3.2 ...`，解释自动插入对应位置
-- **递归嵌套批注**：对追问的回答再追问，批注层层嵌套，不会断开
-- **核对想法**：`check 3.2 我觉得这本质就是余弦相似度，对吗`，LLM 回答但不写入笔记
+- **递归嵌套批注**：对追问的回答再追问，批注层层嵌套（check 核对想法不写入笔记）
+- **总结折叠**：`sum` 把当前追问子树折叠成「总结」（可点击展开原问答），精简笔记
 - **对话树**：`tree` 查看全部对话轨迹，`goto 2` 跳到任意节点继续，根路径即上下文
-- **跨论文知识库**：自动积累读过的论文和学过的概念，`concepts` 查看知识清单
-- **会话自动保存**：退出时自动保存，`paperhelper -s <时间戳>` 直接恢复，对话位置不丢
+- **跨论文知识库**：自动积累读过的论文和学过的概念，追问时自动关联已学知识
+- **HTML 笔记**：单文件网页（KaTeX 公式渲染 + 对话树侧栏），浏览器阅读与搜索
+- **会话自动保存**：退出时自动保存，`paperhelper -s <编号>` 直接恢复，对话位置不丢
+- **工程细节**：Tab 补全（命令/路径/编号/配置项）、网络抖动自动重试、token 预算自动中断
 
 ## 快速开始
 
@@ -48,7 +50,7 @@ brew install tesseract tesseract-lang                    # macOS
 git clone <仓库地址> && cd paperhelper
 cargo build                 # 独立 crate 直接构建
 cargo build -p paperhelper   # 在 workspace 下时加 -p
-cargo test                  # 运行测试（13 个）
+cargo test                  # 运行测试（25 个）
 ```
 
 编译产物在 `./target/debug/paperhelper`。
@@ -93,11 +95,11 @@ EOF
 
 ```bash
 paperhelper                 # 新会话
-paperhelper -l              # 列出所有已保存会话（标识+会话名+时间）
-paperhelper -s 20260909_020452   # 按编号恢复（支持唯一前缀）
+paperhelper -l              # 列出所有已保存会话（编号+标题）
+paperhelper -s 20260909_020452   # 按编号恢复（支持唯一前缀，如 -s 20260909_02）
 ```
 
-会话的恢复标识是**保存时间戳**（退出时显示），会话名仅作展示。
+会话编号是**首次保存时的时间戳**，此后不变（每次 exit 覆盖保存同一编号）；标题仅作展示。
 
 **Shell 补全（可选，推荐）**：`-s` 后 Tab 补全时间戳：
 
@@ -129,6 +131,7 @@ source ~/.bashrc
 > ask 3.2 它和余弦相似度有什么区别            # 对上一个回答再追问，自动嵌套
 > check 3.2 我觉得这就是余弦相似度，对吗      # 核对想法，不写入笔记
 > goto 1                                     # 跳回根节点，开启新追问线
+> sum                                        # 折叠当前追问子树为「总结」
 > tree                                       # 看对话树
 [1] 导入《论文》
     └── [2] BERTScore
@@ -138,7 +141,7 @@ source ~/.bashrc
 > stats                                      # 看 token 用量和成本
 > exit                                       # 退出，自动保存
 ✓ 会话已保存：BERTScore与余弦相似度讨论
-  恢复方式：paperhelper -s 20260908_175624
+  恢复会话，请执行：paperhelper -s 20260909_021633
 ```
 
 ### 导入选项
@@ -179,7 +182,7 @@ source ~/.bashrc
 | `ingest --ocr <pdf>` | OCR 识别扫描件（需 tesseract） |
 | `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
 | `check <编号> <想法>` | 与 ask 类似但不写入笔记，用于核对理解 |
-| `sum` | 把当前对话节点子树的追问概括为"**总结**：…"，插入笔记对应追问处 |
+| `sum` | 把当前对话节点子树（含自己）的追问折叠（`<details>` 可展开）并替换为「**总结**：…」，插入笔记对应追问处 |
 | `blocks` | 列出笔记结构（带层级编号） |
 | `note` | 打印完整笔记 Markdown 到终端 |
 | `tree` | 以树形展示对话轨迹（带 `[n]` 编号，`*` 标记当前位置） |
@@ -196,7 +199,9 @@ source ~/.bashrc
 | `config set <k> <v>` | 设置配置项 |
 | `exit` | 退出（自动保存会话，告知恢复方式） |
 
-**REPL 操作**：`↑↓` 切换历史命令，`←→` 移动光标，`Tab` 补全命令名，`Ctrl-C` 打断当前任务。
+**REPL 操作**：`↑↓` 切换历史命令，`←→` 移动光标，`Ctrl-C` 打断当前任务。
+
+**Tab 补全**：命令名；`ingest/save/load/export` 补全文件路径；`goto` 补全节点编号；`ask/check` 补全笔记编号；`config set` 补全键名与常用值（模型/端点来自 presets）。
 
 ## 配置项
 
@@ -207,6 +212,7 @@ source ~/.bashrc
 | `llm.model` | 模型名 | gpt-4o-mini |
 | `llm.context_length` | 上下文长度（token） | 8192 |
 | `llm.thinking_mode` | 思考模式 | false |
+| `llm.pdf_input` | 声明模型支持 PDF 直传（file 模式，暂未实现均走文本） | false |
 | `pricing.input_price_per_1m` | 输入单价 | 0.15 |
 | `pricing.output_price_per_1m` | 输出单价 | 0.60 |
 | `budget.token_budget` | token 预算（0=不限） | 0 |
@@ -222,10 +228,9 @@ source ~/.bashrc
 ├── prompts/              # 提示词模板（可编辑）
 │   ├── ask.txt           # ask/check 的 system prompt
 │   └── note.txt          # 笔记生成模板（{raw_text} 为论文占位符）
-└── sessions/             # 会话存档
-    ├── counter           # ID 计数器
-    ├── 1.json            # 会话 1
-    └── 2.json            # 会话 2
+└── sessions/             # 会话存档（文件名 = 会话编号 = 首次保存时间戳）
+    ├── 20260909_021633.json
+    └── 20260909_033219.json
 ```
 
 所有文件已被 `.gitignore` 忽略，不会泄露。
@@ -244,16 +249,18 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 ## 技术架构
 
 - **Rust 主控**：PDF 解析、笔记树、对话树、编号、定位、导出、统计——全部 Rust 确定性逻辑
-- **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名
-- **两棵树**：笔记树（Section/Paragraph + 递归 Explanation）+ 对话树（Q&A 节点，路径即上下文）
+- **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名、生成总结
+- **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，sum 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **流式输出 + 进度条**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
+- **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断
+- **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
 
 ## 开发
 
 ```bash
-cargo build -p paperhelper            # 构建
-cargo test  -p paperhelper            # 13 个单元测试
-cargo build -p paperhelper --release  # 发布构建
+cargo build                             # 构建
+cargo test                              # 25 个单元测试
+cargo build --release                   # 发布构建
 ```
 
-二进制产物：`../target/debug/paperhelper`
+二进制产物：`./target/debug/paperhelper`
