@@ -21,6 +21,9 @@ pub struct Paper {
     pub title: String,
     pub path: String,
     pub read_at: String,
+    /// 是否在列表中置顶。
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// 一个已学概念：来源论文 + 精确定义 + 首次出现的追问位置（block_id）。
@@ -33,6 +36,9 @@ pub struct Concept {
     #[serde(default)]
     pub block_id: Option<String>,
     pub created_at: String,
+    /// 是否在列表中置顶。
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

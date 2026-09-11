@@ -911,6 +911,7 @@ PaperHelper 命令：
             title: title.clone(),
             path: file_path.to_string(),
             read_at: Utc::now().to_rfc3339(),
+            pinned: false,
         });
         self.kb.save()?;
 
@@ -1112,6 +1113,7 @@ PaperHelper 命令：
             paper_title: ptitle,
             block_id: if is_nested { None } else { block_id },
             created_at: now,
+            pinned: false,
         });
         self.kb.save()?;
 

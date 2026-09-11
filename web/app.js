@@ -245,9 +245,14 @@ function renderPapers(st) {
   for (const p of st.papers) {
     const li = document.createElement("li");
     li.className = "clickable";
-    li.textContent = `《${p.title}》`;
-    li.title = "点击查看笔记与对应会话";
+    const pin = p.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
+    li.innerHTML = `${pin}《${esc(p.title)}》`;
+    li.title = "点击查看笔记与对应会话 · 右键更多";
     li.onclick = () => openPaperTab(p);
+    li.oncontextmenu = (e) => {
+      e.preventDefault();
+      showPaperMenu(e.clientX, e.clientY, p);
+    };
     ul.appendChild(li);
   }
 }
@@ -262,9 +267,14 @@ function renderConcepts(st) {
   for (const c of st.concepts) {
     const li = document.createElement("li");
     li.className = "clickable";
-    li.textContent = c.name;
-    li.title = "点击查看概念详情";
+    const pin = c.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
+    li.innerHTML = `${pin}${esc(c.name)}`;
+    li.title = "点击查看概念详情 · 右键更多";
     li.onclick = () => openConceptTab(c.name);
+    li.oncontextmenu = (e) => {
+      e.preventDefault();
+      showConceptMenu(e.clientX, e.clientY, c);
+    };
     ul.appendChild(li);
   }
 }
@@ -286,12 +296,19 @@ function reloadNote(anchor) {
 }
 
 /// 把笔记 iframe 滚动到某条解释的锚点（expl-<id>）。同源可直接访问其文档。
+/// 若锚点在 sum 折叠的 <details> 内，先展开所有祖先 details 再滚动。
 function scrollNoteTo(anchor) {
   if (!anchor) return;
   try {
     const doc = noteFrame.contentDocument;
     const el = doc && doc.getElementById("expl-" + anchor);
-    if (el) el.scrollIntoView({ block: "center" });
+    if (!el) return;
+    let p = el.parentElement;
+    while (p) {
+      if (p.tagName === "DETAILS") p.open = true;
+      p = p.parentElement;
+    }
+    requestAnimationFrame(() => el.scrollIntoView({ block: "center" }));
   } catch (e) {
     console.error(e);
   }
@@ -411,22 +428,74 @@ async function loadSession(id, opts = {}) {
   }
 }
 
-function showSessionMenu(x, y, s) {
+/// 通用右键菜单：items = [{ label, danger, fn }]
+function showMenu(x, y, items) {
   const menu = $("ctx-menu");
   menu.innerHTML = "";
-  const item = (label, cls, fn) => {
+  for (const it of items) {
     const d = document.createElement("div");
-    d.textContent = label;
-    if (cls) d.className = cls;
-    d.onclick = () => { hideCtxMenu(); fn(); };
+    d.textContent = it.label;
+    if (it.danger) d.className = "danger";
+    d.onclick = () => { hideCtxMenu(); it.fn(); };
     menu.appendChild(d);
-  };
-  item(s.pinned ? "取消置顶" : "置顶会话", "", () => pinSession(s.id, !s.pinned));
-  item("重命名", "", () => renameSession(s));
-  item("删除会话", "danger", () => deleteSession(s));
+  }
   menu.style.left = x + "px";
   menu.style.top = y + "px";
   menu.classList.remove("hidden");
+}
+
+function showSessionMenu(x, y, s) {
+  showMenu(x, y, [
+    { label: s.pinned ? "取消置顶" : "置顶会话", fn: () => pinSession(s.id, !s.pinned) },
+    { label: "重命名", fn: () => renameSession(s) },
+    { label: "删除会话", danger: true, fn: () => deleteSession(s) },
+  ]);
+}
+
+function showPaperMenu(x, y, p) {
+  showMenu(x, y, [
+    { label: p.pinned ? "取消置顶" : "置顶论文", fn: () => pinPaper(p, !p.pinned) },
+    { label: "删除论文", danger: true, fn: () => deletePaper(p) },
+  ]);
+}
+
+function showConceptMenu(x, y, c) {
+  showMenu(x, y, [
+    { label: c.pinned ? "取消置顶" : "置顶概念", fn: () => pinConcept(c, !c.pinned) },
+    { label: "删除概念", danger: true, fn: () => deleteConcept(c) },
+  ]);
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function pinPaper(p, pinned) {
+  try { await postJson("/api/kb/paper/pin", { id: p.id, pinned }); } catch (e) { appendConsole("❌ " + e.message, "err"); }
+  refreshState();
+}
+
+async function deletePaper(p) {
+  if (!confirm(`从知识库移除论文《${p.title}》？\n（不影响对应会话与笔记）`)) return;
+  try { await postJson("/api/kb/paper/delete", { id: p.id }); } catch (e) { appendConsole("❌ " + e.message, "err"); }
+  refreshState();
+}
+
+async function pinConcept(c, pinned) {
+  try { await postJson("/api/kb/concept/pin", { name: c.name, paper_id: c.paper_id, pinned }); } catch (e) { appendConsole("❌ " + e.message, "err"); }
+  refreshState();
+}
+
+async function deleteConcept(c) {
+  if (!confirm(`从知识库移除概念「${c.name}」？`)) return;
+  try { await postJson("/api/kb/concept/delete", { name: c.name, paper_id: c.paper_id }); } catch (e) { appendConsole("❌ " + e.message, "err"); }
+  refreshState();
 }
 
 function hideCtxMenu() { $("ctx-menu").classList.add("hidden"); }

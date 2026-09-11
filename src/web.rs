@@ -56,6 +56,10 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/concept", get(api_concept))
         .route("/api/paper", get(api_paper))
         .route("/api/paper/note", get(api_paper_note))
+        .route("/api/kb/paper/pin", post(api_paper_pin))
+        .route("/api/kb/paper/delete", post(api_paper_delete))
+        .route("/api/kb/concept/pin", post(api_concept_pin))
+        .route("/api/kb/concept/delete", post(api_concept_delete))
         .with_state(app)
 }
 
@@ -238,21 +242,38 @@ fn build_state(a: &App) -> serde_json::Value {
         }
     }
 
-    let papers: Vec<serde_json::Value> = a
-        .kb
-        .papers
+    // 已读论文：置顶优先，其余按 read_at 倒序
+    let mut papers_ref: Vec<&crate::knowledge::Paper> = a.kb.papers.iter().collect();
+    papers_ref.sort_by(|x, y| {
+        y.pinned.cmp(&x.pinned).then_with(|| y.read_at.cmp(&x.read_at))
+    });
+    let papers: Vec<serde_json::Value> = papers_ref
         .iter()
-        .map(|p| json!({ "id": p.id, "title": p.title, "path": p.path, "read_at": p.read_at }))
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "title": p.title,
+                "path": p.path,
+                "read_at": p.read_at,
+                "pinned": p.pinned,
+            })
+        })
         .collect();
-    let concepts: Vec<serde_json::Value> = a
-        .kb
-        .concepts
+
+    // 已学概念：置顶优先，其余按 created_at 倒序
+    let mut concepts_ref: Vec<&crate::knowledge::Concept> = a.kb.concepts.iter().collect();
+    concepts_ref.sort_by(|x, y| {
+        y.pinned.cmp(&x.pinned).then_with(|| y.created_at.cmp(&x.created_at))
+    });
+    let concepts: Vec<serde_json::Value> = concepts_ref
         .iter()
         .map(|c| {
             json!({
                 "name": c.name,
                 "paper": c.paper_title,
+                "paper_id": c.paper_id,
                 "definition": c.definition.chars().take(80).collect::<String>(),
+                "pinned": c.pinned,
             })
         })
         .collect();
@@ -619,4 +640,89 @@ async fn api_paper_note(State(app): State<SharedApp>, Query(q): Query<IdQuery>) 
         export::to_html_bare(note, &sess.conversation),
     )
         .into_response()
+}
+
+// ===== 知识库（已读论文 / 已学概念）置顶与删除 =====
+
+#[derive(Deserialize)]
+struct PaperPinReq {
+    id: String,
+    pinned: bool,
+}
+
+async fn api_paper_pin(
+    State(app): State<SharedApp>,
+    Json(req): Json<PaperPinReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    let Some(p) = a.kb.papers.iter_mut().find(|p| p.id == req.id) else {
+        return Err((StatusCode::NOT_FOUND, "论文不存在".to_string()));
+    };
+    p.pinned = req.pinned;
+    a.kb.save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn api_paper_delete(
+    State(app): State<SharedApp>,
+    Json(req): Json<SessionReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    let before = a.kb.papers.len();
+    a.kb.papers.retain(|p| p.id != req.id);
+    if a.kb.papers.len() == before {
+        return Err((StatusCode::NOT_FOUND, "论文不存在".to_string()));
+    }
+    a.kb.save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ConceptKeyReq {
+    name: String,
+    paper_id: String,
+    pinned: bool,
+}
+
+async fn api_concept_pin(
+    State(app): State<SharedApp>,
+    Json(req): Json<ConceptKeyReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    let Some(c) = a
+        .kb
+        .concepts
+        .iter_mut()
+        .find(|c| c.name == req.name && c.paper_id == req.paper_id)
+    else {
+        return Err((StatusCode::NOT_FOUND, "概念不存在".to_string()));
+    };
+    c.pinned = req.pinned;
+    a.kb.save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ConceptDeleteReq {
+    name: String,
+    paper_id: String,
+}
+
+async fn api_concept_delete(
+    State(app): State<SharedApp>,
+    Json(req): Json<ConceptDeleteReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    let before = a.kb.concepts.len();
+    a.kb.concepts
+        .retain(|c| !(c.name == req.name && c.paper_id == req.paper_id));
+    if a.kb.concepts.len() == before {
+        return Err((StatusCode::NOT_FOUND, "概念不存在".to_string()));
+    }
+    a.kb.save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
 }

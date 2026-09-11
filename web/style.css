@@ -78,7 +78,7 @@ ul.session-list li:hover { background: #e4e4e1; }
 ul.session-list li.active { background: var(--blue-light); }
 ul.session-list .s-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; }
-ul.session-list .pin { color: #d97706; flex-shrink: 0; }
+.pin { color: #d97706; flex-shrink: 0; margin-right: 4px; }
 .muted { color: var(--muted); }
 
 /* ===== 主区 ===== */
