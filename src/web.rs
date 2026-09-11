@@ -206,6 +206,10 @@ fn build_state(a: &App) -> serde_json::Value {
                 "label": n.label,
                 "depth": depth_of(&n.id),
                 "current": a.session.conversation.current.as_deref() == Some(n.id.as_str()),
+                // 该节点在笔记中对应的解释锚点（ask 即自身；check 回退到最近祖先；根为 null）
+                "expl": crate::conversation::Conversation::explanation_ancestor(
+                    &a.session.conversation.nodes, &n.id,
+                ),
             })
         })
         .collect();
@@ -537,14 +541,15 @@ async fn api_concept(
         }
     });
     let hit = session::find_concept_qa(&q.name, paper_id.as_deref());
-    let (sid, sname, supd, question, answer) = match hit {
-        Some((m, qu, an)) => (m.session_id, m.session_name, m.updated_at, qu, an),
+    let (sid, sname, supd, question, answer, expl_id) = match hit {
+        Some((m, qu, an, eid)) => (m.session_id, m.session_name, m.updated_at, qu, an, eid),
         None => (
             String::new(),
             String::new(),
             String::new(),
             String::new(),
             String::new(),
+            None,
         ),
     };
     Json(json!({
@@ -556,6 +561,7 @@ async fn api_concept(
         "updated_at": supd,
         "question": question,
         "answer": answer,
+        "explanation_id": expl_id,
     }))
 }
 

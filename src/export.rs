@@ -15,12 +15,18 @@ use crate::notes::{Block, BlockKind, Explanation, Note};
 
 /// 整棵笔记渲染为 Markdown（根标题 + 逐块递归，追问挂在所属块下）。
 pub fn to_markdown(note: &Note) -> String {
+    to_markdown_with(note, false)
+}
+
+/// 渲染 Markdown；`anchors=true` 时在每条追问前注入 `<a id="expl-…">`，
+/// 供 Web 端笔记 iframe 内跳转定位（Markdown 导出保持干净，不注入）。
+fn to_markdown_with(note: &Note, anchors: bool) -> String {
     let mut s = format!("# {}\n\n", note.title);
-    walk_md(&note.blocks, 0, &mut s);
+    walk_md(&note.blocks, 0, anchors, &mut s);
     s
 }
 
-fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
+fn walk_md(blocks: &[Block], depth: usize, anchors: bool, s: &mut String) {
     for b in blocks {
         match b.kind {
             BlockKind::Section => {
@@ -43,10 +49,10 @@ fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
             if i > 0 {
                 s.push('\n'); // 顶层追问之间空行分隔（上块尾已有 \n）
             }
-            render_explanation(e, 1, s);
+            render_explanation(e, 1, anchors, s);
             s.push('\n');
         }
-        walk_md(&b.children, depth + 1, s);
+        walk_md(&b.children, depth + 1, anchors, s);
     }
 }
 
@@ -56,10 +62,15 @@ fn walk_md(blocks: &[Block], depth: usize, s: &mut String) {
 /// - 兄弟儿子之间用裸空行断开（分支分隔），`> >` 前缀仍保证渲染为嵌套层级；
 /// - 多行 answer 每行都加当前层级前缀，避免引用块断裂。
 /// - collapsed（sum 折叠）：整个追问子树包进 <details>，总结显示在折叠块外。
+/// - anchors=true 时，在追问最前面注入 `<a id="expl-<id>">` 供页面内跳转。
 /// 块与块之间的顶层分隔由调用者处理。
-fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
+fn render_explanation(e: &Explanation, depth: usize, anchors: bool, s: &mut String) {
     let prefix = "> ".repeat(depth);
     let parent_quote_empty = "> ".repeat(depth - 1) + ">"; // depth 个 >，无尾空格
+
+    if anchors {
+        s.push_str(&format!("{prefix}<a id=\"expl-{}\"></a>\n", e.id));
+    }
 
     if e.collapsed {
         // 折叠块：<details> 包裹 追问+解答+子树，总结在外
@@ -76,7 +87,7 @@ fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
             } else {
                 s.push('\n');
             }
-            render_explanation(child, depth + 1, s);
+            render_explanation(child, depth + 1, anchors, s);
         }
         s.push_str(&format!("{prefix}</details>\n"));
         // 总结显示在折叠块外
@@ -102,7 +113,7 @@ fn render_explanation(e: &Explanation, depth: usize, s: &mut String) {
             // 兄弟之间：裸空行断开（上一块尾已有 \n，再补一个成空行）
             s.push('\n');
         }
-        render_explanation(child, depth + 1, s);
+        render_explanation(child, depth + 1, anchors, s);
     }
 }
 
@@ -192,7 +203,7 @@ pub fn to_html_bare(note: &Note, conv: &Conversation) -> String {
 }
 
 fn to_html_with(note: &Note, conv: &Conversation, include_tree: bool) -> String {
-    let md = convert_inline_math_delims(&to_markdown(note));
+    let md = convert_inline_math_delims(&to_markdown_with(note, true));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
     let aside = if include_tree {
         format!(

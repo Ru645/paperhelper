@@ -79,7 +79,8 @@ function addDynamicTab(key, title, pane) {
   const btn = document.createElement("button");
   btn.className = "tab";
   btn.dataset.key = key;
-  btn.innerHTML = `${esc(title)} <span class="close" title="关闭">×</span>`;
+  // 标题放进 .tab-label（CSS 省略号截断），关闭按钮独立在外
+  btn.innerHTML = `<span class="tab-label">${esc(title)}</span><span class="close" title="关闭">×</span>`;
   btn.onclick = (e) => {
     if (e.target.classList.contains("close")) closeTab(key);
     else switchTab(key);
@@ -122,7 +123,7 @@ function handleFrame(frame) {
   }
 }
 
-async function runCommand(command, exportPath) {
+async function runCommand(command, opts = {}) {
   if (running) return;
   if (!command || !command.trim()) return;
   setRunning(true);
@@ -132,7 +133,7 @@ async function runCommand(command, exportPath) {
     const res = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command, export: exportPath || null }),
+      body: JSON.stringify({ command, export: opts.export || null }),
     });
     if (!res.ok || !res.body) {
       appendConsole("❌ 请求失败: HTTP " + res.status, "err");
@@ -160,7 +161,12 @@ async function runCommand(command, exportPath) {
   } finally {
     setRunning(false);
     await refreshState();
-    reloadNote();
+    if (opts.skipReload) {
+      // 笔记未变（如 goto）：不重载，直接滚动到目标位置
+      if (opts.scrollAnchor) scrollNoteTo(opts.scrollAnchor);
+    } else {
+      reloadNote(opts.scrollAnchor);
+    }
   }
 }
 
@@ -220,8 +226,11 @@ function renderTree(st) {
     li.style.paddingLeft = n.depth * 14 + "px";
     if (n.current) li.className = "current";
     li.textContent = `[${n.n}] ${n.label}`;
-    li.title = "点击跳到此节点";
-    li.onclick = () => runCommand("goto " + n.n);
+    li.title = "点击跳到此节点，并定位到笔记中的位置";
+    li.onclick = () => {
+      switchTab("note");
+      runCommand("goto " + n.n, { skipReload: true, scrollAnchor: n.expl });
+    };
     ul.appendChild(li);
   }
 }
@@ -260,8 +269,32 @@ function renderConcepts(st) {
   }
 }
 
-function reloadNote() {
+let pendingAnchor = null;
+
+// iframe 重载完成后，若有待定锚点则滚动定位（等 marked/KaTeX 执行）
+noteFrame.addEventListener("load", () => {
+  if (pendingAnchor !== null) {
+    const a = pendingAnchor;
+    pendingAnchor = null;
+    setTimeout(() => scrollNoteTo(a), 60);
+  }
+});
+
+function reloadNote(anchor) {
+  pendingAnchor = anchor || null;
   noteFrame.src = "/api/note?format=html&t=" + Date.now();
+}
+
+/// 把笔记 iframe 滚动到某条解释的锚点（expl-<id>）。同源可直接访问其文档。
+function scrollNoteTo(anchor) {
+  if (!anchor) return;
+  try {
+    const doc = noteFrame.contentDocument;
+    const el = doc && doc.getElementById("expl-" + anchor);
+    if (el) el.scrollIntoView({ block: "center" });
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 // ===== 概念 / 论文详情标签页 =====
@@ -277,7 +310,7 @@ async function openConceptTab(name) {
   try {
     const c = await (await fetch("/api/concept?name=" + encodeURIComponent(name))).json();
     const loadBtn = c.session_id
-      ? `<button class="mini primary" data-load="${esc(c.session_id)}">加载该会话</button>`
+      ? `<button class="mini primary" data-load="${esc(c.session_id)}" data-anchor="${esc(c.explanation_id || "")}">加载该会话</button>`
       : "";
     pane.innerHTML = `<div class="detail">
       <h2>概念：${esc(c.name)}</h2>
@@ -289,7 +322,9 @@ async function openConceptTab(name) {
         <dt>当时的回答</dt><dd class="answer">${esc(c.answer || "（无）")}</dd>
       </dl>
     </div>`;
-    pane.querySelectorAll("[data-load]").forEach((b) => (b.onclick = () => loadSession(b.dataset.load)));
+    pane.querySelectorAll("[data-load]").forEach(
+      (b) => (b.onclick = () => loadSession(b.dataset.load, { anchor: b.dataset.anchor || null }))
+    );
   } catch (e) {
     pane.innerHTML = `<div class="detail err">加载失败: ${esc(e)}</div>`;
   }
@@ -310,13 +345,16 @@ async function openPaperTab(p) {
       : "";
     const noteBlock = d.session_id
       ? `<div class="note-frame-wrap"><iframe src="/api/paper/note?id=${encodeURIComponent(p.id)}"></iframe></div>`
-      : '<p class="muted">找不到对应会话的笔记</p>';
-    pane.innerHTML = `<div class="detail">
-      <h2>《${esc(d.title)}》</h2>
-      <p class="meta">会话：${esc(d.session_name || "（未知）")} ${d.updated_at ? "· " + esc(fmtTime(d.updated_at)) : ""} ${loadBtn}</p>
+      : '<p class="muted" style="padding:16px 24px">找不到对应会话的笔记</p>';
+    // 论文页：头部固定，笔记 iframe 填满剩余高度，避免「外层滚动套内层滚动」
+    pane.innerHTML = `<div class="detail paper">
+      <div class="paper-head">
+        <h2>《${esc(d.title)}》</h2>
+        <p class="meta">会话：${esc(d.session_name || "（未知）")} ${d.updated_at ? "· " + esc(fmtTime(d.updated_at)) : ""} ${loadBtn}</p>
+      </div>
       ${noteBlock}
     </div>`;
-    pane.querySelectorAll("[data-load]").forEach((b) => (b.onclick = () => loadSession(b.dataset.load)));
+    pane.querySelectorAll("[data-load]").forEach((b) => (b.onclick = () => loadSession(b.dataset.load, { anchor: null })));
   } catch (e) {
     pane.innerHTML = `<div class="detail err">加载失败: ${esc(e)}</div>`;
   }
@@ -357,7 +395,7 @@ function renderSessions(list) {
   }
 }
 
-async function loadSession(id) {
+async function loadSession(id, opts = {}) {
   const res = await fetch("/api/sessions/load", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -365,7 +403,9 @@ async function loadSession(id) {
   });
   if (res.ok) {
     await refreshState();
-    reloadNote();
+    switchTab("note");
+    // 概念加载传锚点（定位到该问答）；论文/列表加载传 null（回到笔记开头）
+    reloadNote(opts.anchor || null);
   } else {
     appendConsole("❌ 加载失败: " + (await res.text()), "err");
   }

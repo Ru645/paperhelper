@@ -119,6 +119,8 @@ struct NodeLite {
     question: String,
     #[serde(default)]
     answer: String,
+    #[serde(default)]
+    explanation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -198,13 +200,13 @@ pub fn find_session_by_paper(paper_id: &str, title: &str) -> Option<(String, Ses
 
 /// 找某个概念（ask 节点 `label == name`）的问答及所在会话。
 /// 优先匹配概念来源论文 `prefer_paper`，否则取 `updated_at` 最新者。
-/// 返回 `(元信息, question, answer)`。
+/// 返回 `(元信息, question, answer, explanation_id)`。
 pub fn find_concept_qa(
     name: &str,
     prefer_paper: Option<&str>,
-) -> Option<(SessionMeta, String, String)> {
-    let mut fallback: Option<(SessionMeta, String, String)> = None;
-    let mut preferred: Option<(SessionMeta, String, String)> = None;
+) -> Option<(SessionMeta, String, String, Option<String>)> {
+    let mut fallback: Option<(SessionMeta, String, String, Option<String>)> = None;
+    let mut preferred: Option<(SessionMeta, String, String, Option<String>)> = None;
     for id in paths::list_sessions() {
         let Some(sc) = scan(&paths::session_path(&id)) else {
             continue;
@@ -213,7 +215,12 @@ pub fn find_concept_qa(
             if n.label != name {
                 continue;
             }
-            let hit = (sc.meta(), n.question.clone(), n.answer.clone());
+            let hit = (
+                sc.meta(),
+                n.question.clone(),
+                n.answer.clone(),
+                n.explanation_id.clone(),
+            );
             let is_pref = prefer_paper.is_some() && sc.current_paper_id.as_deref() == prefer_paper;
             if is_pref {
                 let better = preferred

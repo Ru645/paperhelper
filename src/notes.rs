@@ -1029,4 +1029,26 @@ mod tests {
         assert!(!bare.contains("<aside>"), "bare 导出不应含树侧栏");
         assert!(bare.contains("const MD = "), "bare 仍应含笔记正文");
     }
+
+    #[test]
+    fn html_injects_anchors_but_markdown_does_not() {
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "e1".into(),
+            question: "Q".into(),
+            answer: "A".into(),
+            concept: "c".into(),
+            created_at: "t".into(),
+            children: Vec::new(),
+            summary: None,
+            collapsed: false,
+        });
+        let conv = crate::conversation::Conversation::default();
+        let html = crate::export::to_html_bare(&note, &conv);
+        assert!(html.contains("expl-e1"), "HTML 应含解释锚点: ");
+        let md_out = crate::export::to_markdown(&note);
+        assert!(!md_out.contains("expl-e1"), "Markdown 导出不应含锚点");
+    }
 }
