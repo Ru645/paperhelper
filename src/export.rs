@@ -183,9 +183,25 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation) -> String {
 /// 左侧对话树（当前节点高亮），右侧笔记；CDN 不可用时降级显示原文。
 /// 资源加载带 fallback：jsdelivr 失败自动切 npmmirror。
 pub fn to_html(note: &Note, conv: &Conversation) -> String {
+    to_html_with(note, conv, true)
+}
+
+/// 只渲染笔记正文、不含左侧对话树（Web 内嵌用，避免与页面自身树重复）。
+pub fn to_html_bare(note: &Note, conv: &Conversation) -> String {
+    to_html_with(note, conv, false)
+}
+
+fn to_html_with(note: &Note, conv: &Conversation, include_tree: bool) -> String {
     let md = convert_inline_math_delims(&to_markdown(note));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
-    let tree = conv_tree_html(conv);
+    let aside = if include_tree {
+        format!(
+            "  <aside>\n    <h2>对话轨迹</h2>\n    {}\n  </aside>\n",
+            conv_tree_html(conv)
+        )
+    } else {
+        String::new()
+    };
     let title = html_escape(&note.title);
     format!(
         r#"<!DOCTYPE html>
@@ -223,11 +239,7 @@ pub fn to_html(note: &Note, conv: &Conversation) -> String {
 </head>
 <body>
 <div class="layout">
-  <aside>
-    <h2>对话轨迹</h2>
-    {tree}
-  </aside>
-  <main>
+{aside}  <main>
     <div id="note"></div>
     <pre id="fallback"></pre>
   </main>
@@ -322,7 +334,7 @@ const MD = {md_json};
 </html>
 "#,
         title = title,
-        tree = tree,
+        aside = aside,
         md_json = md_json
     )
 }

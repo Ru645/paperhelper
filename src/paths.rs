@@ -32,6 +32,11 @@ pub fn knowledge_path() -> PathBuf {
     data_dir().join("knowledge.json")
 }
 
+/// 置顶会话编号列表（旁路文件，避免改写大会话文件）。
+pub fn pins_path() -> PathBuf {
+    data_dir().join("pins.json")
+}
+
 /// 会话存档目录
 pub fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")

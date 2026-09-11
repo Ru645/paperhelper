@@ -228,6 +228,34 @@ impl Note {
         }
         walk(&mut self.blocks, id)
     }
+
+    /// 递归删除指定 id 的 Explanation（连同其嵌套子树），返回被删除的节点。
+    /// 用于 `del` 删除对话节点时同步清理笔记中的解释。找不到返回 None。
+    pub fn remove_explanation(&mut self, id: &str) -> Option<Explanation> {
+        fn walk_expl(expls: &mut Vec<Explanation>, id: &str) -> Option<Explanation> {
+            if let Some(pos) = expls.iter().position(|e| e.id == id) {
+                return Some(expls.remove(pos));
+            }
+            for e in expls.iter_mut() {
+                if let Some(f) = walk_expl(&mut e.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        fn walk(blocks: &mut [Block], id: &str) -> Option<Explanation> {
+            for b in blocks.iter_mut() {
+                if let Some(f) = walk_expl(&mut b.explanations, id) {
+                    return Some(f);
+                }
+                if let Some(f) = walk(&mut b.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        walk(&mut self.blocks, id)
+    }
 }
 
 /// 去掉标题开头的编号前缀（数字 "1.1 " 与中文序号 "一、"），
@@ -957,5 +985,48 @@ mod tests {
         assert_eq!(found.question, "Q2");
         // 找不到
         assert!(note.find_explanation_mut("nonexistent").is_none());
+    }
+
+    #[test]
+    fn remove_explanation_removes_subtree() {
+        let md = "# T\n## M\nSome method.\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let bid = note.locate("method").unwrap().id.clone();
+        note.find_block_mut(&bid).unwrap().explanations.push(Explanation {
+            id: "p".into(),
+            question: "父".into(),
+            answer: "答".into(),
+            concept: "c".into(),
+            created_at: "t".into(),
+            children: vec![Explanation {
+                id: "c1".into(),
+                question: "子".into(),
+                answer: "答".into(),
+                concept: "c".into(),
+                created_at: "t".into(),
+                children: Vec::new(),
+                summary: None,
+                collapsed: false,
+            }],
+            summary: None,
+            collapsed: false,
+        });
+        let removed = note.remove_explanation("p").expect("应删除父解释");
+        assert_eq!(removed.children.len(), 1, "返回值应含子树");
+        assert!(note.find_explanation_mut("p").is_none());
+        assert!(note.find_explanation_mut("c1").is_none(), "子解释应一并删除");
+        assert!(note.remove_explanation("nope").is_none());
+    }
+
+    #[test]
+    fn html_export_bare_has_no_tree() {
+        let md = "# T\n## M\nSome method.\n";
+        let note = parse_markdown_note(md, "raw");
+        let conv = crate::conversation::Conversation::default();
+        let full = crate::export::to_html(&note, &conv);
+        let bare = crate::export::to_html_bare(&note, &conv);
+        assert!(full.contains("<aside>"), "完整导出应含对话树侧栏");
+        assert!(!bare.contains("<aside>"), "bare 导出不应含树侧栏");
+        assert!(bare.contains("const MD = "), "bare 仍应含笔记正文");
     }
 }

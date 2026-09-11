@@ -58,9 +58,17 @@ fn sys_ask() -> String {
 }
 
 const COMMANDS: &[&str] = &[
-    "ingest", "ask", "check", "sum", "blocks", "note", "tree", "goto", "stats", "budget",
-    "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
+    "ingest", "ask", "check", "sum", "del", "undo", "blocks", "note", "tree", "goto", "stats",
+    "budget", "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
+
+/// `del` 的撤销快照：只保存可恢复的笔记与对话树，不含 stats
+/// （成本是真实发生的，撤销删除不应回退用量统计）。
+#[derive(Clone)]
+struct UndoSnapshot {
+    notes: Option<crate::notes::Note>,
+    conversation: Conversation,
+}
 
 /// 配置键定义表：补全与用法提示的单一来源。
 /// set_config 的 match 分支与此表保持键名一致。
@@ -285,6 +293,8 @@ pub struct App {
     section_numbers: Arc<Mutex<Vec<String>>>,
     /// 当前对话树节点编号列表（供补全用）
     node_numbers: Arc<Mutex<Vec<String>>>,
+    /// del 的内存撤销栈（最近在后，上限 20）。
+    undo_stack: Vec<UndoSnapshot>,
 }
 
 impl App {
@@ -301,7 +311,13 @@ impl App {
             emitter: Emitter::terminal(),
             section_numbers: Arc::new(Mutex::new(Vec::new())),
             node_numbers: Arc::new(Mutex::new(Vec::new())),
+            undo_stack: Vec::new(),
         }
+    }
+
+    /// 是否有可撤销的删除（Web 用于启用/禁用撤销按钮）。
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
     }
 
     /// 主循环：打印横幅与配置引导 → 初始化 rustyline 编辑器（history、
@@ -492,6 +508,8 @@ impl App {
             "ask" | "q" => self.cmd_ask(rest).await,
             "check" => self.cmd_check(rest).await,
             "sum" => self.cmd_sum().await,
+            "del" | "rm" => self.cmd_del(rest).await,
+            "undo" => self.cmd_undo().await,
             _ => {
                 outln!(self, "未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
@@ -513,6 +531,8 @@ PaperHelper 命令：
   check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
                           例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
   sum                      把当前节点子树的追问折叠并替换为「总结：…」（可点击展开）
+  del [--yes]              删除当前节点及其子树（需 --yes 确认；根节点不可删）
+  undo                     撤销上一次 del
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -1293,6 +1313,74 @@ PaperHelper 命令：
                 }
             }
         }
+        Ok(())
+    }
+
+    /// del [--yes]：删除当前对话节点及其子树（根节点不可删）。
+    /// 不带 `--yes` 只打印警告与将删除的内容，需 `del --yes` 确认；
+    /// 执行前把笔记+对话树入撤销栈，可用 `undo` 恢复。
+    async fn cmd_del(&mut self, rest: &str) -> Result<()> {
+        let cur = self
+            .session
+            .conversation
+            .current
+            .clone()
+            .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?;
+        let node = self
+            .session
+            .conversation
+            .nodes
+            .iter()
+            .find(|n| n.id == cur)
+            .ok_or_else(|| anyhow!("找不到当前节点"))?
+            .clone();
+        if node.parent.is_none() {
+            bail!("根节点不可删除（如需清空请用 `new` 新建会话）");
+        }
+        let subtree = self.collect_subtree(&cur);
+        let confirm = matches!(rest.trim(), "--yes" | "-y");
+        if !confirm {
+            outln!(self, "⚠️  将删除节点「{}」及其 {} 个子节点：", node.label, subtree.len().saturating_sub(1));
+            for (depth, n) in &subtree {
+                outln!(self, "  {}- {}", "  ".repeat(*depth), n.label);
+            }
+            outln!(self, "确认请执行：del --yes（可用 undo 撤销）");
+            return Ok(());
+        }
+        // 入撤销栈（限 20 条）
+        self.undo_stack.push(UndoSnapshot {
+            notes: self.session.notes.clone(),
+            conversation: self.session.conversation.clone(),
+        });
+        if self.undo_stack.len() > 20 {
+            self.undo_stack.remove(0);
+        }
+        // 同步移除笔记中对应的解释（含嵌套子树）
+        let expl_ids: Vec<String> = subtree
+            .iter()
+            .filter_map(|(_, n)| n.explanation_id.clone())
+            .collect();
+        if let Some(note) = self.session.notes.as_mut() {
+            for eid in &expl_ids {
+                let _ = note.remove_explanation(eid);
+            }
+        }
+        let removed = self.session.conversation.remove_subtree(&cur);
+        self.update_completions();
+        outln!(self, "✓ 已删除 {} 个对话节点（可用 `undo` 撤销）", removed.len());
+        Ok(())
+    }
+
+    /// undo：撤销上一次 `del`（恢复笔记与对话树，不影响用量统计）。
+    async fn cmd_undo(&mut self) -> Result<()> {
+        let snap = self
+            .undo_stack
+            .pop()
+            .ok_or_else(|| anyhow!("没有可撤销的删除操作"))?;
+        self.session.notes = snap.notes;
+        self.session.conversation = snap.conversation;
+        self.update_completions();
+        outln!(self, "✓ 已撤销上一次删除");
         Ok(())
     }
 

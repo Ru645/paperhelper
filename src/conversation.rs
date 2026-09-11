@@ -199,4 +199,82 @@ impl Conversation {
             }
         }
     }
+
+    /// 删除以 `root` 为根的整棵子树（含自己），返回被删除节点的 id（DFS 序）。
+    /// 若 `current` 落在被删子树内，则回退到被删根的父节点（根被删则为 None）。
+    pub fn remove_subtree(&mut self, root: &str) -> Vec<String> {
+        // 收集子树 id
+        let mut ids: Vec<String> = Vec::new();
+        let mut stack = vec![root.to_string()];
+        while let Some(id) = stack.pop() {
+            if !self.nodes.iter().any(|n| n.id == id) {
+                continue;
+            }
+            ids.push(id.clone());
+            for c in self.nodes.iter().filter(|n| n.parent.as_deref() == Some(id.as_str())) {
+                stack.push(c.id.clone());
+            }
+        }
+        // current 若在被删子树内，回退到根的父节点
+        let parent_of_root = self
+            .nodes
+            .iter()
+            .find(|n| n.id == root)
+            .and_then(|n| n.parent.clone());
+        if let Some(cur) = &self.current {
+            if ids.iter().any(|x| x == cur) {
+                self.current = parent_of_root;
+            }
+        }
+        self.nodes.retain(|n| !ids.iter().any(|x| x == &n.id));
+        ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(id: &str, parent: Option<&str>) -> ConvNode {
+        ConvNode {
+            id: id.into(),
+            parent: parent.map(String::from),
+            question: format!("Q{id}"),
+            answer: format!("A{id}"),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: "t".into(),
+            label: format!("L{id}"),
+        }
+    }
+
+    #[test]
+    fn remove_subtree_removes_descendants_and_resets_current() {
+        let mut c = Conversation::default();
+        c.add_exchange(mk("root", None));
+        c.add_exchange(mk("a", Some("root")));
+        c.add_exchange(mk("a1", Some("a")));
+        c.add_exchange(mk("b", Some("root")));
+        c.current = Some("a1".into());
+        let removed = c.remove_subtree("a");
+        assert_eq!(removed.len(), 2, "应删除 a 与 a1");
+        assert!(c.nodes.iter().all(|n| n.id != "a" && n.id != "a1"));
+        assert!(c.nodes.iter().any(|n| n.id == "b"), "兄弟节点应保留");
+        assert_eq!(c.current.as_deref(), Some("root"), "current 应回退到 a 的父节点");
+    }
+
+    #[test]
+    fn remove_subtree_of_root_clears_conversation() {
+        let mut c = Conversation::default();
+        c.add_exchange(mk("root", None));
+        c.add_exchange(mk("a", Some("root")));
+        c.current = Some("a".into());
+        let removed = c.remove_subtree("root");
+        assert_eq!(removed.len(), 2);
+        assert!(c.nodes.is_empty());
+        assert_eq!(c.current, None);
+    }
 }

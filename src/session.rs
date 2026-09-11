@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::conversation::Conversation;
 use crate::notes::Note;
+use crate::paths;
 
 /// 每次 API 调用的 token 与成本累计（会话级）。
 /// 由 `ask/check/ingest/…` 在 LLM 返回后累加，退出时并入跨会话 knowledge.json。
@@ -88,6 +89,166 @@ impl Session {
         }
         Ok(sess)
     }
+}
+
+/// 会话元信息（轻量解析，忽略 raw_text 等大字段，供列表/扫描使用）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub session_name: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub current_paper_id: Option<String>,
+}
+
+/// 读取会话文件里的元信息（serde 跳过未知的大字段如 raw_text）。
+pub fn read_meta(path: &Path) -> Option<SessionMeta> {
+    let s = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<SessionMeta>(&s).ok()
+}
+
+/// 扫描用的精简结构：会话元信息 + 对话节点的问答。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NodeLite {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ConvLite {
+    #[serde(default)]
+    nodes: Vec<NodeLite>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NoteLite {
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionScan {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    session_name: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    current_paper_id: Option<String>,
+    #[serde(default)]
+    notes: Option<NoteLite>,
+    #[serde(default)]
+    conversation: ConvLite,
+}
+
+impl SessionScan {
+    fn meta(&self) -> SessionMeta {
+        SessionMeta {
+            session_id: self.session_id.clone(),
+            session_name: self.session_name.clone(),
+            updated_at: self.updated_at.clone(),
+            current_paper_id: self.current_paper_id.clone(),
+        }
+    }
+}
+
+fn scan(path: &Path) -> Option<SessionScan> {
+    let s = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<SessionScan>(&s).ok()
+}
+
+/// 找包含指定论文的会话，取 `updated_at` 最新者。
+/// 优先按 `current_paper_id` 精确匹配；若论文被重新导入导致 id 变化，
+/// 则回退按笔记标题（忽略大小写）匹配。返回 `(会话编号, 元信息)`。
+pub fn find_session_by_paper(paper_id: &str, title: &str) -> Option<(String, SessionMeta)> {
+    let mut best: Option<(u8, String, SessionMeta)> = None;
+    for id in paths::list_sessions() {
+        let Some(sc) = scan(&paths::session_path(&id)) else {
+            continue;
+        };
+        let by_id = !paper_id.is_empty() && sc.current_paper_id.as_deref() == Some(paper_id);
+        let by_title = !title.is_empty()
+            && sc
+                .notes
+                .as_ref()
+                .is_some_and(|n| n.title.eq_ignore_ascii_case(title));
+        if !by_id && !by_title {
+            continue;
+        }
+        let prio = if by_id { 0u8 } else { 1u8 };
+        let meta = sc.meta();
+        let better = match &best {
+            None => true,
+            Some((bp, _, b)) => prio < *bp || (prio == *bp && meta.updated_at > b.updated_at),
+        };
+        if better {
+            best = Some((prio, id, meta));
+        }
+    }
+    best.map(|(_, id, meta)| (id, meta))
+}
+
+/// 找某个概念（ask 节点 `label == name`）的问答及所在会话。
+/// 优先匹配概念来源论文 `prefer_paper`，否则取 `updated_at` 最新者。
+/// 返回 `(元信息, question, answer)`。
+pub fn find_concept_qa(
+    name: &str,
+    prefer_paper: Option<&str>,
+) -> Option<(SessionMeta, String, String)> {
+    let mut fallback: Option<(SessionMeta, String, String)> = None;
+    let mut preferred: Option<(SessionMeta, String, String)> = None;
+    for id in paths::list_sessions() {
+        let Some(sc) = scan(&paths::session_path(&id)) else {
+            continue;
+        };
+        for n in &sc.conversation.nodes {
+            if n.label != name {
+                continue;
+            }
+            let hit = (sc.meta(), n.question.clone(), n.answer.clone());
+            let is_pref = prefer_paper.is_some() && sc.current_paper_id.as_deref() == prefer_paper;
+            if is_pref {
+                let better = preferred
+                    .as_ref()
+                    .map_or(true, |p| hit.0.updated_at > p.0.updated_at);
+                if better {
+                    preferred = Some(hit);
+                }
+            } else {
+                let better = fallback
+                    .as_ref()
+                    .map_or(true, |p| hit.0.updated_at > p.0.updated_at);
+                if better {
+                    fallback = Some(hit);
+                }
+            }
+        }
+    }
+    preferred.or(fallback)
+}
+
+/// 读取置顶会话编号列表（`.paperhelper/pins.json`），不存在则空。
+pub fn load_pins() -> Vec<String> {
+    match fs::read_to_string(paths::pins_path()) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 写回置顶会话编号列表。
+pub fn save_pins(ids: &[String]) -> Result<()> {
+    paths::ensure_data_dir()?;
+    let s = serde_json::to_string_pretty(ids)?;
+    fs::write(paths::pins_path(), s)?;
+    Ok(())
 }
 
 #[cfg(test)]

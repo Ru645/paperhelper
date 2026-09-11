@@ -50,6 +50,12 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
         .route("/api/sessions/save", post(api_session_save))
+        .route("/api/sessions/pin", post(api_session_pin))
+        .route("/api/sessions/rename", post(api_session_rename))
+        .route("/api/sessions/delete", post(api_session_delete))
+        .route("/api/concept", get(api_concept))
+        .route("/api/paper", get(api_paper))
+        .route("/api/paper/note", get(api_paper_note))
         .with_state(app)
 }
 
@@ -200,11 +206,19 @@ fn build_state(a: &App) -> serde_json::Value {
                 "label": n.label,
                 "depth": depth_of(&n.id),
                 "current": a.session.conversation.current.as_deref() == Some(n.id.as_str()),
-                "input": n.input_tokens,
-                "output": n.output_tokens,
             })
         })
         .collect();
+
+    // 当前节点上次真实请求的精确 input_tokens（API 返回的 usage，非估算）
+    let current_input_tokens = a
+        .session
+        .conversation
+        .current
+        .as_ref()
+        .and_then(|id| a.session.conversation.nodes.iter().find(|n| n.id == *id))
+        .map(|n| n.input_tokens)
+        .unwrap_or(0);
 
     // 笔记结构块
     let mut blocks: Vec<serde_json::Value> = Vec::new();
@@ -224,7 +238,7 @@ fn build_state(a: &App) -> serde_json::Value {
         .kb
         .papers
         .iter()
-        .map(|p| json!({ "title": p.title, "path": p.path }))
+        .map(|p| json!({ "id": p.id, "title": p.title, "path": p.path, "read_at": p.read_at }))
         .collect();
     let concepts: Vec<serde_json::Value> = a
         .kb
@@ -259,8 +273,12 @@ fn build_state(a: &App) -> serde_json::Value {
         },
         "has_note": a.session.notes.is_some(),
         "note_title": a.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
+        "session_id": a.session.session_id,
         "export_path": a.export_path,
         "current": a.session.conversation.current_label(),
+        "current_input_tokens": current_input_tokens,
+        "context_length": a.config.llm.context_length,
+        "can_undo": a.can_undo(),
         "tree": tree,
         "blocks": blocks,
         "papers": papers,
@@ -291,7 +309,7 @@ async fn api_note(State(app): State<SharedApp>, Query(q): Query<NoteQuery>) -> R
     } else {
         (
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            export::to_html(note, &a.session.conversation),
+            export::to_html_bare(note, &a.session.conversation),
         )
             .into_response()
     }
@@ -344,17 +362,49 @@ async fn api_config_set(
 
 // ===== 会话历史 =====
 
-async fn api_sessions() -> Json<serde_json::Value> {
+/// 精确匹配或唯一前缀匹配会话编号。
+fn resolve_session_id(key: &str) -> Result<String, (StatusCode, String)> {
     let ids = paths::list_sessions();
-    let list: Vec<serde_json::Value> = ids
+    if let Some(exact) = ids.iter().find(|s| s.as_str() == key) {
+        return Ok(exact.clone());
+    }
+    let hits: Vec<&String> = ids.iter().filter(|s| s.starts_with(key)).collect();
+    match hits.len() {
+        1 => Ok(hits[0].clone()),
+        0 => Err((StatusCode::NOT_FOUND, format!("会话不存在: {key}"))),
+        _ => Err((StatusCode::CONFLICT, format!("前缀不唯一: {key}"))),
+    }
+}
+
+/// 会话列表：置顶优先，其余按 `updated_at` 新→旧。
+async fn api_sessions() -> Json<serde_json::Value> {
+    let pins = session::load_pins();
+    let mut list: Vec<serde_json::Value> = paths::list_sessions()
         .iter()
         .map(|id| {
+            let meta = session::read_meta(&paths::session_path(id)).unwrap_or_default();
+            let name = if meta.session_name.is_empty() {
+                "（未命名）".to_string()
+            } else {
+                meta.session_name
+            };
             json!({
                 "id": id,
-                "name": crate::session_name_of(id),
+                "name": name,
+                "updated_at": meta.updated_at,
+                "pinned": pins.iter().any(|p| p == id),
             })
         })
         .collect();
+    list.sort_by(|a, b| {
+        let pa = a["pinned"].as_bool().unwrap_or(false);
+        let pb = b["pinned"].as_bool().unwrap_or(false);
+        pb.cmp(&pa).then_with(|| {
+            let ua = a["updated_at"].as_str().unwrap_or("");
+            let ub = b["updated_at"].as_str().unwrap_or("");
+            ub.cmp(ua)
+        })
+    });
     Json(json!({ "sessions": list }))
 }
 
@@ -367,24 +417,10 @@ async fn api_session_load(
     State(app): State<SharedApp>,
     Json(req): Json<SessionReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let ids = paths::list_sessions();
-    let target = ids
-        .iter()
-        .find(|s| *s == &req.id)
-        .cloned()
-        .or_else(|| {
-            let hits: Vec<&String> = ids.iter().filter(|s| s.starts_with(&req.id)).collect();
-            if hits.len() == 1 {
-                Some(hits[0].clone())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("会话不存在或不唯一: {}", req.id)))?;
-
+    let target = resolve_session_id(&req.id)?;
     let path = paths::session_path(&target);
-    let loaded =
-        session::Session::load(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let loaded = session::Session::load(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let mut a = app.lock().await;
     a.session = loaded;
     a.update_completions();
@@ -405,4 +441,176 @@ async fn api_session_save(
         "id": a.session.session_id,
         "name": a.session.session_name,
     })))
+}
+
+#[derive(Deserialize)]
+struct PinReq {
+    id: String,
+    pinned: bool,
+}
+
+async fn api_session_pin(
+    Json(req): Json<PinReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let target = resolve_session_id(&req.id)?;
+    let mut pins = session::load_pins();
+    if req.pinned {
+        if !pins.iter().any(|p| p == &target) {
+            pins.push(target.clone());
+        }
+    } else {
+        pins.retain(|p| p != &target);
+    }
+    session::save_pins(&pins)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true, "id": target, "pinned": req.pinned })))
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    id: String,
+    name: String,
+}
+
+async fn api_session_rename(
+    State(app): State<SharedApp>,
+    Json(req): Json<RenameReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let target = resolve_session_id(&req.id)?;
+    let path = paths::session_path(&target);
+    let mut sess = session::Session::load(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    sess.session_name = req.name.trim().to_string();
+    sess.save(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // 若改的是当前会话，同步内存中的名字
+    let mut a = app.lock().await;
+    if a.session.session_id == target {
+        a.session.session_name = sess.session_name.clone();
+    }
+    Ok(Json(json!({ "ok": true, "id": target, "name": sess.session_name })))
+}
+
+async fn api_session_delete(
+    State(app): State<SharedApp>,
+    Json(req): Json<SessionReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let target = resolve_session_id(&req.id)?;
+    let path = paths::session_path(&target);
+    std::fs::remove_file(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("删除失败: {e}")))?;
+    let mut pins = session::load_pins();
+    pins.retain(|p| p != &target);
+    let _ = session::save_pins(&pins);
+
+    let mut a = app.lock().await;
+    let mut reset = false;
+    if a.session.session_id == target {
+        // 删除的是当前会话：自动新建空会话
+        a.session = session::Session::default();
+        a.update_completions();
+        reset = true;
+    }
+    Ok(Json(json!({ "ok": true, "id": target, "reset": reset })))
+}
+
+// ===== 概念 / 论文详情 =====
+
+#[derive(Deserialize)]
+struct NameQuery {
+    name: String,
+}
+
+async fn api_concept(
+    State(app): State<SharedApp>,
+    Query(q): Query<NameQuery>,
+) -> Json<serde_json::Value> {
+    let a = app.lock().await;
+    let concept = a.kb.concepts.iter().find(|c| c.name == q.name);
+    let definition = concept.map(|c| c.definition.clone()).unwrap_or_default();
+    let paper_title = concept.map(|c| c.paper_title.clone()).unwrap_or_default();
+    let paper_id = concept.and_then(|c| {
+        if c.paper_id.is_empty() {
+            None
+        } else {
+            Some(c.paper_id.clone())
+        }
+    });
+    let hit = session::find_concept_qa(&q.name, paper_id.as_deref());
+    let (sid, sname, supd, question, answer) = match hit {
+        Some((m, qu, an)) => (m.session_id, m.session_name, m.updated_at, qu, an),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+    };
+    Json(json!({
+        "name": q.name,
+        "definition": definition,
+        "paper_title": paper_title,
+        "session_id": sid,
+        "session_name": sname,
+        "updated_at": supd,
+        "question": question,
+        "answer": answer,
+    }))
+}
+
+#[derive(Deserialize)]
+struct IdQuery {
+    id: String,
+}
+
+async fn api_paper(
+    State(app): State<SharedApp>,
+    Query(q): Query<IdQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let a = app.lock().await;
+    let paper = a
+        .kb
+        .papers
+        .iter()
+        .find(|p| p.id == q.id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "论文不存在".to_string()))?;
+    let (sid, sname, supd) = match session::find_session_by_paper(&q.id, &paper.title) {
+        Some((id, m)) => (id, m.session_name, m.updated_at),
+        None => (String::new(), String::new(), String::new()),
+    };
+    Ok(Json(json!({
+        "title": paper.title,
+        "path": paper.path,
+        "read_at": paper.read_at,
+        "session_id": sid,
+        "session_name": sname,
+        "updated_at": supd,
+    })))
+}
+
+/// 论文对应会话的笔记 HTML（无树侧栏，供标签页 iframe 使用）。
+async fn api_paper_note(State(app): State<SharedApp>, Query(q): Query<IdQuery>) -> Response {
+    let (paper_id, title) = {
+        let a = app.lock().await;
+        match a.kb.papers.iter().find(|p| p.id == q.id) {
+            Some(p) => (p.id.clone(), p.title.clone()),
+            None => (q.id.clone(), String::new()),
+        }
+    };
+    let Some((sid, _meta)) = session::find_session_by_paper(&paper_id, &title) else {
+        return (StatusCode::NOT_FOUND, "找不到该论文对应的会话").into_response();
+    };
+    let path = paths::session_path(&sid);
+    let Ok(sess) = session::Session::load(&path) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "加载会话失败").into_response();
+    };
+    let Some(note) = &sess.notes else {
+        return (StatusCode::NOT_FOUND, "该会话没有笔记").into_response();
+    };
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        export::to_html_bare(note, &sess.conversation),
+    )
+        .into_response()
 }
