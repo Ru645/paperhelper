@@ -60,6 +60,20 @@ pub async fn serve(app: App, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("PaperHelper Web 已启动: http://{addr}");
     println!("（Ctrl-C 停止服务）");
+
+    // web 模式不安装 CLI 的 REPL 打断器，这里自行监听 Ctrl-C 并终止整个进程。
+    // 直接 exit 以确保即使有浏览器 SSE 长连接也能立即退出（不做 graceful 等待）。
+    tokio::spawn(async {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            eprintln!("\n[收到 Ctrl-C，停止服务]");
+            interrupt::request(); // 若有在途任务，先请求中止
+            std::process::exit(0);
+        }
+    });
+
     axum::serve(listener, router(shared)).await?;
     Ok(())
 }

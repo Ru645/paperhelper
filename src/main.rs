@@ -44,7 +44,6 @@ complete -F _paperhelper paperhelper
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    interrupt::install();
     let config = config::Config::load()?;
     let kb = knowledge::KnowledgeBase::load()?;
     let client = reqwest::Client::builder()
@@ -72,6 +71,10 @@ async fn main() -> Result<()> {
         }
         return web::serve(app, port).await;
     }
+
+    // 仅 CLI 路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。
+    // 放在这里是为了让 web 模式不注册该 SIGINT 处理器，从而保留 Ctrl-C 终止进程的能力。
+    interrupt::install();
 
     if !args.is_empty() {
         // --completions : 输出 bash 补全脚本

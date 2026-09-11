@@ -128,7 +128,7 @@ paperhelper web --port 9000  # 指定端口
 - **配置弹窗**：修改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存
 - **左栏**：对话轨迹（点击跳转）、会话历史（加载/保存）、已读论文、已学概念
 
-实现方式：`paperhelper web` 启动内嵌的 axum 服务，把 CLI 的输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。
+实现方式：`paperhelper web` 启动内嵌的 axum 服务，把 CLI 的输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。在运行服务的终端按 `Ctrl-C` 即可停止服务（CLI 模式的 Ctrl-C 仍是打断当前任务）。
 
 ## 使用流程
 
