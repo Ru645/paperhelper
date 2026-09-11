@@ -285,20 +285,32 @@ const MD = {md_json};
   await loadCss(['katex@0.16.9/dist/katex.min.css']);
   await loadScripts([
     'marked@12.0.2/marked.min.js',
-    'katex@0.16.9/dist/katex.min.js',
-    'katex@0.16.9/dist/contrib/auto-render.min.js'
+    'katex@0.16.9/dist/katex.min.js'
   ]);
   if (window.marked) {{
-    document.getElementById('note').innerHTML = marked.parse(MD);
-    if (window.renderMathInElement) {{
-      renderMathInElement(document.getElementById('note'), {{
-        delimiters: [
-          {{left: '$$', right: '$$', display: true}},
-          {{left: '$', right: '$', display: false}}
-        ],
-        throwOnError: false
-      }});
-    }}
+    // 数学公式保护 + 渲染：
+    // marked 会把公式里的 _ ^ \ 当作 Markdown 语法（如下划线配对成 <em>），
+    // 也会把 < 当作 HTML 标签，嵌套追问的引用前缀 > 还会混进公式。
+    // 因此：① 先把 $$...$$ / $...$ 抽成占位符；② 渲染 Markdown；③ 逐个用
+    // KaTeX 渲染回填（渲染前去掉行首的 blockquote 标记）。这样公式内容完全不
+    // 经过 marked，LaTeX 保持原样。
+    const store = [];
+    const token = (i) => '\u2063M' + i + '\u2063';
+    let src = MD.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => {{ store.push([tex, true]); return token(store.length - 1); }});
+    src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => {{ store.push([tex, false]); return token(store.length - 1); }});
+    let html = marked.parse(src);
+    html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {{
+      const entry = store[+i];
+      const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, '').trim();
+      const display = entry[1];
+      if (window.katex) {{
+        try {{ return katex.renderToString(tex, {{ displayMode: display, throwOnError: false }}); }} catch (e) {{}}
+      }}
+      // 无 KaTeX 时降级：HTML 转义后按源码显示
+      const raw = display ? '$$' + tex + '$$' : '$' + tex + '$';
+      return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }});
+    document.getElementById('note').innerHTML = html;
   }} else {{
     // CDN 全部不可用时降级为纯文本
     document.getElementById('fallback').style.display = 'block';

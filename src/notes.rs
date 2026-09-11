@@ -915,6 +915,20 @@ mod tests {
     }
 
     #[test]
+    fn html_export_protects_math_from_markdown() {
+        // 多行 $$ 公式含下划线/小于号，且被嵌套引用（> 前缀）包裹：
+        // 必须先把公式抽成占位符再渲染 Markdown，最后用 katex.renderToString 回填，
+        // 否则 marked 会把 _ 配对成 <em>、把 < 当 HTML 标签，破坏 LaTeX。
+        let md = "# T\n## M\n> > $$\n> > S_{\\text{n-gram}}^{\\text{Avg}}(i) = -\\frac{1}{J}\\sum_{j}\\log \\tilde p_{ij}\n> > $$\n";
+        let note = parse_markdown_note(md, "raw");
+        let conv = crate::conversation::Conversation::default();
+        let html = crate::export::to_html(&note, &conv);
+        assert!(html.contains("marked.parse(src)"), "应先渲染 markdown");
+        assert!(html.contains("katex.renderToString"), "应用 KaTeX 回填公式");
+        assert!(html.contains("store.push"), "应抽取公式占位符");
+    }
+
+    #[test]
     fn find_explanation_mut_works() {
         let md = "# T\n## M\nSome method.\n";
         let mut note = parse_markdown_note(md, "raw");
