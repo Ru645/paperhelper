@@ -120,6 +120,13 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .detail dt { color: #666; font-size: 13px; }
 .detail dd { font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
 .detail .answer { background: #f7f7f5; border-radius: 8px; padding: 12px; }
+/* 渲染 Markdown/LaTeX 的字段：恢复正常排版，公式可横向滚动 */
+.detail dd.md { white-space: normal; }
+.detail .md p { margin: 6px 0; }
+.detail .md ul, .detail .md ol { margin: 6px 0 6px 22px; }
+.detail .md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+.detail .md code { background: #eceae6; padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+.detail .md blockquote { border-left: 3px solid var(--blue); background: var(--blue-light); margin: 8px 0; padding: 6px 12px; border-radius: 0 6px 6px 0; }
 .detail .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
 .detail .err { color: var(--danger); }
 .note-frame-wrap { margin-top: 14px; height: 70vh; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }

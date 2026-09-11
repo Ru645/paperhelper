@@ -316,6 +316,78 @@ function scrollNoteTo(anchor) {
 
 // ===== 概念 / 论文详情标签页 =====
 
+// 主页面按需加载 marked + KaTeX（带 CDN 备源），并复用与笔记相同的“公式保护”策略，
+// 使概念详情里的 $...$ / $$...$$ 能正确渲染。
+let mathLibsPromise = null;
+function loadMathLibs() {
+  if (mathLibsPromise) return mathLibsPromise;
+  const CDNS = ["https://cdn.jsdelivr.net/npm", "https://registry.npmmirror.com"];
+  const url = (cdn, path) => {
+    if (cdn.includes("npmmirror")) {
+      const slash = path.indexOf("/");
+      const pkg = path.slice(0, slash);
+      const rest = path.slice(slash + 1);
+      const parts = pkg.split("@");
+      return `https://registry.npmmirror.com/${parts[0]}/${parts[parts.length - 1]}/files/${rest}`;
+    }
+    return cdn + "/" + path;
+  };
+  const loadCss = (path) =>
+    new Promise((resolve) => {
+      let i = 0;
+      const next = () => {
+        if (i >= CDNS.length) return resolve(false);
+        const l = document.createElement("link");
+        l.rel = "stylesheet";
+        l.href = url(CDNS[i], path);
+        l.onload = () => resolve(true);
+        l.onerror = () => { i++; next(); };
+        document.head.appendChild(l);
+      };
+      next();
+    });
+  const loadScript = (path) =>
+    new Promise((resolve) => {
+      let i = 0;
+      const next = () => {
+        if (i >= CDNS.length) return resolve(false);
+        const s = document.createElement("script");
+        s.src = url(CDNS[i], path);
+        s.onload = () => resolve(true);
+        s.onerror = () => { i++; next(); };
+        document.body.appendChild(s);
+      };
+      next();
+    });
+  mathLibsPromise = (async () => {
+    await loadCss("katex@0.16.9/dist/katex.min.css");
+    await loadScript("marked@12.0.2/marked.min.js");
+    await loadScript("katex@0.16.9/dist/katex.min.js");
+  })();
+  return mathLibsPromise;
+}
+
+/// 渲染 Markdown + LaTeX 为 HTML（先抽公式占位符，marked 后再用 KaTeX 回填）。
+function renderMathMarkdown(md) {
+  if (!window.marked) return esc(md);
+  const store = [];
+  const token = (i) => "\u2063M" + i + "\u2063";
+  let src = String(md).replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
+  src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
+  let html = marked.parse(src);
+  html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
+    const entry = store[+i];
+    const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, "").trim();
+    const display = entry[1];
+    if (window.katex) {
+      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false }); } catch (e) {}
+    }
+    const raw = display ? "$$" + tex + "$$" : "$" + tex + "$";
+    return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  });
+  return html;
+}
+
 async function openConceptTab(name) {
   const key = "concept:" + name;
   if (dynamicTabs.has(key)) { switchTab(key); return; }
@@ -326,17 +398,20 @@ async function openConceptTab(name) {
   switchTab(key);
   try {
     const c = await (await fetch("/api/concept?name=" + encodeURIComponent(name))).json();
+    await loadMathLibs();
+    const defHtml = renderMathMarkdown(c.definition || "（无）");
+    const ansHtml = renderMathMarkdown(c.answer || "（无）");
     const loadBtn = c.session_id
       ? `<button class="mini primary" data-load="${esc(c.session_id)}" data-anchor="${esc(c.explanation_id || "")}">加载该会话</button>`
       : "";
     pane.innerHTML = `<div class="detail">
       <h2>概念：${esc(c.name)}</h2>
       <dl>
-        <dt>概念内容</dt><dd>${esc(c.definition || "（无）")}</dd>
+        <dt>概念内容</dt><dd class="md">${defHtml}</dd>
         <dt>出自论文</dt><dd>${esc(c.paper_title || "（未知）")}</dd>
         <dt>所属会话</dt><dd>${esc(c.session_name || "（未找到）")} ${c.updated_at ? "· " + esc(fmtTime(c.updated_at)) : ""} ${loadBtn}</dd>
         <dt>当时的提问</dt><dd>${esc(c.question || "（未找到对应会话记录）")}</dd>
-        <dt>当时的回答</dt><dd class="answer">${esc(c.answer || "（无）")}</dd>
+        <dt>当时的回答</dt><dd class="answer md">${ansHtml}</dd>
       </dl>
     </div>`;
     pane.querySelectorAll("[data-load]").forEach(
