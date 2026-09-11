@@ -14,6 +14,7 @@ PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一�
 - **跨论文知识库**：自动积累读过的论文和学过的概念，追问时自动关联已学知识
 - **HTML 笔记**：单文件网页（KaTeX 公式渲染 + 对话树侧栏），浏览器阅读与搜索
 - **会话自动保存**：退出时自动保存，`paperhelper -s <编号>` 直接恢复，对话位置不丢
+- **Web 界面**：`paperhelper web` 浏览器操作，SSE 实时流式输出 + 停止按钮 + 配置页 + 会话历史
 - **工程细节**：Tab 补全（命令/路径/编号/配置项）、网络抖动自动重试、token 预算自动中断
 
 ## 快速开始
@@ -108,6 +109,26 @@ paperhelper --completions >> ~/.bashrc   # 安装 bash 补全
 source ~/.bashrc
 # 之后：paperhelper -s 2026<Tab> 自动补全时间戳
 ```
+
+## Web 界面（浏览器）
+
+除 CLI 外还提供浏览器界面，功能与 CLI 一致（核心逻辑仍是同一套 Rust 代码）：
+
+```bash
+paperhelper web              # 默认 http://127.0.0.1:8080
+paperhelper web --port 9000  # 指定端口
+```
+
+浏览器打开后：
+
+- **主区**：左侧「笔记」为实时渲染的 HTML 笔记（KaTeX 公式 + 对话树），右侧「控制台」实时显示 LLM 流式输出
+- **底部命令栏**：`ask` / `check` / `sum` / `ingest` / `goto` / `export` 表单，或「自由命令」直接输入任意 CLI 命令
+- **顶栏**：模型名、本次/累计 token 与成本、预算使用进度
+- **停止按钮**：打断正在执行的任务（对应 CLI 的 Ctrl-C）
+- **配置弹窗**：修改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存
+- **左栏**：对话轨迹（点击跳转）、会话历史（加载/保存）、已读论文、已学概念
+
+实现方式：`paperhelper web` 启动内嵌的 axum 服务，把 CLI 的输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。
 
 ## 使用流程
 
@@ -252,6 +273,7 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名、生成总结
 - **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，sum 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **流式输出 + 进度条**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
+- **CLI/Web 双前端**：业务逻辑输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
 - **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断
 - **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
 

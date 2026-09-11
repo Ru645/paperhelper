@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PaperHelper — 论文学习助手</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">PaperHelper <span class="sub">论文学习助手</span></div>
+  <div class="stats" id="stats">加载中…</div>
+  <div class="actions">
+    <button id="btn-config" class="ghost">配置</button>
+    <button id="btn-refresh" class="ghost">刷新</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside id="sidebar">
+    <section>
+      <h3>对话轨迹</h3>
+      <ul id="tree" class="tree"><li class="muted">（尚无对话）</li></ul>
+    </section>
+    <section>
+      <h3>会话历史</h3>
+      <div class="row">
+        <select id="sessions"></select>
+      </div>
+      <div class="row">
+        <button id="btn-load">加载</button>
+        <button id="btn-save">保存当前</button>
+      </div>
+    </section>
+    <section>
+      <h3>已读论文</h3>
+      <ul id="papers" class="plain"><li class="muted">（无）</li></ul>
+    </section>
+    <section>
+      <h3>已学概念</h3>
+      <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
+    </section>
+  </aside>
+
+  <main id="main">
+    <div class="tabs">
+      <button class="tab active" data-tab="note">笔记</button>
+      <button class="tab" data-tab="console">控制台</button>
+      <span class="spacer"></span>
+      <span id="progress" class="progress"></span>
+      <button id="btn-stop" class="danger" disabled>停止</button>
+    </div>
+
+    <div id="pane-note" class="pane active">
+      <iframe id="note-frame" src="/api/note?format=html" title="笔记"></iframe>
+    </div>
+    <div id="pane-console" class="pane">
+      <pre id="console"></pre>
+    </div>
+
+    <form id="cmd-form" class="cmdbar">
+      <select id="cmd-kind">
+        <option value="ask">ask 追问</option>
+        <option value="check">check 核对</option>
+        <option value="sum">sum 总结</option>
+        <option value="ingest">ingest 导入</option>
+        <option value="goto">goto 跳转</option>
+        <option value="export">export 导出</option>
+        <option value="raw">自由命令</option>
+      </select>
+      <input id="cmd-arg" type="text" placeholder="编号 / 路径…" autocomplete="off">
+      <input id="cmd-question" type="text" placeholder="问题内容（ask / check 用）" autocomplete="off">
+      <button type="submit" id="btn-send" class="primary">发送</button>
+    </form>
+  </main>
+</div>
+
+<div id="config-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>模型与预算配置</h2>
+    <label>API Endpoint<input id="cfg-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
+    <label>API Key<input id="cfg-key" placeholder="留空则不修改（当前：—）"></label>
+    <label>模型<input id="cfg-model" placeholder="deepseek-v4-pro"></label>
+    <label>上下文长度（token）<input id="cfg-context" type="number"></label>
+    <label class="check"><input id="cfg-thinking" type="checkbox"> 思考模式</label>
+    <label>输入单价 / 1M token<input id="cfg-inprice" type="number" step="0.01"></label>
+    <label>输出单价 / 1M token<input id="cfg-outprice" type="number" step="0.01"></label>
+    <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
+    <div class="modal-actions">
+      <button id="btn-config-cancel" class="ghost">取消</button>
+      <button id="btn-config-save" class="primary">保存</button>
+    </div>
+    <p id="cfg-status" class="status"></p>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

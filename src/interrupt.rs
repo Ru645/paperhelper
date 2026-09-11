@@ -24,6 +24,14 @@ pub fn reset() {
     FLAG.store(false, Ordering::Relaxed);
 }
 
+/// 从外部请求打断当前任务（Web 的停止按钮调用）。
+/// 与 Ctrl-C 等价：置位标志并唤醒等待者；长任务轮询到后自行中止。
+pub fn request() {
+    if !FLAG.swap(true, Ordering::Relaxed) {
+        notify().notify_waiters();
+    }
+}
+
 pub fn install() {
     tokio::spawn(async {
         loop {

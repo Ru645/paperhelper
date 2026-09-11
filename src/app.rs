@@ -14,7 +14,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 use rustyline::completion::{Completer, FilenameCompleter};
 use rustyline::error::ReadlineError;
@@ -26,7 +25,6 @@ use rustyline::{Cmd, Editor, KeyEvent, Helper};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::config::Config;
 use crate::conversation::{Conversation, ConvNode};
@@ -35,8 +33,19 @@ use crate::interrupt;
 use crate::knowledge::{Concept, KnowledgeBase, Paper};
 use crate::llm::{self, Message};
 use crate::notes::{self, Explanation};
+use crate::output::Emitter;
 use crate::pdf;
 use crate::session::Session;
+
+/// 输出宏：把标准输出的语义接到 `$slf.emitter` 上（终端或 Web/SSE 由 emitter 决定）。
+/// 需显式传入 `self`（macro_rules 对 self 是卫生的，无法从调用点隐式取得）。
+/// outln 带换行，outerr 走错误输出。
+macro_rules! outln {
+    ($slf:expr, $($arg:tt)*) => { $slf.emitter.stdout(format!($($arg)*)) };
+}
+macro_rules! outerr {
+    ($slf:expr, $($arg:tt)*) => { $slf.emitter.stderr(format!($($arg)*)) };
+}
 
 /// ask/check 的 system prompt：优先用 .paperhelper/prompts/ask.txt（用户可编辑），
 /// 不存在则用内置默认并首启写出。
@@ -270,6 +279,8 @@ pub struct App {
     pub client: reqwest::Client,
     /// ask 后自动导出笔记的文件路径（ingest 时由用户指定）。
     pub export_path: Option<String>,
+    /// 输出器：CLI 下写终端，Web 下写 SSE。所有用户可见输出都经它。
+    pub emitter: Emitter,
     /// 当前笔记的 section 编号列表（供补全用）
     section_numbers: Arc<Mutex<Vec<String>>>,
     /// 当前对话树节点编号列表（供补全用）
@@ -287,6 +298,7 @@ impl App {
             session: Session::default(),
             client,
             export_path: None,
+            emitter: Emitter::terminal(),
             section_numbers: Arc::new(Mutex::new(Vec::new())),
             node_numbers: Arc::new(Mutex::new(Vec::new())),
         }
@@ -296,8 +308,8 @@ impl App {
     /// Ctrl-C 绑定、补全 helper）→ 逐行 `run_command` → 退出前 `autosave_on_exit`。
     /// Ctrl-C 语义：当前无任务时取消输入行；有 LLM 任务时置打断标志中止流式。
     pub async fn repl(&mut self) -> Result<()> {
-        println!("{}", "=== PaperHelper 论文学习助手 ===".bold().cyan());
-        println!(
+        outln!(self, "{}", "=== PaperHelper 论文学习助手 ===".bold().cyan());
+        outln!(self, 
             "{} {} | {} {}",
             "模型:".dimmed(),
             self.config.llm.model.green(),
@@ -310,17 +322,17 @@ impl App {
         let default_endpoint = self.config.llm.api_endpoint
             == "https://api.openai.com/v1/chat/completions";
         if need_key || default_endpoint {
-            println!("{}", "⚠️  配置不完整，请先完成以下设置（或写 .env）：".yellow());
+            outln!(self, "{}", "⚠️  配置不完整，请先完成以下设置（或写 .env）：".yellow());
             if need_key {
-                println!("  > config set llm.api_key <你的key>");
+                outln!(self, "  > config set llm.api_key <你的key>");
             }
             if default_endpoint {
-                println!("  > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions");
-                println!("  > config set llm.model deepseek-v4-pro");
+                outln!(self, "  > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions");
+                outln!(self, "  > config set llm.model deepseek-v4-pro");
             }
-            println!("  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
+            outln!(self, "  示例（DeepSeek）：endpoint=https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
         }
-        println!("{}  help 查看命令；exit 退出。Ctrl-C 打断当前任务，↑↓ 切换历史，Tab 补全。\n",
+        outln!(self, "{}  help 查看命令；exit 退出。Ctrl-C 打断当前任务，↑↓ 切换历史，Tab 补全。\n",
             "输入".dimmed());
 
         let hist_path = crate::paths::data_dir().join("history.txt");
@@ -356,21 +368,21 @@ impl App {
                         break;
                     }
                     if let Err(e) = self.run_command(line).await {
-                        eprintln!("{} {e:#}", "❌".red());
+                        outerr!(self, "{} {e:#}", "❌".red());
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
                     // Ctrl-C：打断当前 LLM 任务（如果有），不退出
                     if !interrupt::is_interrupted() {
-                        eprintln!("{}", "[已打断当前任务]".yellow());
+                        outerr!(self, "{}", "[已打断当前任务]".yellow());
                     }
                 }
                 Err(ReadlineError::Eof) => {
-                    println!();
+                    outln!(self, "");
                     break;
                 }
                 Err(e) => {
-                    eprintln!("{} 读取输入失败: {e}", "❌".red());
+                    outerr!(self, "{} 读取输入失败: {e}", "❌".red());
                 }
             }
         }
@@ -383,19 +395,16 @@ impl App {
     /// 退出时自动保存会话到 .paperhelper/sessions/。
     /// 编号 = 首次保存时间戳（session_id，之后每次退出覆盖保存同一文件不变）。
     /// 保存前先调 LLM 取一个简短会话名（失败则兜底"未命名会话"）。
-    async fn autosave_on_exit(&mut self) -> Result<()> {
+    pub async fn autosave_on_exit(&mut self) -> Result<()> {
         if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
             return Ok(());
         }
         crate::paths::ensure_sessions_dir()?;
 
         // 让 LLM 给会话取个简短名字（带进度条）
-        let bar = ProgressBar::new_spinner();
-        bar.set_style(spinner_style());
-        bar.set_message("保存会话中…");
-        bar.enable_steady_tick(Duration::from_millis(100));
+        self.emitter.progress("保存会话中…");
         let session_name = self.generate_session_name().await;
-        bar.finish_and_clear();
+        self.emitter.progress_done();
         self.session.session_name = session_name;
 
         // 会话编号：首次保存时生成（保存时间戳），此后不变；文件按编号覆盖保存
@@ -404,8 +413,8 @@ impl App {
         }
         let path = crate::paths::session_path(&self.session.session_id);
         self.session.save(&path)?;
-        println!("{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
-        println!("  恢复会话，请执行：paperhelper -s {}", self.session.session_id);
+        outln!(self, "{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
+        outln!(self, "  恢复会话，请执行：paperhelper -s {}", self.session.session_id);
         Ok(())
     }
 
@@ -464,7 +473,7 @@ impl App {
             "blocks" => self.cmd_blocks().await,
             "note" => self.cmd_note().await,
             "tree" | "trajectory" => {
-                println!("{}", self.session.conversation.render_tree());
+                outln!(self, "{}", self.session.conversation.render_tree());
                 Ok(())
             }
             "goto" => self.cmd_goto(rest).await,
@@ -473,7 +482,7 @@ impl App {
             "concepts" => self.cmd_concepts().await,
             "new" => {
                 self.session = Session::default();
-                println!("已新建会话。");
+                outln!(self, "已新建会话。");
                 Ok(())
             }
             "save" => self.cmd_save(rest).await,
@@ -484,7 +493,7 @@ impl App {
             "check" => self.cmd_check(rest).await,
             "sum" => self.cmd_sum().await,
             _ => {
-                println!("未知命令: {cmd}。输入 help 查看帮助。");
+                outln!(self, "未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
             }
         }?;
@@ -526,7 +535,7 @@ PaperHelper 命令：
   paperhelper              新会话
   paperhelper -s <序号>    恢复指定会话（先用 -l 查看序号）
   paperhelper -l           列出所有已保存会话";
-        println!("{h}");
+        outln!(self, "{h}");
         Ok(())
     }
 
@@ -538,28 +547,28 @@ PaperHelper 命令：
         match sub {
             "" | "show" => {
                 let k = &self.config.llm;
-                println!("=== 配置 ===");
-                println!("llm.api_endpoint   = {}", k.api_endpoint);
-                println!("llm.api_key        = {}", mask_key(&k.api_key));
-                println!("llm.model           = {}", k.model);
-                println!("llm.context_length  = {}", k.context_length);
-                println!("llm.thinking_mode   = {}", k.thinking_mode);
-                println!("llm.pdf_input       = {} (file模式未实现,均走text)", k.pdf_input);
-                println!("pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
-                println!("pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
-                println!("budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
-                println!("提示：api_endpoint 需是完整 URL（含 /chat/completions），如 https://api.deepseek.com/v1/chat/completions");
+                outln!(self, "=== 配置 ===");
+                outln!(self, "llm.api_endpoint   = {}", k.api_endpoint);
+                outln!(self, "llm.api_key        = {}", mask_key(&k.api_key));
+                outln!(self, "llm.model           = {}", k.model);
+                outln!(self, "llm.context_length  = {}", k.context_length);
+                outln!(self, "llm.thinking_mode   = {}", k.thinking_mode);
+                outln!(self, "llm.pdf_input       = {} (file模式未实现,均走text)", k.pdf_input);
+                outln!(self, "pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
+                outln!(self, "pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
+                outln!(self, "budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
+                outln!(self, "提示：api_endpoint 需是完整 URL（含 /chat/completions），如 https://api.deepseek.com/v1/chat/completions");
             }
             "set" => {
                 let (key, val) = split_cmd(args);
                 if key.is_empty() {
-                    println!("用法: config set <key> <value>");
+                    outln!(self, "用法: config set <key> <value>");
                     let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
-                    println!("可设: {}", keys.join(" "));
-                    println!("常见端点：");
-                    println!("  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
-                    println!("  OpenAI   : https://api.openai.com/v1/chat/completions    model=gpt-4o-mini");
-                    println!("  本地Ollama: http://localhost:11434/v1/chat/completions    model=qwen2.5:7b");
+                    outln!(self, "可设: {}", keys.join(" "));
+                    outln!(self, "常见端点：");
+                    outln!(self, "  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
+                    outln!(self, "  OpenAI   : https://api.openai.com/v1/chat/completions    model=gpt-4o-mini");
+                    outln!(self, "  本地Ollama: http://localhost:11434/v1/chat/completions    model=qwen2.5:7b");
                     return Ok(());
                 }
                 let val = normalize_path_arg(val);
@@ -567,14 +576,14 @@ PaperHelper 命令：
                 self.config.save()?;
                 // api_key 脱敏回显，避免明文泄露
                 let display = if key == "llm.api_key" { mask_key(&val) } else { val.clone() };
-                println!("已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
+                outln!(self, "已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
             }
-            _ => println!("用法: config [show | set <key> <value>]"),
+            _ => outln!(self, "用法: config [show | set <key> <value>]"),
         }
         Ok(())
     }
 
-    fn set_config(&mut self, key: &str, val: &str) -> Result<()> {
+    pub fn set_config(&mut self, key: &str, val: &str) -> Result<()> {
         match key {
             "llm.api_key" => self.config.llm.api_key = val.into(),
             "llm.api_endpoint" => self.config.llm.api_endpoint = val.into(),
@@ -595,12 +604,12 @@ PaperHelper 命令：
 
     async fn cmd_budget(&mut self, rest: &str) -> Result<()> {
         if rest.trim().is_empty() {
-            println!("当前 token 预算: {} (0=不限)", self.config.budget.token_budget);
+            outln!(self, "当前 token 预算: {} (0=不限)", self.config.budget.token_budget);
             return Ok(());
         }
         self.config.budget.token_budget = rest.trim().parse().context("需要整数")?;
         self.config.save()?;
-        println!("token 预算已设为 {}", self.config.budget.token_budget);
+        outln!(self, "token 预算已设为 {}", self.config.budget.token_budget);
         Ok(())
     }
 
@@ -612,29 +621,29 @@ PaperHelper 命令：
             let nexpl = b.explanations.len();
             let expl = if nexpl > 0 { format!("  [{}条解释]", nexpl) } else { String::new() };
             let num = if b.number.is_empty() { format!("{:>6}", "") } else { format!("{:>6}", b.number) };
-            println!("{} {}{} {} {}{}", num, indent, b.kind.tag(), text, "", expl);
+            outln!(self, "{} {}{} {} {}{}", num, indent, b.kind.tag(), text, "", expl);
         }
         Ok(())
     }
 
     async fn cmd_note(&self) -> Result<()> {
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
-        println!("{}", export::to_markdown(note));
+        outln!(self, "{}", export::to_markdown(note));
         Ok(())
     }
 
     async fn cmd_stats(&self) -> Result<()> {
         let s = &self.session.stats;
         let k = &self.kb.stats;
-        println!("=== 用量统计 ===");
-        println!("本次会话: {} 次调用 | 输入 {} / 输出 {} tok | 小计 ${:.6}", s.calls, s.total_input, s.total_output, s.total_cost);
-        println!("累计(跨会话): {} 次调用 | 输入 {} / 输出 {} tok | 小计 ${:.6}", k.calls, k.total_input, k.total_output, k.total_cost);
+        outln!(self, "=== 用量统计 ===");
+        outln!(self, "本次会话: {} 次调用 | 输入 {} / 输出 {} tok | 小计 ${:.6}", s.calls, s.total_input, s.total_output, s.total_cost);
+        outln!(self, "累计(跨会话): {} 次调用 | 输入 {} / 输出 {} tok | 小计 ${:.6}", k.calls, k.total_input, k.total_output, k.total_cost);
         let tot = s.total_tokens() + k.total_tokens();
         if self.config.budget.token_budget > 0 {
-            println!("预算: {} (累计已用 {:.1}%)", self.config.budget.token_budget,
+            outln!(self, "预算: {} (累计已用 {:.1}%)", self.config.budget.token_budget,
                 tot as f64 / self.config.budget.token_budget as f64 * 100.0);
         } else {
-            println!("预算: 未设置（`budget <n>` 设置）");
+            outln!(self, "预算: 未设置（`budget <n>` 设置）");
         }
         Ok(())
     }
@@ -653,36 +662,36 @@ PaperHelper 命令：
         };
         match node {
             Some(n) => {
-                println!("已跳转到: {}", n.label);
-                println!("--- 根路径对话 ---");
+                outln!(self, "已跳转到: {}", n.label);
+                outln!(self, "--- 根路径对话 ---");
                 for (i, x) in self.session.conversation.path_to_current().iter().enumerate() {
-                    println!("{}. Q: {}", i + 1, x.question);
+                    outln!(self, "{}. Q: {}", i + 1, x.question);
                 }
             }
-            None => println!("找不到节点 {arg}。用 `tree` 查看可用节点。"),
+            None => outln!(self, "找不到节点 {arg}。用 `tree` 查看可用节点。"),
         }
         Ok(())
     }
 
     async fn cmd_papers(&self) -> Result<()> {
         if self.kb.papers.is_empty() {
-            println!("（还没有读过论文）");
+            outln!(self, "（还没有读过论文）");
             return Ok(());
         }
         for p in &self.kb.papers {
-            println!("- [{}] 《{}》（{}）", &p.id[..6.min(p.id.len())], p.title, p.path);
+            outln!(self, "- [{}] 《{}》（{}）", &p.id[..6.min(p.id.len())], p.title, p.path);
         }
         Ok(())
     }
 
     async fn cmd_concepts(&self) -> Result<()> {
         if self.kb.concepts.is_empty() {
-            println!("（还没有学过概念）");
+            outln!(self, "（还没有学过概念）");
             return Ok(());
         }
         for c in &self.kb.concepts {
             let d: String = c.definition.chars().take(80).collect();
-            println!("- {}（来自《{}》）: {}", c.name, c.paper_title, d);
+            outln!(self, "- {}（来自《{}》）: {}", c.name, c.paper_title, d);
         }
         Ok(())
     }
@@ -690,7 +699,7 @@ PaperHelper 命令：
     async fn cmd_save(&mut self, rest: &str) -> Result<()> {
         let path = if rest.trim().is_empty() { "session.json".to_string() } else { normalize_path_arg(rest) };
         self.session.save(Path::new(&path))?;
-        println!("会话已保存到 {path}");
+        outln!(self, "会话已保存到 {path}");
         Ok(())
     }
 
@@ -700,7 +709,7 @@ PaperHelper 命令：
         }
         let path = normalize_path_arg(rest);
         self.session = Session::load(Path::new(&path))?;
-        println!("已加载会话: 笔记={}, 对话节点={}",
+        outln!(self, "已加载会话: 笔记={}, 对话节点={}",
             self.session.notes.is_some(),
             self.session.conversation.nodes.len());
         Ok(())
@@ -742,7 +751,7 @@ PaperHelper 命令：
             _ => unreachable!(),
         };
         std::fs::write(&path, content)?;
-        println!("已导出到 {path}");
+        outln!(self, "已导出到 {path}");
         Ok(())
     }
 
@@ -776,53 +785,57 @@ PaperHelper 命令：
         }
         interrupt::reset();
 
-        // 1. 抽取文本
-        let bar = ProgressBar::new_spinner();
-        bar.set_style(spinner_style());
-        bar.enable_steady_tick(Duration::from_millis(100));
-
-        let raw_text = match mode {
-            "text" => {
-                bar.set_message("读取文本文件…");
-                std::fs::read_to_string(p)?
-            }
-            "ocr" => {
-                bar.set_message("OCR 识别中（可能较慢）…");
-                pdf::ocr_extract(p)?
-            }
-            _ => {
-                bar.set_message("解析 PDF…");
-                let pages = pdf::extract_pages(p)?;
-                pages.join("\n\n")
-            }
+        // 1. 抽取文本（PDF/OCR 是阻塞子进程，放 spawn_blocking 避免卡住 Web 服务器）
+        let progress_msg = match mode {
+            "text" => "读取文本文件…",
+            "ocr" => "OCR 识别中（可能较慢）…",
+            _ => "解析 PDF…",
         };
-        bar.finish_and_clear();
+        self.emitter.progress(progress_msg);
+        let mode_s = mode.to_string();
+        let file_s = file_path.clone();
+        let raw_text = tokio::task::spawn_blocking(move || -> Result<String> {
+            let p = Path::new(&file_s);
+            match mode_s.as_str() {
+                "text" => Ok(std::fs::read_to_string(p)?),
+                "ocr" => pdf::ocr_extract(p),
+                _ => Ok(pdf::extract_pages(p)?.join("\n\n")),
+            }
+        })
+        .await
+        .context("文本抽取任务失败")??;
+        self.emitter.progress_done();
         if raw_text.trim().is_empty() {
             bail!("文本内容为空（可能是扫描件，试试 ingest --ocr <pdf>）");
         }
         let char_count = raw_text.chars().count();
-        println!("{} 文本已就绪: {} 字符", "✓".green().bold(), char_count);
+        outln!(self, "{} 文本已就绪: {} 字符", "✓".green().bold(), char_count);
 
         if interrupt::is_interrupted() {
             bail!("已打断");
         }
 
-        // 2. 先询问笔记导出文件名（在等待 LLM 时让用户知道笔记存哪）
+        // 2. 确定笔记导出文件名。
+        //    终端：交互式询问；Web：用预先设置的 export_path，否则用默认名。
         let stem = Path::new(&file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
         let title_guess: String = stem.chars().take(20).collect();
         let default_name = format!("笔记_{title_guess}.md");
-        print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
-        io::stdout().flush()?;
-        let mut name = String::new();
-        io::stdin().lock().read_line(&mut name)?;
-        let name = name.trim();
-        let export_file = if name.is_empty() {
-            default_name.clone()
+        let export_file = if self.emitter.is_terminal() {
+            print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
+            io::stdout().flush()?;
+            let mut name = String::new();
+            io::stdin().lock().read_line(&mut name)?;
+            let name = name.trim();
+            if name.is_empty() {
+                default_name.clone()
+            } else {
+                sanitize_filename(&normalize_path_arg(name))
+            }
         } else {
-            sanitize_filename(&normalize_path_arg(name))
+            self.export_path.clone().unwrap_or_else(|| default_name.clone())
         };
 
         // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
@@ -842,24 +855,21 @@ PaperHelper 命令：
             Message { role: "user".into(), content: prompt },
         ];
         let raw_clone = raw_text.clone();
+        let emitter = self.emitter.clone();
         let mut first_token = true;
-        let bar2 = ProgressBar::new_spinner();
-        bar2.set_style(spinner_style());
-        bar2.set_message("笔记生成中…");
-        bar2.enable_steady_tick(Duration::from_millis(100));
+        emitter.progress("笔记生成中…");
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
-                bar2.finish_and_clear();
+                emitter.progress_done();
                 first_token = false;
             }
-            print!("{t}");
-            let _ = io::stdout().flush();
+            emitter.token(t);
         }).await;
-        println!();
-        let res = res?;
         if first_token {
-            bar2.finish_and_clear();
+            emitter.progress_done();
         }
+        self.emitter.stdout("");
+        let res = res?;
 
         // 3. 统计与预算检查
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -868,7 +878,7 @@ PaperHelper 命令：
         let note = notes::parse_markdown_note(&res.content, &raw_clone);
         let title = note.title.clone();
         let nblocks = note.count_blocks();
-        println!("{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
+        outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
 
         // 5. 注册到知识库
         let paper_id = uuid::Uuid::new_v4().to_string();
@@ -912,7 +922,7 @@ PaperHelper 命令：
         self.export_path = Some(export_file.clone());
         if let Some(note) = &self.session.notes {
             std::fs::write(&export_file, export::render_for(&export_file, note, &self.session.conversation))?;
-            println!("{} 笔记已导出到 {}", "✓".green().bold(), export_file);
+            outln!(self, "{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
         self.update_completions();
         Ok(())
@@ -931,13 +941,13 @@ PaperHelper 命令：
         let args = args.trim();
         // ask --help：打印用法
         if args == "--help" || args == "-h" || args.is_empty() {
-            println!("用法: ask <编号> <问题>");
-            println!("  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
-            println!("  <问题>    你的追问内容");
-            println!("例:");
-            println!("  ask 3.2 BERTScore的公式里max_k是什么意思");
-            println!("  ask 2.1 灰盒方法为什么对黑盒不适用");
-            println!("说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
+            outln!(self, "用法: ask <编号> <问题>");
+            outln!(self, "  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
+            outln!(self, "  <问题>    你的追问内容");
+            outln!(self, "例:");
+            outln!(self, "  ask 3.2 BERTScore的公式里max_k是什么意思");
+            outln!(self, "  ask 2.1 灰盒方法为什么对黑盒不适用");
+            outln!(self, "说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
             return Ok(());
         }
         let (block_num, question) = parse_ask_args(args);
@@ -946,7 +956,7 @@ PaperHelper 命令：
             bail!("用法: ask <编号> <问题>   例: ask 3.2 BERTScore是什么   (ask --help 看详情)");
         }
         if block_num.is_none() {
-            eprintln!("{} 未指定编号，将用关键词匹配定位（可能不准）。建议用 `ask <编号> <问题>`。", "⚠️ ".yellow());
+            outerr!(self, "{} 未指定编号，将用关键词匹配定位（可能不准）。建议用 `ask <编号> <问题>`。", "⚠️ ".yellow());
         }
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
@@ -963,25 +973,22 @@ PaperHelper 命令：
         let block_id_for_hint = block_id.clone();
 
         // 5. 流式调用 LLM
+        let emitter = self.emitter.clone();
         let mut first_token = true;
-        let bar = ProgressBar::new_spinner();
-        bar.set_style(spinner_style());
-        bar.set_message("思考中…");
-        bar.enable_steady_tick(Duration::from_millis(100));
+        emitter.progress("思考中…");
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
-                bar.finish_and_clear();
+                emitter.progress_done();
                 first_token = false;
-                print!("\n");
+                emitter.token("\n");
             }
-            print!("{t}");
-            let _ = io::stdout().flush();
+            emitter.token(t);
         }).await;
-        let res = res?;
         if first_token {
-            bar.finish_and_clear();
+            emitter.progress_done();
         }
-        println!();
+        let res = res?;
+        self.emitter.stdout("");
 
         // 6. 记录统计
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -1089,20 +1096,24 @@ PaperHelper 命令：
         self.kb.save()?;
 
         // 自动更新导出的 markdown 文件
-        // 若 export_path 未设置，引导用户输入一次
+        // 若 export_path 未设置：终端交互式询问一次；Web 下自动用默认名（不阻塞）
         if self.export_path.is_none() {
             let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
             let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
-            print!("请输入笔记导出文件名（回车默认 {}，输 skip 跳过）: ", default_name);
-            io::stdout().flush()?;
-            let mut name = String::new();
-            io::stdin().lock().read_line(&mut name)?;
-            let name = name.trim();
-            if name == "skip" || name == "s" {
-                eprintln!("{} 已跳过导出，之后可用 `export md <file>` 手动导出。", "".dimmed());
+            if self.emitter.is_terminal() {
+                print!("请输入笔记导出文件名（回车默认 {}，输 skip 跳过）: ", default_name);
+                io::stdout().flush()?;
+                let mut name = String::new();
+                io::stdin().lock().read_line(&mut name)?;
+                let name = name.trim();
+                if name == "skip" || name == "s" {
+                    outerr!(self, "{} 已跳过导出，之后可用 `export md <file>` 手动导出。", "".dimmed());
+                } else {
+                    let path = if name.is_empty() { default_name } else { name.to_string() };
+                    self.export_path = Some(path.clone());
+                }
             } else {
-                let path = if name.is_empty() { default_name } else { name.to_string() };
-                self.export_path = Some(path.clone());
+                self.export_path = Some(default_name);
             }
         }
         if let Some(p) = &self.export_path {
@@ -1116,15 +1127,15 @@ PaperHelper 命令：
                         })
                     });
                     match location {
-                        Some(loc) => println!("{} 笔记已同步更新到 {}（更新位置：{}）", "✓".green().bold(), p, loc),
-                        None => println!("{} 笔记已同步更新到 {}", "✓".green().bold(), p),
+                        Some(loc) => outln!(self, "{} 笔记已同步更新到 {}（更新位置：{}）", "✓".green().bold(), p, loc),
+                        None => outln!(self, "{} 笔记已同步更新到 {}", "✓".green().bold(), p),
                     }
                 }
             }
         }
 
         if res.estimated {
-            println!("[注: 本次 token 数为估算]");
+            outln!(self, "[注: 本次 token 数为估算]");
         }
         self.update_completions();
         Ok(())
@@ -1135,12 +1146,12 @@ PaperHelper 命令：
     async fn cmd_check(&mut self, args: &str) -> Result<()> {
         let args = args.trim();
         if args == "--help" || args == "-h" || args.is_empty() {
-            println!("用法: check <编号> <想法>");
-            println!("  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
-            println!("  <想法>    你想核对/验证的想法或理解");
-            println!("例:");
-            println!("  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
-            println!("说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
+            outln!(self, "用法: check <编号> <想法>");
+            outln!(self, "  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
+            outln!(self, "  <想法>    你想核对/验证的想法或理解");
+            outln!(self, "例:");
+            outln!(self, "  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
+            outln!(self, "说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
             return Ok(());
         }
         let (block_num, question) = parse_ask_args(args);
@@ -1161,25 +1172,22 @@ PaperHelper 命令：
         let (msgs, _block_id) = self.build_context_messages(question, &block_num);
 
         // 流式调用 LLM
+        let emitter = self.emitter.clone();
         let mut first_token = true;
-        let bar = ProgressBar::new_spinner();
-        bar.set_style(spinner_style());
-        bar.set_message("核对中…");
-        bar.enable_steady_tick(Duration::from_millis(100));
+        emitter.progress("核对中…");
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
-                bar.finish_and_clear();
+                emitter.progress_done();
                 first_token = false;
-                print!("\n");
+                emitter.token("\n");
             }
-            print!("{t}");
-            let _ = io::stdout().flush();
+            emitter.token(t);
         }).await;
-        let res = res?;
         if first_token {
-            bar.finish_and_clear();
+            emitter.progress_done();
         }
-        println!();
+        let res = res?;
+        self.emitter.stdout("");
 
         // 记录统计
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -1208,7 +1216,7 @@ PaperHelper 命令：
         self.session.conversation.current = Some(node_id);
 
         if res.estimated {
-            println!("[注: 本次 token 数为估算]");
+            outln!(self, "[注: 本次 token 数为估算]");
         }
         self.update_completions();
         Ok(())
@@ -1258,17 +1266,14 @@ PaperHelper 命令：
             Message { role: "user".into(), content: prompt },
         ];
 
-        let bar = ProgressBar::new_spinner();
-        bar.set_style(spinner_style());
-        bar.set_message("概括总结中…");
-        bar.enable_steady_tick(Duration::from_millis(100));
+        self.emitter.progress("概括总结中…");
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}).await;
-        bar.finish_and_clear();
+        self.emitter.progress_done();
         let res = res?;
         self.record_usage(res.input_tokens, res.output_tokens);
 
         let summary = res.content.trim().to_string();
-        println!("\n**总结**：{summary}\n");
+        outln!(self, "\n**总结**：{summary}\n");
 
         // 写入笔记：插入当前节点（或其最近有解释的祖先，跳过 check）对应的
         // Explanation：折叠其子树 + 挂总结
@@ -1284,7 +1289,7 @@ PaperHelper 命令：
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
                 if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
-                    println!("{} 笔记已同步更新到 {}（已插入总结）", "✓".green().bold(), p);
+                    outln!(self, "{} 笔记已同步更新到 {}（已插入总结）", "✓".green().bold(), p);
                 }
             }
         }
@@ -1342,7 +1347,7 @@ PaperHelper 命令：
     }
 
     /// 更新补全用的编号列表（section 编号 + 对话树节点编号）。
-    fn update_completions(&self) {
+    pub fn update_completions(&self) {
         let sections: Vec<String> = if let Some(note) = &self.session.notes {
             note.flatten()
                 .iter()
@@ -1391,7 +1396,7 @@ PaperHelper 命令：
         let ctx = self.config.llm.context_length;
         let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4;
         if base_tokens > ctx {
-            eprintln!("{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。", "⚠️ ".yellow(), base_tokens, ctx);
+            outerr!(self, "{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。", "⚠️ ".yellow(), base_tokens, ctx);
         }
         let avail = ctx.saturating_sub(base_tokens + question.chars().count() / 4 + 200);
         let mut used = 0usize;
@@ -1408,7 +1413,7 @@ PaperHelper 命令：
         let dropped = keep_from;
         let kept_pairs: Vec<(String, String)> = path[keep_from..].to_vec();
         if dropped > 0 {
-            eprintln!("{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
+            outerr!(self, "{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
         }
 
         let mut msgs = vec![
@@ -1467,10 +1472,6 @@ fn short(s: &str, n: usize) -> String {
 
 fn parse_bool(s: &str) -> bool {
     matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner} {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner())
 }
 
 /// 用问题前若干字作为概念名 / 节点标签（免 token）。
@@ -1543,7 +1544,7 @@ fn extract_concept(content: &str, question: &str) -> (String, String) {
     (clean_answer, concept)
 }
 
-fn mask_key(k: &str) -> String {
+pub fn mask_key(k: &str) -> String {
     if k.is_empty() {
         "（未设置）".into()
     } else if k.len() <= 8 {

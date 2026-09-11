@@ -16,10 +16,12 @@ mod interrupt;
 mod knowledge;
 mod llm;
 mod notes;
+mod output;
 mod paths;
 mod pdf;
 mod prompts;
 mod session;
+mod web;
 
 use anyhow::{anyhow, Result};
 
@@ -40,7 +42,7 @@ const BASH_COMPLETION: &str = r#"_paperhelper() {
 complete -F _paperhelper paperhelper
 "#;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     interrupt::install();
     let config = config::Config::load()?;
@@ -52,6 +54,25 @@ async fn main() -> Result<()> {
 
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // web 子命令：paperhelper web [--port N]（默认 8080，仅监听本机）
+    if !args.is_empty() && args[0] == "web" {
+        let mut port = 8080u16;
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--port" && i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(8080);
+                i += 2;
+            } else if let Some(p) = args[i].strip_prefix("--port=") {
+                port = p.parse().unwrap_or(8080);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return web::serve(app, port).await;
+    }
+
     if !args.is_empty() {
         // --completions : 输出 bash 补全脚本
         if args.len() == 1 && args[0] == "--completions" {
@@ -126,7 +147,7 @@ async fn main() -> Result<()> {
 /// 读取会话文件里的 session_name 字段。
 /// 实现方式：不做完整 JSON 反序列化（会话文件可能很大），而是字符串查找
 /// `"session_name"` 键后取下一个 JSON 字符串字面量，轻量且够用。
-fn session_name_of(id: &str) -> String {
+pub(crate) fn session_name_of(id: &str) -> String {
     let path = paths::session_path(id);
     let Ok(s) = std::fs::read_to_string(&path) else {
         return "（读取失败）".into();
