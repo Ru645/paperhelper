@@ -392,7 +392,9 @@ function renderMathMarkdown(md) {
   const store = [];
   const token = (i) => "\u2063M" + i + "\u2063";
   let src = String(md).replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
-  src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
+  // 行内公式：遵循 Pandoc 规则——开头 $ 后不能是空白、结尾 $ 前不能是空白，
+  // 以免把货币美元（如 "$200 元"）误当成公式定界符。同时跳过转义的 \$
+  src = src.replace(/(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
   let html = marked.parse(src);
   html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
     const entry = store[+i];

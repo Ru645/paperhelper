@@ -334,7 +334,8 @@ function renderMd(md) {
   const store = [];
   const token = (i) => '\u2063M' + i + '\u2063';
   let src = md.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
-  src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
+  // 行内公式：Pandoc 规则（开头 $ 后非空白、结尾 $ 前非空白），避免把货币美元当公式
+  src = src.replace(/(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
   let html = marked.parse(src);
   html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
     const entry = store[+i];
