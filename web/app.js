@@ -373,8 +373,22 @@ function loadMathLibs() {
 }
 
 /// 渲染 Markdown + LaTeX 为 HTML（先抽公式占位符，marked 后再用 KaTeX 回填）。
+/// 把 LaTeX 的 \(…\) / \[…\] 定界符统一成 $ / $$（按 ``` 围栏跳过代码块）。
+function convertMathDelims(md) {
+  const out = [];
+  let inCode = false;
+  for (const line of String(md).split("\n")) {
+    const t = line.trimStart();
+    if (t.startsWith("```")) { inCode = !inCode; out.push(line); continue; }
+    if (inCode) { out.push(line); continue; }
+    out.push(line.replace(/\\\[/g, "$$").replace(/\\\]/g, "$$").replace(/\\\(/g, "$").replace(/\\\)/g, "$"));
+  }
+  return out.join("\n");
+}
+
 function renderMathMarkdown(md) {
   if (!window.marked) return esc(md);
+  md = convertMathDelims(md);
   const store = [];
   const token = (i) => "\u2063M" + i + "\u2063";
   let src = String(md).replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });

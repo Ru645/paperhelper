@@ -300,8 +300,20 @@ const ANN_CSS: &str = r#"
 
 /// 批注相关的 JS（只读：高亮 + 点击弹窗；注入导出 HTML）。
 const ANN_SCRIPT: &str = r#"
+function convertMathDelims(md) {
+  const out = [];
+  let inCode = false;
+  for (const line of String(md).split('\n')) {
+    const t = line.trimStart();
+    if (t.startsWith('```')) { inCode = !inCode; out.push(line); continue; }
+    if (inCode) { out.push(line); continue; }
+    out.push(line.replace(/\\\[/g, '$$').replace(/\\\]/g, '$$').replace(/\\\(/g, '$').replace(/\\\)/g, '$'));
+  }
+  return out.join('\n');
+}
 function renderMd(md) {
   if (!window.marked) return md;
+  md = convertMathDelims(md);
   const store = [];
   const token = (i) => '\u2063M' + i + '\u2063';
   let src = md.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
