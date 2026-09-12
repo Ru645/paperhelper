@@ -63,6 +63,23 @@ pub struct Session {
     /// 同时也是会话文件名与 `-s` 的恢复参数）。
     #[serde(default)]
     pub session_id: String,
+    /// 批注列表（Web 端在笔记选中文字提问产生；每条批注关联一段会话子树）。
+    #[serde(default)]
+    pub annotations: Vec<Annotation>,
+}
+
+/// 一条批注：笔记里的一段引用文字 + 其对话线程（以 `root_node_id` 为根的会话子树）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Annotation {
+    pub id: String,
+    /// 引用文字所在的笔记块 id。
+    pub block_id: String,
+    /// 选中的引用文字。
+    pub quote: String,
+    /// 该批注对话线程的根会话节点 id。
+    pub root_node_id: String,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 impl Session {
@@ -301,6 +318,7 @@ mod tests {
             updated_at: String::new(),
             session_name: String::new(),
             session_id: String::new(),
+            annotations: Vec::new(),
         };
         sess.session_id = "20260101_000000".into();
         sess.save(&path).unwrap();

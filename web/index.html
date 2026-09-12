@@ -74,6 +74,24 @@
 
 <div id="ctx-menu" class="ctx-menu hidden"></div>
 
+<!-- 选中文字后浮出的“提问”按钮 -->
+<button id="sel-btn" class="sel-btn hidden">提问</button>
+
+<!-- 批注弹窗（引用 + 对话线程 + 输入） -->
+<div id="ann-popup" class="ann-popup hidden">
+  <div class="ann-head">
+    <span class="ann-quote" id="ann-quote"></span>
+    <span class="ann-spacer"></span>
+    <button id="ann-close" class="mini ghost" title="关闭">×</button>
+  </div>
+  <div class="ann-thread" id="ann-thread"></div>
+  <div class="ann-input">
+    <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
+    <input id="ann-q" type="text" placeholder="针对选中文字提问，回车发送…" autocomplete="off">
+    <button id="ann-send" class="mini primary">发送</button>
+  </div>
+</div>
+
 <div id="config-modal" class="modal hidden">
   <div class="modal-box">
     <h2>模型与预算配置</h2>

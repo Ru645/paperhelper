@@ -60,6 +60,9 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/kb/paper/delete", post(api_paper_delete))
         .route("/api/kb/concept/pin", post(api_concept_pin))
         .route("/api/kb/concept/delete", post(api_concept_delete))
+        .route("/api/annotate", post(api_annotate))
+        .route("/api/annotate/reply", post(api_annotate_reply))
+        .route("/api/annotations", get(api_annotations))
         .with_state(app)
 }
 
@@ -332,12 +335,37 @@ async fn api_note(State(app): State<SharedApp>, Query(q): Query<NoteQuery>) -> R
         )
             .into_response()
     } else {
+        let hidden = hidden_expl_ids(&a.session);
         (
             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            export::to_html_bare(note, &a.session.conversation),
+            export::to_html_bare(note, &a.session.conversation, &hidden),
         )
             .into_response()
     }
+}
+
+/// 计算批注线程涉及的所有解释 id（这些问答不在笔记正文内联显示）。
+fn hidden_expl_ids(sess: &session::Session) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for ann in &sess.annotations {
+        let mut stack = vec![ann.root_node_id.clone()];
+        while let Some(id) = stack.pop() {
+            if let Some(n) = sess.conversation.nodes.iter().find(|n| n.id == id) {
+                if let Some(e) = &n.explanation_id {
+                    set.insert(e.clone());
+                }
+                for c in sess
+                    .conversation
+                    .nodes
+                    .iter()
+                    .filter(|c| c.parent.as_deref() == Some(id.as_str()))
+                {
+                    stack.push(c.id.clone());
+                }
+            }
+        }
+    }
+    set
 }
 
 // ===== 配置 =====
@@ -635,9 +663,10 @@ async fn api_paper_note(State(app): State<SharedApp>, Query(q): Query<IdQuery>) 
     let Some(note) = &sess.notes else {
         return (StatusCode::NOT_FOUND, "该会话没有笔记").into_response();
     };
+    let hidden = hidden_expl_ids(&sess);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        export::to_html_bare(note, &sess.conversation),
+        export::to_html_bare(note, &sess.conversation, &hidden),
     )
         .into_response()
 }
@@ -725,4 +754,124 @@ async fn api_concept_delete(
     a.kb.save()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ===== 批注（笔记选中文字提问） =====
+
+#[derive(Deserialize)]
+struct AnnotateReq {
+    block_id: String,
+    quote: String,
+    question: String,
+    /// "ask"（默认，写入笔记解释）或 "check"（只进批注线程）。
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn api_annotate(
+    State(app): State<SharedApp>,
+    Json(req): Json<AnnotateReq>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut guard = app2.lock().await;
+        guard.emitter = Emitter::channel(tx);
+        let is_check = matches!(req.mode.as_deref(), Some("check"));
+        match guard
+            .annotate(&req.block_id, &req.quote, &req.question, is_check)
+            .await
+        {
+            Ok(_) => guard.emitter.done(),
+            Err(e) => guard.emitter.error(format!("{e:#}")),
+        }
+        guard.emitter = Emitter::terminal();
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct AnnotateReplyReq {
+    node_id: String,
+    question: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn api_annotate_reply(
+    State(app): State<SharedApp>,
+    Json(req): Json<AnnotateReplyReq>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut guard = app2.lock().await;
+        guard.emitter = Emitter::channel(tx);
+        let is_check = matches!(req.mode.as_deref(), Some("check"));
+        match guard
+            .annotate_reply(&req.node_id, &req.question, is_check)
+            .await
+        {
+            Ok(_) => guard.emitter.done(),
+            Err(e) => guard.emitter.error(format!("{e:#}")),
+        }
+        guard.emitter = Emitter::terminal();
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value> {
+    let a = app.lock().await;
+    let list: Vec<serde_json::Value> = a
+        .session
+        .annotations
+        .iter()
+        .map(|ann| {
+            json!({
+                "id": ann.id,
+                "block_id": ann.block_id,
+                "quote": ann.quote,
+                "root_node_id": ann.root_node_id,
+                "thread": build_thread(&a.session.conversation, &ann.root_node_id),
+            })
+        })
+        .collect();
+    Json(json!({ "annotations": list }))
+}
+
+/// 把以 `root` 为根的会话子树渲染成嵌套 JSON（`n` 为全局 DFS 编号，供 goto）。
+fn build_thread(conv: &crate::conversation::Conversation, root: &str) -> serde_json::Value {
+    use std::collections::HashMap;
+    let order = conv.dfs_order();
+    let num_of: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id.as_str(), i + 1))
+        .collect();
+    fn build(
+        conv: &crate::conversation::Conversation,
+        id: &str,
+        num_of: &std::collections::HashMap<&str, usize>,
+    ) -> serde_json::Value {
+        let Some(n) = conv.nodes.iter().find(|x| x.id == id) else {
+            return serde_json::Value::Null;
+        };
+        let children: Vec<serde_json::Value> = conv
+            .nodes
+            .iter()
+            .filter(|x| x.parent.as_deref() == Some(id))
+            .map(|c| build(conv, &c.id, num_of))
+            .collect();
+        json!({
+            "n": num_of.get(id).copied().unwrap_or(0),
+            "node_id": n.id,
+            "question": n.question,
+            "answer": n.answer,
+            "is_check": n.explanation_id.is_none(),
+            "children": children,
+        })
+    }
+    build(conv, root, &num_of)
 }

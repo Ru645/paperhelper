@@ -1024,7 +1024,7 @@ mod tests {
         let note = parse_markdown_note(md, "raw");
         let conv = crate::conversation::Conversation::default();
         let full = crate::export::to_html(&note, &conv);
-        let bare = crate::export::to_html_bare(&note, &conv);
+        let bare = crate::export::to_html_bare(&note, &conv, &std::collections::HashSet::new());
         assert!(full.contains("<aside>"), "完整导出应含对话树侧栏");
         assert!(!bare.contains("<aside>"), "bare 导出不应含树侧栏");
         assert!(bare.contains("const MD = "), "bare 仍应含笔记正文");
@@ -1046,7 +1046,7 @@ mod tests {
             collapsed: false,
         });
         let conv = crate::conversation::Conversation::default();
-        let html = crate::export::to_html_bare(&note, &conv);
+        let html = crate::export::to_html_bare(&note, &conv, &std::collections::HashSet::new());
         assert!(html.contains("expl-e1"), "HTML 应含解释锚点: ");
         let md_out = crate::export::to_markdown(&note);
         assert!(!md_out.contains("expl-e1"), "Markdown 导出不应含锚点");

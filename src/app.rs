@@ -35,7 +35,7 @@ use crate::llm::{self, Message};
 use crate::notes::{self, Explanation};
 use crate::output::Emitter;
 use crate::pdf;
-use crate::session::Session;
+use crate::session::{Annotation, Session};
 
 /// 输出宏：把标准输出的语义接到 `$slf.emitter` 上（终端或 Web/SSE 由 emitter 决定）。
 /// 需显式传入 `self`（macro_rules 对 self 是卫生的，无法从调用点隐式取得）。
@@ -507,7 +507,7 @@ impl App {
             "ingest" | "pdf" => self.cmd_ingest(rest).await,
             "ask" | "q" => self.cmd_ask(rest).await,
             "check" => self.cmd_check(rest).await,
-            "sum" => self.cmd_sum().await,
+            "sum" => self.cmd_sum(rest).await,
             "del" | "rm" => self.cmd_del(rest).await,
             "undo" => self.cmd_undo().await,
             _ => {
@@ -982,21 +982,70 @@ PaperHelper 命令：
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
-        interrupt::reset();
+        let block_id = self.resolve_block_id(question, &block_num);
+        self.ask_core(question, block_id, false).await?;
+        Ok(())
+    }
 
+    /// check <编号> <想法>：与 ask 类似调 LLM 回答，但不写入笔记、不增加追问嵌套。
+    /// 对话树仍记录此节点（用于上下文），但 explanation_id 为 None。
+    async fn cmd_check(&mut self, args: &str) -> Result<()> {
+        let args = args.trim();
+        if args == "--help" || args == "-h" || args.is_empty() {
+            outln!(self, "用法: check <编号> <想法>");
+            outln!(self, "  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
+            outln!(self, "  <想法>    你想核对/验证的想法或理解");
+            outln!(self, "例:");
+            outln!(self, "  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
+            outln!(self, "说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
+            return Ok(());
+        }
+        let (block_num, question) = parse_ask_args(args);
+        let question = question.trim();
+        if question.is_empty() {
+            bail!("用法: check <编号> <想法>   例: check 3.2 我觉得这个方法等价于余弦相似度");
+        }
+        if self.session.notes.is_none() {
+            bail!("还没有笔记，先 `ingest <pdf>`");
+        }
+        let block_id = self.resolve_block_id(question, &block_num);
+        self.ask_core(question, block_id, true).await?;
+        Ok(())
+    }
+
+    /// 按编号/关键词定位笔记块（ask/check 共用）。
+    fn resolve_block_id(&self, question: &str, block_num: &Option<String>) -> Option<String> {
+        let note = self.session.notes.as_ref()?;
+        match block_num {
+            Some(num) => note
+                .find_section_by_number(num)
+                .or_else(|| note.locate(question))
+                .map(|b| b.id.clone()),
+            None => note.locate(question).map(|b| b.id.clone()),
+        }
+    }
+
+    /// ask/check 共用核心：预算检查 → 构建上下文 → 流式 LLM → 写解释（仅 ask）→
+    /// 记录会话节点。返回 `(新节点 id, 新解释 id 或 None)`。
+    async fn ask_core(
+        &mut self,
+        question: &str,
+        block_id: Option<String>,
+        is_check: bool,
+    ) -> Result<(String, Option<String>)> {
+        interrupt::reset();
         let budget_ok = self.check_budget()?;
         if !budget_ok {
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
 
-        // 1-4. 构建上下文消息（论文全文+笔记+对话路径+概念注入）
-        let (msgs, block_id) = self.build_context_messages(question, &block_num);
+        let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref());
         let block_id_for_hint = block_id.clone();
 
-        // 5. 流式调用 LLM
+        // 流式调用 LLM
         let emitter = self.emitter.clone();
         let mut first_token = true;
-        emitter.progress("思考中…");
+        emitter.progress(if is_check { "核对中…" } else { "思考中…" });
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
                 emitter.progress_done();
@@ -1011,46 +1060,38 @@ PaperHelper 命令：
         let res = res?;
         self.emitter.stdout("");
 
-        // 6. 记录统计
         self.record_usage(res.input_tokens, res.output_tokens);
-
-        // 6.5 从 LLM 回答末尾提取概念名，去掉 [[概念:]] 标记行
         let (clean_answer, concept_name) = extract_concept(&res.content, question);
         let now = Utc::now().to_rfc3339();
-        let expl_id = uuid::Uuid::new_v4().to_string();
 
-        // 7. 把解释插入笔记
-        //    嵌套判断：从当前节点沿父链向上找第一个有 explanation_id 的祖先（跳过
-        //    check 等核对节点）——check 的儿子在笔记中的父亲是 check 的父亲。
-        let parent_expl_id = self
-            .session
-            .conversation
-            .current
-            .as_deref()
-            .and_then(|cur| {
-                Conversation::explanation_ancestor(&self.session.conversation.nodes, cur)
-            });
+        let mut explanation_id: Option<String> = None;
+        let mut is_nested = false;
 
-        let is_nested = parent_expl_id.is_some();
-        if let Some(parent_eid) = parent_expl_id {
-            // 嵌套追问：找到父解释，插入其 children
-            if let Some(note) = self.session.notes.as_mut() {
-                if let Some(parent_expl) = note.find_explanation_mut(&parent_eid) {
-                    parent_expl.children.push(Explanation {
-                        id: expl_id.clone(),
-                        question: question.to_string(),
-                        answer: clean_answer.clone(),
-                        concept: concept_name.clone(),
-                        created_at: now.clone(),
-                        children: Vec::new(),
-                        summary: None,
-                        collapsed: false,
-                    });
+        if !is_check {
+            let expl_id = uuid::Uuid::new_v4().to_string();
+            let parent_expl_id = self
+                .session
+                .conversation
+                .current
+                .as_deref()
+                .and_then(|cur| Conversation::explanation_ancestor(&self.session.conversation.nodes, cur));
+            is_nested = parent_expl_id.is_some();
+            if let Some(parent_eid) = parent_expl_id {
+                if let Some(note) = self.session.notes.as_mut() {
+                    if let Some(parent_expl) = note.find_explanation_mut(&parent_eid) {
+                        parent_expl.children.push(Explanation {
+                            id: expl_id.clone(),
+                            question: question.to_string(),
+                            answer: clean_answer.clone(),
+                            concept: concept_name.clone(),
+                            created_at: now.clone(),
+                            children: Vec::new(),
+                            summary: None,
+                            collapsed: false,
+                        });
+                    }
                 }
-            }
-        } else {
-            // 顶层追问：按 block_id 定位 block，插入顶层 explanations
-            if let Some(bid) = &block_id {
+            } else if let Some(bid) = &block_id {
                 if let Some(note) = self.session.notes.as_mut() {
                     let target_id = note.find_block(bid).and_then(|b| {
                         if b.kind == notes::BlockKind::Section {
@@ -1078,9 +1119,31 @@ PaperHelper 命令：
                     }
                 }
             }
+            explanation_id = Some(expl_id);
+
+            // 加入知识库概念
+            let (pid, ptitle) = self
+                .session
+                .current_paper_id
+                .clone()
+                .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
+                .unwrap_or_default();
+            self.kb.add_concept(Concept {
+                name: concept_name.clone(),
+                definition: clean_answer.chars().take(200).collect(),
+                paper_id: pid,
+                paper_title: ptitle,
+                block_id: if is_nested { None } else { block_id.clone() },
+                created_at: now.clone(),
+                pinned: false,
+            });
+            self.kb.save()?;
+
+            // 自动同步导出
+            self.sync_export(block_id_for_hint.as_deref())?;
         }
 
-        // 8. 记录对话树节点（当前节点为父），关联 explanation_id
+        // 记录会话节点（当前节点为父）
         let parent = self.session.conversation.current.clone();
         let node_id = uuid::Uuid::new_v4().to_string();
         self.session.conversation.add_exchange(ConvNode {
@@ -1088,37 +1151,26 @@ PaperHelper 命令：
             parent,
             question: question.to_string(),
             answer: clean_answer.clone(),
-            block_id: if is_nested { None } else { block_id.clone() },
-            explanation_id: Some(expl_id.clone()),
+            block_id: if is_check || is_nested { None } else { block_id.clone() },
+            explanation_id: explanation_id.clone(),
             input_tokens: res.input_tokens,
             output_tokens: res.output_tokens,
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
                 + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
             created_at: now.clone(),
-            label: concept_name.clone(),
+            label: if is_check { format!("[核对] {}", concept_name) } else { concept_name.clone() },
         });
-        self.session.conversation.current = Some(node_id);
+        self.session.conversation.current = Some(node_id.clone());
 
-        // 9. 加入知识库概念（用 LLM 提取的概念名）
-        let (pid, ptitle) = self
-            .session
-            .current_paper_id
-            .clone()
-            .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
-            .unwrap_or_default();
-        self.kb.add_concept(Concept {
-            name: concept_name.clone(),
-            definition: clean_answer.chars().take(200).collect(),
-            paper_id: pid,
-            paper_title: ptitle,
-            block_id: if is_nested { None } else { block_id },
-            created_at: now,
-            pinned: false,
-        });
-        self.kb.save()?;
+        if res.estimated {
+            outln!(self, "[注: 本次 token 数为估算]");
+        }
+        self.update_completions();
+        Ok((node_id, explanation_id))
+    }
 
-        // 自动更新导出的 markdown 文件
-        // 若 export_path 未设置：终端交互式询问一次；Web 下自动用默认名（不阻塞）
+    /// 自动同步导出笔记（ask/批注后调用）；终端下必要时询问导出文件名。
+    fn sync_export(&mut self, block_id_for_hint: Option<&str>) -> Result<()> {
         if self.export_path.is_none() {
             let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
             let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
@@ -1130,10 +1182,10 @@ PaperHelper 命令：
                 let name = name.trim();
                 if name == "skip" || name == "s" {
                     outerr!(self, "{} 已跳过导出，之后可用 `export md <file>` 手动导出。", "".dimmed());
-                } else {
-                    let path = if name.is_empty() { default_name } else { name.to_string() };
-                    self.export_path = Some(path.clone());
+                    return Ok(());
                 }
+                let path = if name.is_empty() { default_name } else { name.to_string() };
+                self.export_path = Some(path);
             } else {
                 self.export_path = Some(default_name);
             }
@@ -1141,8 +1193,7 @@ PaperHelper 命令：
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
                 if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
-                    // 查更新位置（block_id 对应的 section 编号+标题）
-                    let location = block_id_for_hint.as_ref().and_then(|bid| {
+                    let location = block_id_for_hint.and_then(|bid| {
                         note.find_block(bid).map(|b| {
                             let num = if b.number.is_empty() { String::new() } else { format!("{} ", b.number) };
                             format!("{num}{}", b.text.chars().take(30).collect::<String>())
@@ -1155,109 +1206,105 @@ PaperHelper 命令：
                 }
             }
         }
-
-        if res.estimated {
-            outln!(self, "[注: 本次 token 数为估算]");
-        }
-        self.update_completions();
         Ok(())
     }
 
-    /// check <编号> <想法>：与 ask 类似调 LLM 回答，但不写入笔记、不增加追问嵌套。
-    /// 对话树仍记录此节点（用于上下文），但 explanation_id 为 None。
-    async fn cmd_check(&mut self, args: &str) -> Result<()> {
-        let args = args.trim();
-        if args == "--help" || args == "-h" || args.is_empty() {
-            outln!(self, "用法: check <编号> <想法>");
-            outln!(self, "  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
-            outln!(self, "  <想法>    你想核对/验证的想法或理解");
-            outln!(self, "例:");
-            outln!(self, "  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
-            outln!(self, "说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
-            return Ok(());
+    /// 新建批注（Web）：在 block_id 处针对选中文字提问，作为独立线程的根节点。
+    /// 返回 `(批注 id, 根节点 id, 解释 id 或 None)`。
+    pub async fn annotate(
+        &mut self,
+        block_id: &str,
+        quote: &str,
+        question: &str,
+        is_check: bool,
+    ) -> Result<(String, String, Option<String>)> {
+        if self.session.notes.as_ref().and_then(|n| n.find_block(block_id)).is_none() {
+            bail!("找不到引用的笔记块（笔记可能已变化）");
         }
-        let (block_num, question) = parse_ask_args(args);
-        let question = question.trim();
-        if question.is_empty() {
-            bail!("用法: check <编号> <想法>   例: check 3.2 我觉得这个方法等价于余弦相似度");
-        }
-        if self.session.notes.is_none() {
-            bail!("还没有笔记，先 `ingest <pdf>`");
-        }
-        interrupt::reset();
-
-        let budget_ok = self.check_budget()?;
-        if !budget_ok {
-            bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
-        }
-
-        let (msgs, _block_id) = self.build_context_messages(question, &block_num);
-
-        // 流式调用 LLM
-        let emitter = self.emitter.clone();
-        let mut first_token = true;
-        emitter.progress("核对中…");
-        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
-            if first_token {
-                emitter.progress_done();
-                first_token = false;
-                emitter.token("\n");
+        let saved = self.session.conversation.current.clone();
+        self.session.conversation.current = None; // 独立线程：新根
+        let (node_id, expl_id) = match self.ask_core(question, Some(block_id.to_string()), is_check).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.session.conversation.current = saved;
+                return Err(e);
             }
-            emitter.token(t);
-        }).await;
-        if first_token {
-            emitter.progress_done();
-        }
-        let res = res?;
-        self.emitter.stdout("");
-
-        // 记录统计
-        self.record_usage(res.input_tokens, res.output_tokens);
-
-        // 提取概念名（用于 label）
-        let (clean_answer, concept_name) = extract_concept(&res.content, question);
-        let now = Utc::now().to_rfc3339();
-
-        // 对话树记录节点，但 explanation_id = None（不关联笔记解释）
-        let parent = self.session.conversation.current.clone();
-        let node_id = uuid::Uuid::new_v4().to_string();
-        self.session.conversation.add_exchange(ConvNode {
-            id: node_id.clone(),
-            parent,
-            question: question.to_string(),
-            answer: clean_answer.clone(),
-            block_id: None,
-            explanation_id: None,
-            input_tokens: res.input_tokens,
-            output_tokens: res.output_tokens,
-            cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
-                + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
-            created_at: now,
-            label: format!("[核对] {}", concept_name),
+        };
+        let ann_id = uuid::Uuid::new_v4().to_string();
+        self.session.annotations.push(Annotation {
+            id: ann_id.clone(),
+            block_id: block_id.to_string(),
+            quote: quote.to_string(),
+            root_node_id: node_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
         });
-        self.session.conversation.current = Some(node_id);
+        Ok((ann_id, node_id, expl_id))
+    }
 
-        if res.estimated {
-            outln!(self, "[注: 本次 token 数为估算]");
+    /// 批注内追问（Web）：在指定会话节点下继续 ask/check。
+    pub async fn annotate_reply(
+        &mut self,
+        node_id: &str,
+        question: &str,
+        is_check: bool,
+    ) -> Result<(String, Option<String>)> {
+        if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
+            bail!("找不到对话节点");
         }
-        self.update_completions();
-        Ok(())
+        let fallback_block = self.annotation_block_for_node(node_id);
+        let saved = self.session.conversation.current.clone();
+        self.session.conversation.current = Some(node_id.to_string());
+        let res = self.ask_core(question, fallback_block, is_check).await;
+        if res.is_err() {
+            self.session.conversation.current = saved;
+        }
+        res
+    }
+
+    /// 找到包含指定节点的批注，返回其 block_id（批注内追问的兜底定位）。
+    fn annotation_block_for_node(&self, node_id: &str) -> Option<String> {
+        for ann in &self.session.annotations {
+            let mut cur = Some(node_id.to_string());
+            while let Some(id) = cur {
+                if id == ann.root_node_id {
+                    return Some(ann.block_id.clone());
+                }
+                cur = self
+                    .session
+                    .conversation
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == id)
+                    .and_then(|n| n.parent.clone());
+            }
+        }
+        None
     }
 
     /// sum：把当前对话节点子树（含自己）的全部问答概括成"总结"，写入笔记。
     /// 流程：DFS 收集子树 → 预算检查 → LLM 概括（进度条）→ 找到当前节点向上最近
     /// 带解释的祖先（跳过 check）→ 给该 Explanation 写 summary 并折叠（collapsed）
     /// → 同步导出。终端先打印总结正文，笔记中体现为 <details> 折叠+总结。
-    async fn cmd_sum(&mut self) -> Result<()> {
+    async fn cmd_sum(&mut self, rest: &str) -> Result<()> {
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
-        let cur = self
-            .session
-            .conversation
-            .current
-            .clone()
-            .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?;
+        // sum [n]：n 为对话树 DFS 编号；不填则用当前节点
+        let cur = match rest.trim().parse::<usize>() {
+            Ok(n) => self
+                .session
+                .conversation
+                .dfs_order()
+                .get(n.wrapping_sub(1))
+                .map(|x| x.id.clone())
+                .ok_or_else(|| anyhow!("找不到节点 {n}（见 tree）"))?,
+            Err(_) => self
+                .session
+                .conversation
+                .current
+                .clone()
+                .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?,
+        };
         // 收集子树（含自己），DFS 顺序
         let subtree = self.collect_subtree(&cur);
         if subtree.is_empty() {
@@ -1318,16 +1365,34 @@ PaperHelper 命令：
         Ok(())
     }
 
-    /// del [--yes]：删除当前对话节点及其子树（根节点不可删）。
-    /// 不带 `--yes` 只打印警告与将删除的内容，需 `del --yes` 确认；
-    /// 执行前把笔记+对话树入撤销栈，可用 `undo` 恢复。
+    /// del [n] [--yes]：删除指定（默认当前）对话节点及其子树（根节点不可删）。
+    /// 不带 `--yes` 只打印警告与将删除的内容；执行前把笔记+对话树入撤销栈。
     async fn cmd_del(&mut self, rest: &str) -> Result<()> {
-        let cur = self
-            .session
-            .conversation
-            .current
-            .clone()
-            .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?;
+        let mut target: Option<String> = None;
+        let mut confirm = false;
+        for tok in rest.split_whitespace() {
+            if tok == "--yes" || tok == "-y" {
+                confirm = true;
+            } else if let Ok(n) = tok.parse::<usize>() {
+                target = Some(
+                    self.session
+                        .conversation
+                        .dfs_order()
+                        .get(n.wrapping_sub(1))
+                        .map(|x| x.id.clone())
+                        .ok_or_else(|| anyhow!("找不到节点 {n}（见 tree）"))?,
+                );
+            }
+        }
+        let cur = match target {
+            Some(id) => id,
+            None => self
+                .session
+                .conversation
+                .current
+                .clone()
+                .ok_or_else(|| anyhow!("当前不在任何对话节点上，先 ask 提问"))?,
+        };
         let node = self
             .session
             .conversation
@@ -1340,7 +1405,6 @@ PaperHelper 命令：
             bail!("根节点不可删除（如需清空请用 `new` 新建会话）");
         }
         let subtree = self.collect_subtree(&cur);
-        let confirm = matches!(rest.trim(), "--yes" | "-y");
         if !confirm {
             outln!(self, "⚠️  将删除节点「{}」及其 {} 个子节点：", node.label, subtree.len().saturating_sub(1));
             for (depth, n) in &subtree {
@@ -1457,22 +1521,19 @@ PaperHelper 命令：
     /// 构建 ask/check 共用的上下文消息序列（论文全文+笔记+对话路径+概念注入）。
     /// 消息编排：system=ask 提示词；user=论文全文；assistant=已生成笔记
     /// （把它们放进多轮对话让 LLM"看过"长文，再以多轮 Q&A 追加历史）；
-    /// user=问题（追加检索到的知识库相关概念提示语）。若问题带编号先在
-    /// 笔记里定位该 Section 文本；否则用关键词 `locate`。
+    /// user=问题（追加检索到的知识库相关概念提示语）。`block_id` 由调用方
+    /// 预先定位（章节编号/关键词/批注引用的块），仅用于返回定位信息。
     /// 上下文长度控制：先估算 论文+笔记+问题 的 token 基数，在
     /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
-    fn build_context_messages(&self, question: &str, block_num: &Option<String>) -> (Vec<Message>, Option<String>) {
+    fn build_context_messages(&self, question: &str, block_id: Option<&str>) -> (Vec<Message>, Option<String>) {
         let (raw_text, notes_md, block_id) = {
             let note = self.session.notes.as_ref().unwrap();
-            let blk = if let Some(num) = block_num {
-                note.find_section_by_number(num)
-                    .or_else(|| note.locate(question))
-            } else {
-                note.locate(question)
-            };
-            let bid = blk.map(|b| b.id.clone());
-            (note.raw_text.clone(), note.to_markdown(), bid)
+            (
+                note.raw_text.clone(),
+                note.to_markdown(),
+                block_id.map(|s| s.to_string()),
+            )
         };
 
         let path: Vec<(String, String)> = self

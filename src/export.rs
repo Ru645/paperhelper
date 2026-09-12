@@ -10,24 +10,31 @@
 //!   CDN 双源（jsdelivr → npmmirror）自动 fallback，全挂则降级纯文本。
 //!   导出前先 `convert_inline_math_delims` 统一公式定界符，规避 marked 转义。
 
+use std::collections::HashSet;
+
 use crate::conversation::Conversation;
 use crate::notes::{Block, BlockKind, Explanation, Note};
 
 /// 整棵笔记渲染为 Markdown（根标题 + 逐块递归，追问挂在所属块下）。
 pub fn to_markdown(note: &Note) -> String {
-    to_markdown_with(note, false)
+    to_markdown_with(note, false, &HashSet::new())
 }
 
-/// 渲染 Markdown；`anchors=true` 时在每条追问前注入 `<a id="expl-…">`，
-/// 供 Web 端笔记 iframe 内跳转定位（Markdown 导出保持干净，不注入）。
-fn to_markdown_with(note: &Note, anchors: bool) -> String {
+/// 渲染 Markdown。
+/// - `anchors=true`：给每个块注入 `<a id="blk-…">`、每条追问注入 `<a id="expl-…">`，
+///   供 Web 端笔记 iframe 内定位（Markdown 导出保持干净，不注入）。
+/// - `hidden`：要跳过的解释 id 集合（批注线程的问答不在正文内联显示，只在弹窗里看）。
+fn to_markdown_with(note: &Note, anchors: bool, hidden: &HashSet<String>) -> String {
     let mut s = format!("# {}\n\n", note.title);
-    walk_md(&note.blocks, 0, anchors, &mut s);
+    walk_md(&note.blocks, 0, anchors, hidden, &mut s);
     s
 }
 
-fn walk_md(blocks: &[Block], depth: usize, anchors: bool, s: &mut String) {
+fn walk_md(blocks: &[Block], depth: usize, anchors: bool, hidden: &HashSet<String>, s: &mut String) {
     for b in blocks {
+        if anchors {
+            s.push_str(&format!("<a id=\"blk-{}\"></a>\n", b.id));
+        }
         match b.kind {
             BlockKind::Section => {
                 let level = (depth + 2).min(6);
@@ -46,13 +53,16 @@ fn walk_md(blocks: &[Block], depth: usize, anchors: bool, s: &mut String) {
             }
         }
         for (i, e) in b.explanations.iter().enumerate() {
+            if hidden.contains(&e.id) {
+                continue; // 批注线程的问答：正文不内联显示
+            }
             if i > 0 {
                 s.push('\n'); // 顶层追问之间空行分隔（上块尾已有 \n）
             }
-            render_explanation(e, 1, anchors, s);
+            render_explanation(e, 1, anchors, hidden, s);
             s.push('\n');
         }
-        walk_md(&b.children, depth + 1, anchors, s);
+        walk_md(&b.children, depth + 1, anchors, hidden, s);
     }
 }
 
@@ -64,7 +74,13 @@ fn walk_md(blocks: &[Block], depth: usize, anchors: bool, s: &mut String) {
 /// - collapsed（sum 折叠）：整个追问子树包进 <details>，总结显示在折叠块外。
 /// - anchors=true 时，在追问最前面注入 `<a id="expl-<id>">` 供页面内跳转。
 /// 块与块之间的顶层分隔由调用者处理。
-fn render_explanation(e: &Explanation, depth: usize, anchors: bool, s: &mut String) {
+fn render_explanation(
+    e: &Explanation,
+    depth: usize,
+    anchors: bool,
+    hidden: &HashSet<String>,
+    s: &mut String,
+) {
     let prefix = "> ".repeat(depth);
     let parent_quote_empty = "> ".repeat(depth - 1) + ">"; // depth 个 >，无尾空格
 
@@ -81,13 +97,18 @@ fn render_explanation(e: &Explanation, depth: usize, anchors: bool, s: &mut Stri
         s.push_str(&format!("{parent_quote_empty}\n"));
         render_qa_body(e, depth, s);
         // 子树也在折叠块内
-        for (i, child) in e.children.iter().enumerate() {
-            if i == 0 {
+        let mut first = true;
+        for child in e.children.iter() {
+            if hidden.contains(&child.id) {
+                continue;
+            }
+            if first {
                 s.push_str(&format!("{parent_quote_empty}\n"));
+                first = false;
             } else {
                 s.push('\n');
             }
-            render_explanation(child, depth + 1, anchors, s);
+            render_explanation(child, depth + 1, anchors, hidden, s);
         }
         s.push_str(&format!("{prefix}</details>\n"));
         // 总结显示在折叠块外
@@ -105,15 +126,20 @@ fn render_explanation(e: &Explanation, depth: usize, anchors: bool, s: &mut Stri
         render_summary(summary, &prefix, s);
     }
     // 递归子追问
-    for (i, child) in e.children.iter().enumerate() {
-        if i == 0 {
+    let mut first = true;
+    for child in e.children.iter() {
+        if hidden.contains(&child.id) {
+            continue;
+        }
+        if first {
             // 父子连续：父级空引用行衔接（解答行尾已有 \n），同一引用块内继续
             s.push_str(&format!("{parent_quote_empty}\n"));
+            first = false;
         } else {
             // 兄弟之间：裸空行断开（上一块尾已有 \n，再补一个成空行）
             s.push('\n');
         }
-        render_explanation(child, depth + 1, anchors, s);
+        render_explanation(child, depth + 1, anchors, hidden, s);
     }
 }
 
@@ -194,16 +220,22 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation) -> String {
 /// 左侧对话树（当前节点高亮），右侧笔记；CDN 不可用时降级显示原文。
 /// 资源加载带 fallback：jsdelivr 失败自动切 npmmirror。
 pub fn to_html(note: &Note, conv: &Conversation) -> String {
-    to_html_with(note, conv, true)
+    to_html_with(note, conv, true, &HashSet::new())
 }
 
 /// 只渲染笔记正文、不含左侧对话树（Web 内嵌用，避免与页面自身树重复）。
-pub fn to_html_bare(note: &Note, conv: &Conversation) -> String {
-    to_html_with(note, conv, false)
+/// `hidden` 为批注线程的解释 id 集合：这些问答不在正文内联显示（只在弹窗看）。
+pub fn to_html_bare(note: &Note, conv: &Conversation, hidden: &HashSet<String>) -> String {
+    to_html_with(note, conv, false, hidden)
 }
 
-fn to_html_with(note: &Note, conv: &Conversation, include_tree: bool) -> String {
-    let md = convert_inline_math_delims(&to_markdown_with(note, true));
+fn to_html_with(
+    note: &Note,
+    conv: &Conversation,
+    include_tree: bool,
+    hidden: &HashSet<String>,
+) -> String {
+    let md = convert_inline_math_delims(&to_markdown_with(note, true, hidden));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
     let aside = if include_tree {
         format!(
