@@ -63,6 +63,8 @@
     </div>
 
     <form id="cmd-form" class="cmdbar">
+      <button type="button" id="btn-upload" class="mini ghost" title="导入论文文件（PDF/TXT）">＋ 导入</button>
+      <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
       <div class="cmd-wrap">
         <input id="cmd-input" type="text" placeholder="输入 / 选择命令，或直接输入问题提问…" autocomplete="off" autofocus>
         <ul id="cmd-suggest" class="suggest hidden"></ul>
@@ -71,6 +73,8 @@
     </form>
   </main>
 </div>
+
+<div id="drop-overlay" class="drop-overlay hidden"><div class="drop-inner">松开鼠标，导入论文文件</div></div>
 
 <div id="ctx-menu" class="ctx-menu hidden"></div>
 

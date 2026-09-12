@@ -1027,6 +1027,41 @@ function submitInput() {
   if (command) runCommand(command);
 }
 
+// ===== 文件导入（上传 + 拖拽） =====
+
+/// 上传文件到服务器，再按类型执行 ingest。
+async function importFile(file) {
+  if (!file) return;
+  if (running) { alert("有任务正在运行，请稍后再导入。"); return; }
+  setProgress("上传中…");
+  switchTab("console");
+  appendConsole("> 导入文件: " + file.name);
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch("/api/upload", { method: "POST", body: fd });
+    if (!res.ok) {
+      appendConsole("❌ 上传失败: " + (await res.text()), "err");
+      setProgress("");
+      return;
+    }
+    const j = await res.json();
+    setProgress("");
+    // .txt/.md 走 --text（跳过 PDF 解析），其余按 PDF 处理
+    const isText = /\.(txt|md|markdown)$/i.test(file.name);
+    const cmd = (isText ? "ingest --text " : "ingest ") + shellQuote(j.path);
+    await runCommand(cmd);
+  } catch (e) {
+    appendConsole("❌ 导入失败: " + e, "err");
+    setProgress("");
+  }
+}
+
+/// 把路径包成双引号（内部反斜杠/引号转义），与后端 normalize_path_arg 对应。
+function shellQuote(p) {
+  return '"' + String(p).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
 // ===== 配置弹窗 =====
 
 async function openConfig() {
@@ -1108,6 +1143,37 @@ document.addEventListener("DOMContentLoaded", () => {
   cmdInput.addEventListener("blur", () => setTimeout(hideSuggest, 120));
 
   $("cmd-form").onsubmit = (e) => { e.preventDefault(); submitInput(); };
+
+  // 文件导入：按钮 + 拖拽
+  $("btn-upload").onclick = () => $("file-input").click();
+  $("file-input").onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (f) importFile(f);
+  };
+  let dragDepth = 0;
+  const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+  document.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    $("drop-overlay").classList.remove("hidden");
+  });
+  document.addEventListener("dragover", (e) => {
+    if (hasFiles(e)) e.preventDefault();
+  });
+  document.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) $("drop-overlay").classList.add("hidden");
+  });
+  document.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    $("drop-overlay").classList.add("hidden");
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) importFile(f);
+  });
 
   $("btn-refresh").onclick = () => { refreshState(); reloadNote(); };
 

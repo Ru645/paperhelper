@@ -252,3 +252,29 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 /* 笔记内高亮 */
 mark.ann-mark { background: #fff3a3; cursor: pointer; padding: 0 1px; border-radius: 2px; }
 mark.ann-mark:hover { background: #ffe066; }
+
+/* ===== 文件导入 ===== */
+.cmdbar #btn-upload { flex-shrink: 0; }
+.drop-overlay {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(37, 99, 235, .12); border: 3px dashed var(--blue);
+  display: flex; align-items: center; justify-content: center; pointer-events: none;
+}
+.drop-overlay.hidden { display: none; }
+.drop-inner {
+  background: #fff; color: var(--blue); font-size: 18px; font-weight: 600;
+  padding: 16px 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
+}
+
+/* ===== 文件导入 ===== */
+.cmdbar #btn-upload { flex-shrink: 0; }
+.drop-overlay {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(37, 99, 235, .12); border: 3px dashed var(--blue);
+  display: flex; align-items: center; justify-content: center; pointer-events: none;
+}
+.drop-overlay.hidden { display: none; }
+.drop-inner {
+  background: #fff; color: var(--blue); font-size: 18px; font-weight: 600;
+  padding: 16px 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
+}

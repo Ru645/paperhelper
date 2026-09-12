@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -63,6 +63,10 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/annotate", post(api_annotate))
         .route("/api/annotate/reply", post(api_annotate_reply))
         .route("/api/annotations", get(api_annotations))
+        .route(
+            "/api/upload",
+            post(api_upload).layer(DefaultBodyLimit::max(200 * 1024 * 1024)),
+        )
         .with_state(app)
 }
 
@@ -874,4 +878,58 @@ fn build_thread(conv: &crate::conversation::Conversation, root: &str) -> serde_j
         })
     }
     build(conv, root, &num_of)
+}
+
+// ===== 文件上传（Web 端导入论文文件） =====
+
+async fn api_upload(
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取上传失败: {e}")))?
+    {
+        let fname = field.name().map(|s| s.to_string());
+        if fname.as_deref() != Some("file") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("upload.pdf").to_string();
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取文件内容失败: {e}")))?;
+        if data.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "文件为空".to_string()));
+        }
+        paths::ensure_uploads_dir()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let name = format!("{stamp}_{}", sanitize_upload_name(&filename));
+        let path = paths::uploads_dir().join(&name);
+        std::fs::write(&path, &data)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("保存文件失败: {e}")))?;
+        return Ok(Json(json!({
+            "path": path.to_string_lossy(),
+            "name": filename,
+        })));
+    }
+    Err((StatusCode::BAD_REQUEST, "缺少 file 字段".to_string()))
+}
+
+/// 上传文件名安全化：去掉路径分隔符与危险字符（保留空格/中文）。
+fn sanitize_upload_name(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
+    if cleaned.is_empty() {
+        "upload.pdf".to_string()
+    } else {
+        cleaned.chars().take(120).collect()
+    }
 }

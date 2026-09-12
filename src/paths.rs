@@ -37,6 +37,19 @@ pub fn pins_path() -> PathBuf {
     data_dir().join("pins.json")
 }
 
+/// 上传文件目录（Web 端导入 PDF 等）。
+pub fn uploads_dir() -> PathBuf {
+    data_dir().join("uploads")
+}
+
+/// 确保上传目录存在。
+pub fn ensure_uploads_dir() -> Result<()> {
+    if !uploads_dir().exists() {
+        fs::create_dir_all(uploads_dir())?;
+    }
+    Ok(())
+}
+
 /// 会话存档目录
 pub fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")
