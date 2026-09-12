@@ -64,7 +64,6 @@ function setProgress(msg) { $("progress").textContent = msg || ""; }
 function setRunning(v) {
   running = v;
   $("btn-send").disabled = v;
-  $("btn-stop").disabled = !v;
   if (!v) setProgress("");
 }
 
@@ -761,11 +760,6 @@ document.addEventListener("DOMContentLoaded", () => {
   cmdInput.addEventListener("blur", () => setTimeout(hideSuggest, 120));
 
   $("cmd-form").onsubmit = (e) => { e.preventDefault(); submitInput(); };
-
-  $("btn-stop").onclick = async () => {
-    setProgress("已请求停止…");
-    try { await fetch("/api/interrupt", { method: "POST" }); } catch (e) { console.error(e); }
-  };
 
   $("btn-refresh").onclick = () => { refreshState(); reloadNote(); };
   $("btn-config").onclick = openConfig;
