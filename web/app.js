@@ -688,16 +688,51 @@ function renderAnnThread(root) {
   const box = $("ann-thread");
   box.innerHTML = "";
   if (!root) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
-  const add = (node, depth) => {
+  const add = (node, depth, container) => {
     const div = document.createElement("div");
     div.className = "ann-node" + (node.is_check ? " check" : "") + (annSelectedNode === node.node_id ? " selected" : "");
     div.style.marginLeft = depth * 10 + "px";
+
     const q = document.createElement("div");
     q.className = "ann-q";
     q.textContent = (node.is_check ? "[核对] " : "") + node.question;
     const a = document.createElement("div");
     a.className = "ann-a";
     a.innerHTML = renderMathMarkdown(node.answer || "");
+
+    if (node.summary) {
+      // 总结节点：显示总结，折叠原对话（点击展开）
+      div.classList.add("summary");
+      const sum = document.createElement("div");
+      sum.className = "ann-summary";
+      sum.innerHTML = renderMathMarkdown(node.summary);
+      const hint = document.createElement("div");
+      hint.className = "ann-summary-hint";
+      hint.textContent = "▶ 展开原对话";
+      const orig = document.createElement("div");
+      orig.className = "ann-original";
+      orig.style.display = "none";
+      orig.appendChild(q);
+      orig.appendChild(a);
+      (node.children || []).forEach((c) => add(c, depth + 1, orig));
+      div.appendChild(sum);
+      div.appendChild(hint);
+      div.appendChild(orig);
+      div.onclick = (e) => {
+        e.stopPropagation();
+        const open = orig.style.display !== "none";
+        orig.style.display = open ? "none" : "block";
+        hint.textContent = open ? "▶ 展开原对话" : "▼ 收起";
+      };
+      div.oncontextmenu = (e) => {
+        e.preventDefault();
+        showAnnNodeMenu(e.clientX, e.clientY, node);
+      };
+      container.appendChild(div);
+      return;
+    }
+
+    // 普通节点
     div.appendChild(q);
     div.appendChild(a);
     div.onclick = () => {
@@ -709,10 +744,10 @@ function renderAnnThread(root) {
       e.preventDefault();
       showAnnNodeMenu(e.clientX, e.clientY, node);
     };
-    box.appendChild(div);
-    (node.children || []).forEach((c) => add(c, depth + 1));
+    container.appendChild(div);
+    (node.children || []).forEach((c) => add(c, depth + 1, container));
   };
-  add(root, 0);
+  add(root, 0, box);
 }
 
 function showAnnNodeMenu(x, y, node) {

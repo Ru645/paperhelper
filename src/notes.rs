@@ -256,6 +256,27 @@ impl Note {
         }
         walk(&mut self.blocks, id)
     }
+
+    /// 返回 id → (summary, collapsed) 映射，供 Web/导出把被 sum 的节点渲染成
+    /// 「总结」节点（显示总结、可展开查看原对话）。
+    pub fn summary_map(&self) -> std::collections::HashMap<String, (Option<String>, bool)> {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        fn walk_expl(expls: &[Explanation], map: &mut HashMap<String, (Option<String>, bool)>) {
+            for e in expls {
+                map.insert(e.id.clone(), (e.summary.clone(), e.collapsed));
+                walk_expl(&e.children, map);
+            }
+        }
+        fn walk_blocks(blocks: &[Block], map: &mut HashMap<String, (Option<String>, bool)>) {
+            for b in blocks {
+                walk_expl(&b.explanations, map);
+                walk_blocks(&b.children, map);
+            }
+        }
+        walk_blocks(&self.blocks, &mut map);
+        map
+    }
 }
 
 /// 去掉标题开头的编号前缀（数字 "1.1 " 与中文序号 "一、"），

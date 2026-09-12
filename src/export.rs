@@ -256,8 +256,12 @@ fn annotation_hidden_ids(annotations: &[Annotation], conv: &Conversation) -> Has
     set
 }
 
-/// 把以 `root` 为根的会话子树转成 JSON（`{question, answer, is_check, children}`）。
-fn thread_json(conv: &Conversation, root: &str) -> serde_json::Value {
+/// 把以 `root` 为根的会话子树转成 JSON（`{question, answer, is_check, summary, collapsed, children}`）。
+fn thread_json(
+    conv: &Conversation,
+    root: &str,
+    summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+) -> serde_json::Value {
     let Some(n) = conv.nodes.iter().find(|x| x.id == root) else {
         return serde_json::Value::Null;
     };
@@ -265,12 +269,20 @@ fn thread_json(conv: &Conversation, root: &str) -> serde_json::Value {
         .nodes
         .iter()
         .filter(|x| x.parent.as_deref() == Some(root))
-        .map(|c| thread_json(conv, &c.id))
+        .map(|c| thread_json(conv, &c.id, summary_map))
         .collect();
+    let (summary, collapsed) = n
+        .explanation_id
+        .as_ref()
+        .and_then(|eid| summary_map.get(eid))
+        .cloned()
+        .unwrap_or((None, false));
     serde_json::json!({
         "question": n.question,
         "answer": n.answer,
         "is_check": n.explanation_id.is_none(),
+        "summary": summary,
+        "collapsed": collapsed,
         "children": children,
     })
 }
@@ -291,6 +303,11 @@ const ANN_CSS: &str = r#"
   .ann-a { font-size: 13px; line-height: 1.6; color: #333; }
   .ann-a p { margin: 4px 0; }
   .ann-a .katex-display { overflow-x: auto; }
+  .ann-node.summary { background: #fffbe6; border-left-color: #f59e0b; }
+  .ann-summary { font-size: 13px; line-height: 1.6; color: #333; }
+  .ann-summary p { margin: 4px 0; }
+  .ann-summary-hint { font-size: 11px; color: #2563eb; margin-top: 4px; }
+  .ann-original { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e5c76b; }
   .ann-fallback { margin-top: 40px; border-top: 1px solid #ddd; padding-top: 16px; }
   .ann-fallback:empty { display: none; }
   .ann-fallback h2 { font-size: 18px; }
@@ -391,6 +408,32 @@ function renderThread(container, node, depth) {
   const a = document.createElement('div');
   a.className = 'ann-a';
   a.innerHTML = renderMd(node.answer || '');
+  if (node.summary) {
+    div.classList.add('summary');
+    const sum = document.createElement('div');
+    sum.className = 'ann-summary';
+    sum.innerHTML = renderMd(node.summary);
+    const hint = document.createElement('div');
+    hint.className = 'ann-summary-hint';
+    hint.textContent = '▶ 展开原对话';
+    const orig = document.createElement('div');
+    orig.className = 'ann-original';
+    orig.style.display = 'none';
+    orig.appendChild(q);
+    orig.appendChild(a);
+    (node.children || []).forEach((c) => renderThread(orig, c, depth + 1));
+    div.appendChild(sum);
+    div.appendChild(hint);
+    div.appendChild(orig);
+    div.onclick = (e) => {
+      e.stopPropagation();
+      const open = orig.style.display !== 'none';
+      orig.style.display = open ? 'none' : 'block';
+      hint.textContent = open ? '▶ 展开原对话' : '▼ 收起';
+    };
+    container.appendChild(div);
+    return;
+  }
   div.appendChild(q);
   div.appendChild(a);
   container.appendChild(div);
@@ -455,13 +498,14 @@ fn to_html_with(
 ) -> String {
     let md = convert_inline_math_delims(&to_markdown_with(note, true, hidden));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
+    let summary_map = note.summary_map();
     let anns: Vec<serde_json::Value> = annotations
         .iter()
         .map(|a| {
             serde_json::json!({
                 "block_id": a.block_id,
                 "quote": a.quote,
-                "thread": thread_json(conv, &a.root_node_id),
+                "thread": thread_json(conv, &a.root_node_id, &summary_map),
             })
         })
         .collect();

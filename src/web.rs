@@ -832,6 +832,12 @@ async fn api_annotation_delete(
 
 async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value> {
     let a = app.lock().await;
+    let summary_map = a
+        .session
+        .notes
+        .as_ref()
+        .map(|n| n.summary_map())
+        .unwrap_or_default();
     let list: Vec<serde_json::Value> = a
         .session
         .annotations
@@ -842,7 +848,7 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
                 "block_id": ann.block_id,
                 "quote": ann.quote,
                 "root_node_id": ann.root_node_id,
-                "thread": build_thread(&a.session.conversation, &ann.root_node_id),
+                "thread": build_thread(&a.session.conversation, &ann.root_node_id, &summary_map),
             })
         })
         .collect();
@@ -850,7 +856,12 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
 }
 
 /// 把以 `root` 为根的会话子树渲染成嵌套 JSON（`n` 为全局 DFS 编号，供 goto）。
-fn build_thread(conv: &crate::conversation::Conversation, root: &str) -> serde_json::Value {
+/// `summary_map` 提供解释 id → (summary, collapsed)，用于把被 sum 的节点标成总结节点。
+fn build_thread(
+    conv: &crate::conversation::Conversation,
+    root: &str,
+    summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+) -> serde_json::Value {
     use std::collections::HashMap;
     let order = conv.dfs_order();
     let num_of: HashMap<&str, usize> = order
@@ -862,6 +873,7 @@ fn build_thread(conv: &crate::conversation::Conversation, root: &str) -> serde_j
         conv: &crate::conversation::Conversation,
         id: &str,
         num_of: &std::collections::HashMap<&str, usize>,
+        summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
     ) -> serde_json::Value {
         let Some(n) = conv.nodes.iter().find(|x| x.id == id) else {
             return serde_json::Value::Null;
@@ -870,18 +882,26 @@ fn build_thread(conv: &crate::conversation::Conversation, root: &str) -> serde_j
             .nodes
             .iter()
             .filter(|x| x.parent.as_deref() == Some(id))
-            .map(|c| build(conv, &c.id, num_of))
+            .map(|c| build(conv, &c.id, num_of, summary_map))
             .collect();
+        let (summary, collapsed) = n
+            .explanation_id
+            .as_ref()
+            .and_then(|eid| summary_map.get(eid))
+            .cloned()
+            .unwrap_or((None, false));
         json!({
             "n": num_of.get(id).copied().unwrap_or(0),
             "node_id": n.id,
             "question": n.question,
             "answer": n.answer,
             "is_check": n.explanation_id.is_none(),
+            "summary": summary,
+            "collapsed": collapsed,
             "children": children,
         })
     }
-    build(conv, root, &num_of)
+    build(conv, root, &num_of, summary_map)
 }
 
 // ===== 文件上传（Web 端导入论文文件） =====
