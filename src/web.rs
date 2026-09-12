@@ -98,20 +98,29 @@ pub async fn serve(app: App, port: u16) -> Result<()> {
 
 // ===== 静态前端 =====
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../web/index.html"))
+async fn index() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-cache")],
+        Html(include_str!("../web/index.html")),
+    )
 }
 
 async fn stylesheet() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("../web/style.css"),
     )
 }
 
 async fn script() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         include_str!("../web/app.js"),
     )
 }
