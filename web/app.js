@@ -1033,6 +1033,12 @@ function submitInput() {
 async function importFile(file) {
   if (!file) return;
   if (running) { alert("有任务正在运行，请稍后再导入。"); return; }
+  // 先询问笔记文件名（默认 笔记_<文件stem>.md）
+  const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 20);
+  const defaultName = "笔记_" + stem + ".md";
+  const input = prompt("笔记文件名（可写 .md 或 .html）", defaultName);
+  if (input === null) return; // 取消
+  const exportName = input.trim() || defaultName;
   setProgress("上传中…");
   switchTab("console");
   appendConsole("> 导入文件: " + file.name);
@@ -1050,7 +1056,7 @@ async function importFile(file) {
     // .txt/.md 走 --text（跳过 PDF 解析），其余按 PDF 处理
     const isText = /\.(txt|md|markdown)$/i.test(file.name);
     const cmd = (isText ? "ingest --text " : "ingest ") + shellQuote(j.path);
-    await runCommand(cmd);
+    await runCommand(cmd, { export: exportName });
   } catch (e) {
     appendConsole("❌ 导入失败: " + e, "err");
     setProgress("");

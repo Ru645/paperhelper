@@ -427,10 +427,40 @@ impl App {
         if self.session.session_id.is_empty() {
             self.session.session_id = crate::paths::new_session_stamp();
         }
+        self.session.export_path = self.export_path.clone();
         let path = crate::paths::session_path(&self.session.session_id);
         self.session.save(&path)?;
         outln!(self, "{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
         outln!(self, "  恢复会话，请执行：paperhelper -s {}", self.session.session_id);
+        Ok(())
+    }
+
+    /// Web 端自动保存会话（**不调用 LLM 取名**，用笔记标题兜底），
+    /// 让新导入的会话立即出现在会话列表里，切换/新建都不会丢。
+    pub fn auto_persist(&mut self) -> Result<()> {
+        if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
+            return Ok(());
+        }
+        if self.session.session_id.is_empty() {
+            self.session.session_id = crate::paths::new_session_stamp();
+        }
+        if self.session.session_name.trim().is_empty() {
+            let title = self
+                .session
+                .notes
+                .as_ref()
+                .map(|n| n.title.clone())
+                .unwrap_or_default();
+            self.session.session_name = if title.trim().is_empty() {
+                "未命名会话".to_string()
+            } else {
+                title.chars().take(30).collect()
+            };
+        }
+        self.session.export_path = self.export_path.clone();
+        crate::paths::ensure_sessions_dir()?;
+        let path = crate::paths::session_path(&self.session.session_id);
+        self.session.save(&path)?;
         Ok(())
     }
 
@@ -720,6 +750,7 @@ PaperHelper 命令：
 
     async fn cmd_save(&mut self, rest: &str) -> Result<()> {
         let path = if rest.trim().is_empty() { "session.json".to_string() } else { normalize_path_arg(rest) };
+        self.session.export_path = self.export_path.clone();
         self.session.save(Path::new(&path))?;
         outln!(self, "会话已保存到 {path}");
         Ok(())
@@ -731,6 +762,7 @@ PaperHelper 命令：
         }
         let path = normalize_path_arg(rest);
         self.session = Session::load(Path::new(&path))?;
+        self.export_path = self.session.export_path.clone();
         outln!(self, "已加载会话: 笔记={}, 对话节点={}",
             self.session.notes.is_some(),
             self.session.conversation.nodes.len());
@@ -857,7 +889,8 @@ PaperHelper 命令：
                 sanitize_filename(&normalize_path_arg(name))
             }
         } else {
-            self.export_path.clone().unwrap_or_else(|| default_name.clone())
+            let name = self.export_path.clone().unwrap_or_else(|| default_name.clone());
+            sanitize_filename(&name)
         };
 
         // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）

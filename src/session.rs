@@ -66,6 +66,9 @@ pub struct Session {
     /// 批注列表（Web 端在笔记选中文字提问产生；每条批注关联一段会话子树）。
     #[serde(default)]
     pub annotations: Vec<Annotation>,
+    /// 该会话的笔记导出文件路径（ingest/ask 自动同步用；随会话持久化）。
+    #[serde(default)]
+    pub export_path: Option<String>,
 }
 
 /// 一条批注：笔记里的一段引用文字 + 其对话线程（以 `root_node_id` 为根的会话子树）。
@@ -319,6 +322,7 @@ mod tests {
             session_name: String::new(),
             session_id: String::new(),
             annotations: Vec::new(),
+            export_path: None,
         };
         sess.session_id = "20260101_000000".into();
         sess.save(&path).unwrap();

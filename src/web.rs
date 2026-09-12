@@ -141,8 +141,18 @@ async fn api_run(
                 guard.export_path = Some(e);
             }
         }
+        let first = req.command.split_whitespace().next().unwrap_or("");
+        let mutating = matches!(
+            first,
+            "ingest" | "pdf" | "ask" | "q" | "check" | "sum" | "del" | "rm" | "undo"
+        );
         match guard.run_command(&req.command).await {
-            Ok(()) => guard.emitter.done(),
+            Ok(()) => {
+                if mutating {
+                    let _ = guard.auto_persist();
+                }
+                guard.emitter.done();
+            }
             Err(e) => guard.emitter.error(format!("{e:#}")),
         }
         // 关键：恢复为终端输出器，丢弃 SSE sender，让接收端在 done 后正常结束流
@@ -480,6 +490,7 @@ async fn api_session_load(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let mut a = app.lock().await;
     a.session = loaded;
+    a.export_path = a.session.export_path.clone();
     a.update_completions();
     let name = a.session.session_name.clone();
     Ok(Json(json!({ "ok": true, "id": target, "name": name })))
@@ -565,6 +576,7 @@ async fn api_session_delete(
     if a.session.session_id == target {
         // 删除的是当前会话：自动新建空会话
         a.session = session::Session::default();
+        a.export_path = None;
         a.update_completions();
         reset = true;
     }
@@ -786,7 +798,10 @@ async fn api_annotate(
             .annotate(&req.block_id, &req.quote, &req.question, is_check)
             .await
         {
-            Ok(_) => guard.emitter.done(),
+            Ok(_) => {
+                let _ = guard.auto_persist();
+                guard.emitter.done();
+            }
             Err(e) => guard.emitter.error(format!("{e:#}")),
         }
         guard.emitter = Emitter::terminal();
@@ -817,7 +832,10 @@ async fn api_annotate_reply(
             .annotate_reply(&req.node_id, &req.question, is_check)
             .await
         {
-            Ok(_) => guard.emitter.done(),
+            Ok(_) => {
+                let _ = guard.auto_persist();
+                guard.emitter.done();
+            }
             Err(e) => guard.emitter.error(format!("{e:#}")),
         }
         guard.emitter = Emitter::terminal();

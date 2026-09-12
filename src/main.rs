@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                 Some(id) => {
                     let path = paths::session_path(&id);
                     app.session = session::Session::load(&path)?;
+                    app.export_path = app.session.export_path.clone();
                     let name = app.session.session_name.clone();
                     println!("已恢复会话 {id}：{}", if name.is_empty() { "（未命名）".into() } else { name });
                     return app.repl().await;
