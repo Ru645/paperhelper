@@ -291,3 +291,26 @@ mark.ann-mark:hover { background: #ffe066; }
 .ann-summary .katex-display { overflow-x: auto; }
 .ann-summary-hint { font-size: 11px; color: var(--blue); margin-top: 4px; }
 .ann-original { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e5c76b; }
+
+/* ===== 顶栏下拉 ===== */
+.dropdown { position: relative; }
+.dropdown-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 90;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.16); padding: 4px; min-width: 150px;
+}
+.dropdown-menu.hidden { display: none; }
+.dropdown-menu div { padding: 7px 12px; font-size: 13px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+.dropdown-menu div:hover { background: var(--blue-light); }
+
+/* ===== 笔记结构大纲 ===== */
+ul.outline { list-style: none; font-size: 13px; }
+ul.outline li { padding: 2px 0; cursor: pointer; line-height: 1.4; color: #444; }
+ul.outline li:hover { color: var(--blue); }
+ul.outline li.para { color: #888; font-size: 12px; }
+.outline-num { color: var(--blue); margin-right: 2px; }
+.outline-ann { color: #d97706; margin-right: 3px; }
+
+/* ===== 帮助 ===== */
+.help-list { margin: 8px 0 0 18px; }
+.help-list li { font-size: 13px; line-height: 1.9; }

@@ -1255,12 +1255,31 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
     ) -> Result<(String, String, Option<String>)> {
-        if self.session.notes.as_ref().and_then(|n| n.find_block(block_id)).is_none() {
+        // 全文提问：block_id 用哨兵 __title__，解释挂到首个块（保证追问嵌套），
+        // 但批注仍记录 __title__ 供前端高亮标题。
+        let is_title = block_id == "__title__";
+        if !is_title
+            && self
+                .session
+                .notes
+                .as_ref()
+                .and_then(|n| n.find_block(block_id))
+                .is_none()
+        {
             bail!("找不到引用的笔记块（笔记可能已变化）");
         }
+        let insert_block = if is_title {
+            self.session
+                .notes
+                .as_ref()
+                .and_then(|n| n.blocks.first())
+                .map(|b| b.id.clone())
+        } else {
+            Some(block_id.to_string())
+        };
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
-        let (node_id, expl_id) = match self.ask_core(question, Some(block_id.to_string()), is_check, Some(quote)).await {
+        let (node_id, expl_id) = match self.ask_core(question, insert_block, is_check, Some(quote)).await {
             Ok(v) => v,
             Err(e) => {
                 self.session.conversation.current = saved;

@@ -26,7 +26,12 @@ pub fn to_markdown(note: &Note) -> String {
 ///   供 Web 端笔记 iframe 内定位（Markdown 导出保持干净，不注入）。
 /// - `hidden`：要跳过的解释 id 集合（批注线程的问答不在正文内联显示，只在弹窗里看）。
 fn to_markdown_with(note: &Note, anchors: bool, hidden: &HashSet<String>) -> String {
-    let mut s = format!("# {}\n\n", note.title);
+    // 标题也作为「全文」章节：锚点 id 用哨兵 __title__，供前端高亮/右键提问
+    let mut s = if anchors {
+        format!("<a id=\"blk-__title__\"></a>\n# {}\n\n", note.title)
+    } else {
+        format!("# {}\n\n", note.title)
+    };
     walk_md(&note.blocks, 0, anchors, hidden, &mut s);
     s
 }
@@ -291,6 +296,8 @@ fn thread_json(
 const ANN_CSS: &str = r#"
   main mark.ann-mark { background: #fff3a3; cursor: pointer; padding: 0 1px; border-radius: 2px; }
   main mark.ann-mark:hover { background: #ffe066; }
+  main h1, main h2, main h3, main h4, main h5, main h6 { cursor: context-menu; border-radius: 4px; }
+  main h1:hover, main h2:hover, main h3:hover, main h4:hover, main h5:hover, main h6:hover { background: #eff6ff; }
   .ann-popup { position: fixed; z-index: 90; width: 380px; max-height: 70vh; background: #fff; border: 1px solid #ddd; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column; }
   .ann-popup.hidden { display: none; }
   .ann-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #ddd; }

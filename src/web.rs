@@ -46,6 +46,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/interrupt", post(api_interrupt))
         .route("/api/state", get(api_state))
         .route("/api/note", get(api_note))
+        .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
@@ -220,6 +221,7 @@ fn build_state(a: &App) -> serde_json::Value {
     if let Some(note) = &a.session.notes {
         for (b, depth) in note.flatten() {
             blocks.push(json!({
+                "id": b.id,
                 "number": b.number,
                 "kind": format!("{:?}", b.kind).to_lowercase(),
                 "text": b.text.chars().take(80).collect::<String>(),
@@ -349,6 +351,94 @@ fn hidden_expl_ids(sess: &session::Session) -> std::collections::HashSet<String>
         }
     }
     set
+}
+
+// ===== 导出下载 =====
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// `GET /api/export?format=md|mm|html`：返回对应渲染内容，供浏览器下载。
+async fn api_export(State(app): State<SharedApp>, Query(q): Query<ExportQuery>) -> Response {
+    let a = app.lock().await;
+    let Some(note) = &a.session.notes else {
+        return (StatusCode::NOT_FOUND, "还没有笔记").into_response();
+    };
+    let fmt = q.format.as_deref().unwrap_or("md");
+    let (content, ext) = match fmt {
+        "html" | "htm" => (
+            export::to_html(note, &a.session.conversation, &a.session.annotations),
+            "html",
+        ),
+        "mm" | "mindmap" => (export::to_mindmap(note), "mm"),
+        _ => (export::to_markdown(note), "md"),
+    };
+    // 文件名：优先用会话的导出名 stem，否则用笔记标题
+    let stem = a
+        .export_path
+        .as_ref()
+        .and_then(|p| {
+            std::path::Path::new(p)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            let t: String = note.title.chars().take(40).collect();
+            if t.trim().is_empty() {
+                "note".to_string()
+            } else {
+                t
+            }
+        });
+    let filename = format!("{}.{}", sanitize_download_name(&stem), ext);
+    let ctype = if ext == "html" {
+        "text/html; charset=utf-8"
+    } else {
+        "text/markdown; charset=utf-8"
+    };
+    let cd = format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        filename
+            .chars()
+            .map(|c| if c.is_ascii() && c != '"' { c } else { '_' })
+            .collect::<String>(),
+        pct_encode(&filename)
+    );
+    let mut resp = ([(header::CONTENT_TYPE, ctype)], content).into_response();
+    if let Ok(v) = header::HeaderValue::from_str(&cd) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
+/// 下载文件名安全化（去掉路径分隔符等）。
+fn sanitize_download_name(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            _ => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// RFC 5987 百分号编码（用于 Content-Disposition 的 filename*）。
+fn pct_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 // ===== 配置 =====

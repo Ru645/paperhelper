@@ -5,16 +5,11 @@
 const $ = (id) => document.getElementById(id);
 const consoleEl = $("console");
 const noteFrame = $("note-frame");
-const cmdInput = $("cmd-input");
-const suggestEl = $("cmd-suggest");
 
 let running = false;
 let streamSpan = null;      // 当前流式 token 的容器
 let lastState = null;       // 最近一次 /api/state 快照
 const dynamicTabs = new Map(); // key -> { btn, pane }
-let suggestIndex = 0;
-const cmdHistory = [];
-let histIdx = 0;
 // 批注（选中文字提问）
 let annotationsCache = [];
 let currentAnnotation = null; // { id, block_id, quote }
@@ -68,7 +63,6 @@ function setProgress(msg) { $("progress").textContent = msg || ""; }
 
 function setRunning(v) {
   running = v;
-  $("btn-send").disabled = v;
   if (!v) setProgress("");
 }
 
@@ -195,6 +189,7 @@ async function refreshState() {
   }
   await refreshSessions();
   await refreshAnnotations();
+  renderOutline(lastState);
   applyHighlights();
 }
 
@@ -512,15 +507,37 @@ function onNoteLoaded() {
       }
     });
     doc.addEventListener("contextmenu", (e) => {
-      const mark = e.target && e.target.closest ? e.target.closest("mark.ann-mark") : null;
-      if (!mark) return;
-      e.preventDefault();
+      const t = e.target;
       const fr = noteFrame.getBoundingClientRect();
-      showAnnMarkMenu(mark.dataset.annId, fr.left + e.clientX, fr.top + e.clientY);
+      const mark = t && t.closest ? t.closest("mark.ann-mark") : null;
+      if (mark) {
+        e.preventDefault();
+        showAnnMarkMenu(mark.dataset.annId, fr.left + e.clientX, fr.top + e.clientY);
+        return;
+      }
+      const heading = t && t.closest ? t.closest("h1, h2, h3, h4, h5, h6") : null;
+      if (heading) {
+        e.preventDefault();
+        showHeadingMenu(doc, heading, fr.left + e.clientX, fr.top + e.clientY);
+      }
     });
     doc.addEventListener("scroll", hideSelButton, true);
   }
   applyHighlights();
+}
+
+/// 右键标题：对该章节（h1=全文）提问 / 打开或删除已有批注。
+function showHeadingMenu(doc, heading, x, y) {
+  const blockId = blockIdForNode(doc, heading);
+  if (!blockId) return;
+  const text = (heading.textContent || "").trim();
+  const items = [{ label: "对本章节提问", fn: () => openAnnotationCreate(blockId, text) }];
+  const ann = (annotationsCache || []).find((a) => a.block_id === blockId);
+  if (ann) {
+    items.unshift({ label: "打开批注", fn: () => openAnnotationView(ann.id) });
+    items.push({ label: "删除该批注", danger: true, fn: () => deleteAnnotation(ann.id) });
+  }
+  showMenu(x, y, items);
 }
 
 /// 右键高亮文字：打开 / 删除整条批注。
@@ -532,7 +549,7 @@ function showAnnMarkMenu(annId, x, y) {
 }
 
 async function deleteAnnotation(annId) {
-  if (!confirm("删除该批注及其全部问答？（可用 /undo 撤销）")) return;
+  if (!confirm("删除该批注及其全部问答？（可用顶栏「撤销」恢复）")) return;
   try {
     await postJson("/api/annotate/delete", { annotation_id: annId });
   } catch (e) {
@@ -617,6 +634,9 @@ function wrapQuote(doc, range, quote, annId) {
 function blockIdForNode(doc, node) {
   const note = doc.getElementById("note");
   if (!note || !note.contains(node)) return null;
+  // 标题可能把 blk- 锚点包在内部，优先用它
+  const inner = node.querySelector ? node.querySelector('a[id^="blk-"]') : null;
+  if (inner) return inner.id.slice(4);
   let best = null;
   for (const a of note.querySelectorAll('a[id^="blk-"]')) {
     const pos = a.compareDocumentPosition(node);
@@ -1082,72 +1102,49 @@ async function deleteSession(s) {
   }
 }
 
-// ===== 命令面板 =====
+// ===== 顶栏操作：导出 / 撤销 / 帮助 =====
 
-const COMMANDS = [
-  { name: "ask", usage: "ask <编号> <问题>", desc: "按编号追问，回答插入笔记" },
-  { name: "check", usage: "check <编号> <想法>", desc: "核对想法，不写入笔记" },
-  { name: "sum", usage: "sum", desc: "折叠当前子树为总结" },
-  { name: "ingest", usage: "ingest [--text|--ocr] <路径>", desc: "导入论文生成笔记" },
-  { name: "goto", usage: "goto <编号>", desc: "跳转对话节点" },
-  { name: "del", usage: "del [--yes]", desc: "删除当前节点及子树" },
-  { name: "undo", usage: "undo", desc: "撤销上一次删除" },
-  { name: "export", usage: "export <md|mindmap|html> [文件]", desc: "导出笔记" },
-  { name: "blocks", usage: "blocks", desc: "查看笔记结构" },
-  { name: "note", usage: "note", desc: "打印笔记 Markdown" },
-  { name: "tree", usage: "tree", desc: "查看对话轨迹" },
-  { name: "stats", usage: "stats", desc: "查看用量与成本" },
-  { name: "budget", usage: "budget <n>", desc: "设置 token 预算" },
-  { name: "papers", usage: "papers", desc: "列出已读论文" },
-  { name: "concepts", usage: "concepts", desc: "列出已学概念" },
-  { name: "save", usage: "save [文件]", desc: "保存会话" },
-  { name: "load", usage: "load <文件>", desc: "加载会话" },
-  { name: "config", usage: "config show | set <k> <v>", desc: "查看/设置配置" },
-  { name: "new", usage: "new", desc: "新建会话" },
-  { name: "help", usage: "help", desc: "帮助" },
-];
+function downloadExport(fmt) {
+  if (!lastState || !lastState.has_note) { alert("还没有笔记"); return; }
+  const a = document.createElement("a");
+  a.href = "/api/export?format=" + encodeURIComponent(fmt);
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
 
-function hideSuggest() { suggestEl.classList.add("hidden"); }
+// ===== 笔记结构大纲 =====
 
-function updateSuggest() {
-  const v = cmdInput.value;
-  if (!v.startsWith("/")) return hideSuggest();
-  const body = v.slice(1);
-  if (body.includes(" ")) return hideSuggest();
-  const matches = COMMANDS.filter((c) => c.name.startsWith(body.toLowerCase()));
-  if (!matches.length) return hideSuggest();
-  suggestIndex = Math.min(suggestIndex, matches.length - 1);
-  suggestEl.innerHTML = "";
-  matches.forEach((c, i) => {
+function renderOutline(st) {
+  const ul = $("outline");
+  ul.innerHTML = "";
+  if (!st || !st.has_note || !st.blocks || st.blocks.length === 0) {
+    ul.innerHTML = '<li class="muted">（还没有笔记）</li>';
+    return;
+  }
+  const annBlocks = new Set((annotationsCache || []).map((a) => a.block_id));
+  for (const b of st.blocks) {
     const li = document.createElement("li");
-    li.className = i === suggestIndex ? "active" : "";
-    li.innerHTML = `<b>/${esc(c.name)}</b> <span class="usage">${esc(c.usage)}</span><span class="desc">${esc(c.desc)}</span>`;
-    li.onmousedown = (e) => { e.preventDefault(); acceptSuggest(c.name); };
-    suggestEl.appendChild(li);
-  });
-  suggestEl.classList.remove("hidden");
+    li.className = "outline-item" + (b.kind === "paragraph" ? " para" : "");
+    li.style.paddingLeft = b.depth * 12 + "px";
+    const num = b.number ? b.number + " " : "";
+    const text = b.text.length > 40 ? b.text.slice(0, 40) + "…" : b.text;
+    const mark = annBlocks.has(b.id) ? '<span class="outline-ann" title="有批注">●</span>' : "";
+    li.innerHTML = `${mark}<span class="outline-num">${esc(num)}</span>${esc(text)}`;
+    li.title = "点击定位到笔记中的位置";
+    li.onclick = () => scrollNoteToBlock(b.id);
+    ul.appendChild(li);
+  }
 }
 
-function acceptSuggest(name) {
-  cmdInput.value = "/" + name + " ";
-  hideSuggest();
-  cmdInput.focus();
+function scrollNoteToBlock(blockId) {
+  const doc = noteFrame.contentDocument;
+  if (!doc) return;
+  const el = doc.getElementById("blk-" + blockId);
+  if (el) el.scrollIntoView({ block: "start" });
 }
 
-function submitInput() {
-  const value = cmdInput.value.trim();
-  if (!value) return;
-  cmdHistory.push(value);
-  histIdx = cmdHistory.length;
-  const command = value.startsWith("/") ? value.slice(1).trim() : "ask " + value;
-  cmdInput.value = "";
-  hideSuggest();
-  if (!command) return;
-  // 提问/核对/总结后保持笔记滚动位置，不跳回开头
-  const first = command.split(/\s+/)[0];
-  const keepScroll = ["ask", "q", "check", "sum"].includes(first);
-  runCommand(command, { keepScroll });
-}
 
 // ===== 文件导入（上传 + 拖拽） =====
 
@@ -1250,27 +1247,23 @@ async function saveConfig() {
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".tab[data-key]").forEach((t) => (t.onclick = () => switchTab(t.dataset.key)));
 
-  // 命令输入：/ 触发候选、全键盘、历史
-  cmdInput.addEventListener("input", () => { suggestIndex = 0; updateSuggest(); });
-  cmdInput.addEventListener("keydown", (e) => {
-    const suggestVisible = !suggestEl.classList.contains("hidden");
-    const count = suggestEl.children.length;
-    if (e.key === "ArrowDown") {
-      if (suggestVisible) { e.preventDefault(); suggestIndex = (suggestIndex + 1) % count; updateSuggest(); }
-    } else if (e.key === "ArrowUp") {
-      if (suggestVisible) { e.preventDefault(); suggestIndex = (suggestIndex - 1 + count) % count; updateSuggest(); }
-      else if (histIdx > 0) { e.preventDefault(); histIdx--; cmdInput.value = cmdHistory[histIdx] || ""; }
-    } else if (e.key === "Tab") {
-      if (suggestVisible) { e.preventDefault(); acceptSuggest(suggestEl.children[suggestIndex].querySelector("b").textContent.slice(1)); }
-    } else if (e.key === "Enter") {
-      if (suggestVisible) { e.preventDefault(); acceptSuggest(suggestEl.children[suggestIndex].querySelector("b").textContent.slice(1)); }
-    } else if (e.key === "Escape") {
-      hideSuggest();
-    }
+  // 顶栏：导出 / 撤销 / 帮助
+  $("btn-export").onclick = (e) => {
+    e.stopPropagation();
+    $("export-menu").classList.toggle("hidden");
+  };
+  $("export-menu").querySelectorAll("[data-fmt]").forEach((el) => {
+    el.onclick = () => {
+      $("export-menu").classList.add("hidden");
+      downloadExport(el.dataset.fmt);
+    };
   });
-  cmdInput.addEventListener("blur", () => setTimeout(hideSuggest, 120));
-
-  $("cmd-form").onsubmit = (e) => { e.preventDefault(); submitInput(); };
+  $("btn-undo").onclick = () => runCommand("undo");
+  $("btn-help").onclick = () => $("help-modal").classList.remove("hidden");
+  $("btn-help-close").onclick = () => $("help-modal").classList.add("hidden");
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".dropdown")) $("export-menu").classList.add("hidden");
+  });
 
   // 文件导入：按钮 + 拖拽
   $("btn-upload").onclick = () => $("file-input").click();
