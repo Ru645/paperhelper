@@ -395,6 +395,18 @@ function renderMathMarkdown(md) {
   // 行内公式：遵循 Pandoc 规则——开头 $ 后不能是空白、结尾 $ 前不能是空白，
   // 以免把货币美元（如 "$200 元"）误当成公式定界符。同时跳过转义的 \$
   src = src.replace(/(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
+  // 包裹漏加 $ 的裸数学 token（下标/上标，如 p_ij、S_n、s^n_k）；跳过代码围栏与行内代码
+  let inFence = false;
+  src = String(src).split("\n").map((line) => {
+    const t = line.trimStart();
+    if (t.startsWith("```")) { inFence = !inFence; return line; }
+    if (inFence) return line;
+    const codes = [];
+    line = line.replace(/`[^`]*`/g, (m) => { codes.push(m); return "\u2063C" + (codes.length - 1) + "\u2063"; });
+    line = line.replace(/(?<![\w$\\])(\\?[A-Za-z\u0370-\u03ff][A-Za-z0-9\u0370-\u03ff']*(?:(?:_|\^)(?:\{[^{}]*\}|[A-Za-z0-9\u0370-\u03ff]+))+)(?![\w])/g, (m) => { store.push([m, false]); return token(store.length - 1); });
+    line = line.replace(/\u2063C(\d+)\u2063/g, (_, i) => codes[+i]);
+    return line;
+  }).join("\n");
   let html = marked.parse(src);
   html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
     const entry = store[+i];
