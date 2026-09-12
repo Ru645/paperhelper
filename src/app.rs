@@ -1018,7 +1018,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, false).await?;
+        self.ask_core(question, block_id, false, None).await?;
         Ok(())
     }
 
@@ -1044,7 +1044,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, true).await?;
+        self.ask_core(question, block_id, true, None).await?;
         Ok(())
     }
 
@@ -1067,6 +1067,7 @@ PaperHelper 命令：
         question: &str,
         block_id: Option<String>,
         is_check: bool,
+        quote: Option<&str>,
     ) -> Result<(String, Option<String>)> {
         interrupt::reset();
         let budget_ok = self.check_budget()?;
@@ -1074,7 +1075,7 @@ PaperHelper 命令：
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
 
-        let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref());
+        let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref(), quote);
         let block_id_for_hint = block_id.clone();
 
         // 流式调用 LLM
@@ -1258,7 +1259,7 @@ PaperHelper 命令：
         }
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
-        let (node_id, expl_id) = match self.ask_core(question, Some(block_id.to_string()), is_check).await {
+        let (node_id, expl_id) = match self.ask_core(question, Some(block_id.to_string()), is_check, Some(quote)).await {
             Ok(v) => v,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -1289,7 +1290,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let res = self.ask_core(question, fallback_block, is_check).await;
+        let res = self.ask_core(question, fallback_block, is_check, None).await;
         if res.is_err() {
             self.session.conversation.current = saved;
         }
@@ -1561,7 +1562,7 @@ PaperHelper 命令：
     /// 上下文长度控制：先估算 论文+笔记+问题 的 token 基数，在
     /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
-    fn build_context_messages(&self, question: &str, block_id: Option<&str>) -> (Vec<Message>, Option<String>) {
+    fn build_context_messages(&self, question: &str, block_id: Option<&str>, quote: Option<&str>) -> (Vec<Message>, Option<String>) {
         let (raw_text, notes_md, block_id) = {
             let note = self.session.notes.as_ref().unwrap();
             (
@@ -1613,7 +1614,16 @@ PaperHelper 命令：
         }
 
         let related = self.kb.search(question);
-        let mut q_final = question.to_string();
+        // 批注提问时，把用户选中的原文一并作为上下文（普通 ask/check 无 quote）
+        let mut q_final = String::new();
+        if let Some(qt) = quote {
+            if !qt.trim().is_empty() {
+                q_final.push_str("【用户选中的笔记原文】\n");
+                q_final.push_str(qt.trim());
+                q_final.push_str("\n【问题】\n");
+            }
+        }
+        q_final.push_str(question);
         if !related.is_empty() {
             q_final.push_str("\n\n【你之前学过的相关概念，可参考并建立联系】");
             for c in &related {

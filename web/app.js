@@ -188,7 +188,6 @@ async function refreshState() {
     lastState = st;
     renderModel(st);
     renderUsage(st);
-    renderTree(st);
     renderPapers(st);
     renderConcepts(st);
   } catch (e) {
@@ -223,28 +222,6 @@ function renderUsage(st) {
     <div class="u-row"><span>当前节点上下文</span><b>${fmt(st.current_input_tokens)}</b></div>
     <div class="u-sub${warn}">/ ${fmt(st.context_length)} tok (${pct}%)</div>
     ${budget}`;
-  $("btn-undo").disabled = !st.can_undo;
-}
-
-function renderTree(st) {
-  const ul = $("tree");
-  ul.innerHTML = "";
-  if (!st.tree || st.tree.length === 0) {
-    ul.innerHTML = '<li class="muted">（尚无对话）</li>';
-    return;
-  }
-  for (const n of st.tree) {
-    const li = document.createElement("li");
-    li.style.paddingLeft = n.depth * 14 + "px";
-    if (n.current) li.className = "current";
-    li.textContent = `[${n.n}] ${n.label}`;
-    li.title = "点击跳到此节点，并定位到笔记中的位置";
-    li.onclick = () => {
-      switchTab("note");
-      runCommand("goto " + n.n, { skipReload: true, scrollAnchor: n.expl });
-    };
-    ul.appendChild(li);
-  }
 }
 
 function renderPapers(st) {
@@ -716,34 +693,69 @@ function closeAnnPopup() {
   annSelectedNode = null;
 }
 
+/// 乐观追加一个待回答节点（问题 + 思考中…），返回回答元素供流式填充。
+function appendPendingNode(question) {
+  const box = $("ann-thread");
+  const muted = box.querySelector(".muted");
+  if (muted) box.innerHTML = "";
+  const div = document.createElement("div");
+  div.className = "ann-node pending";
+  const q = document.createElement("div");
+  q.className = "ann-q";
+  q.textContent = question;
+  const a = document.createElement("div");
+  a.className = "ann-a";
+  a.textContent = "思考中…";
+  div.appendChild(q);
+  div.appendChild(a);
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return a;
+}
+
 async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
   $("ann-q").value = "";
   $("ann-send").disabled = true;
+  $("ann-progress").textContent = "思考中…";
+  const ansEl = appendPendingNode(q);
   let url, body;
   if (!currentAnnotation.id) {
     url = "/api/annotate";
     body = { block_id: currentAnnotation.block_id, quote: currentAnnotation.quote, question: q, mode: annMode };
   } else {
     const nodeId = annSelectedNode;
-    if (!nodeId) { $("ann-send").disabled = false; return; }
+    if (!nodeId) { $("ann-send").disabled = false; $("ann-progress").textContent = ""; return; }
     url = "/api/annotate/reply";
     body = { node_id: nodeId, question: q, mode: annMode };
   }
+  let streamed = "";
   try {
     await postSse(url, body, ({ name, text }) => {
-      if (name === "error") appendConsole("❌ " + text, "err");
-      else if (name === "token") appendToken(text);
-      else if (name === "stdout") appendConsole(text);
-      else if (name === "stderr") appendConsole(text, "err");
-      else if (name === "progress") setProgress(text);
-      else if (name === "progress_done") setProgress("");
+      if (name === "error") {
+        appendConsole("❌ " + text, "err");
+        ansEl.textContent = "（出错：" + text + "）";
+      } else if (name === "token") {
+        streamed += text;
+        ansEl.textContent = streamed;
+        $("ann-thread").scrollTop = $("ann-thread").scrollHeight;
+      } else if (name === "stdout") {
+        appendConsole(text);
+      } else if (name === "stderr") {
+        appendConsole(text, "err");
+      } else if (name === "progress") {
+        $("ann-progress").textContent = text;   // 进度显示在弹窗右上角
+      } else if (name === "progress_done") {
+        $("ann-progress").textContent = "";
+      }
     });
   } catch (e) {
     appendConsole("❌ " + e, "err");
+    ansEl.textContent = "（出错：" + e + "）";
   }
   $("ann-send").disabled = false;
+  $("ann-progress").textContent = "";
   await refreshState();
   await refreshAnnotations();
   if (currentAnnotation.id) {
@@ -1197,20 +1209,6 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config").onclick = openConfig;
   $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
   $("btn-config-save").onclick = saveConfig;
-
-  $("btn-undo").onclick = () => runCommand("undo");
-
-  $("btn-del").onclick = () => {
-    const tree = (lastState && lastState.tree) || [];
-    const cur = tree.find((n) => n.current);
-    if (!cur) { alert("当前不在任何对话节点上"); return; }
-    if (cur.depth === 0) { alert("根节点不可删除"); return; }
-    const i = tree.findIndex((x) => x.n === cur.n);
-    let desc = 0;
-    for (let j = i + 1; j < tree.length && tree[j].depth > cur.depth; j++) desc++;
-    if (!confirm(`删除节点「${cur.label}」及其 ${desc} 个子节点？\n可用「撤销」恢复。`)) return;
-    runCommand("del --yes");
-  };
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideCtxMenu(); });

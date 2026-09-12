@@ -278,3 +278,8 @@ mark.ann-mark:hover { background: #ffe066; }
   background: #fff; color: var(--blue); font-size: 18px; font-weight: 600;
   padding: 16px 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
 }
+
+/* 批注弹窗：右上角进度 + 待回答节点 */
+.ann-progress { font-size: 12px; color: var(--blue); }
+.ann-node.pending { border-left-color: var(--muted); opacity: .9; }
+.ann-node.pending .ann-a { color: var(--muted); }

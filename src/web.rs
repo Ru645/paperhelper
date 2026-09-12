@@ -195,46 +195,6 @@ fn build_state(a: &App) -> serde_json::Value {
     let g = &a.kb.stats;
     let used = s.total_tokens() + g.total_tokens();
 
-    // 对话树（DFS 编号，供前端 goto）
-    let order = a.session.conversation.dfs_order();
-    let depth_of = |id: &str| -> usize {
-        let mut d = 0usize;
-        let mut cur = a
-            .session
-            .conversation
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .and_then(|n| n.parent.clone());
-        while let Some(p) = cur {
-            d += 1;
-            cur = a
-                .session
-                .conversation
-                .nodes
-                .iter()
-                .find(|n| n.id == p)
-                .and_then(|n| n.parent.clone());
-        }
-        d
-    };
-    let tree: Vec<serde_json::Value> = order
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            json!({
-                "n": i + 1,
-                "label": n.label,
-                "depth": depth_of(&n.id),
-                "current": a.session.conversation.current.as_deref() == Some(n.id.as_str()),
-                // 该节点在笔记中对应的解释锚点（ask 即自身；check 回退到最近祖先；根为 null）
-                "expl": crate::conversation::Conversation::explanation_ancestor(
-                    &a.session.conversation.nodes, &n.id,
-                ),
-            })
-        })
-        .collect();
-
     // 当前节点上次真实请求的精确 input_tokens（API 返回的 usage，非估算）
     let current_input_tokens = a
         .session
@@ -321,7 +281,6 @@ fn build_state(a: &App) -> serde_json::Value {
         "current_input_tokens": current_input_tokens,
         "context_length": a.config.llm.context_length,
         "can_undo": a.can_undo(),
-        "tree": tree,
         "blocks": blocks,
         "papers": papers,
         "concepts": concepts,
