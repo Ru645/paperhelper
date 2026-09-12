@@ -76,6 +76,11 @@ ul.session-list li {
 }
 ul.session-list li:hover { background: #e4e4e1; }
 ul.session-list li.active { background: var(--blue-light); }
+ul.session-list li.session-new {
+  background: var(--blue-light); color: var(--blue); font-weight: 600;
+  margin-bottom: 4px; justify-content: center;
+}
+ul.session-list li.session-new:hover { background: #dbeafe; }
 ul.session-list .s-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; }
 .pin { color: #d97706; flex-shrink: 0; margin-right: 4px; }

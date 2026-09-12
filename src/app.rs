@@ -498,6 +498,8 @@ impl App {
             "concepts" => self.cmd_concepts().await,
             "new" => {
                 self.session = Session::default();
+                self.export_path = None;
+                self.undo_stack.clear();
                 outln!(self, "已新建会话。");
                 Ok(())
             }

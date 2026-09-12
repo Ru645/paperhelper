@@ -802,8 +802,19 @@ async function refreshSessions() {
 function renderSessions(list) {
   const ul = $("sessions");
   ul.innerHTML = "";
+  // 永远置顶的“新会话”
+  const newLi = document.createElement("li");
+  newLi.className = "session-new";
+  newLi.innerHTML = '<span class="s-name">＋ 新会话</span>';
+  newLi.title = "创建新会话";
+  newLi.onclick = () => runCommand("new");
+  ul.appendChild(newLi);
+
   if (!list.length) {
-    ul.innerHTML = '<li class="muted">（无）</li>';
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "（无历史会话）";
+    ul.appendChild(empty);
     return;
   }
   const activeId = lastState && lastState.session_id ? lastState.session_id : null;
