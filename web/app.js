@@ -175,7 +175,7 @@ async function runCommand(command, opts = {}) {
       // 笔记未变（如 goto）：不重载，直接滚动到目标位置
       if (opts.scrollAnchor) scrollNoteTo(opts.scrollAnchor);
     } else {
-      reloadNote(opts.scrollAnchor);
+      reloadNote(opts.scrollAnchor, opts.keepScroll);
     }
   }
 }
@@ -727,7 +727,7 @@ async function afterAnnotationChange() {
     if (ann) renderAnnThread(ann.thread);
     else closeAnnPopup();
   }
-  reloadNote();
+  reloadNote(null, true);
 }
 
 function closeAnnPopup() {
@@ -816,7 +816,7 @@ async function sendAnnotation() {
       renderAnnThread(latest.thread);
     }
   }
-  reloadNote();
+  reloadNote(null, true);
 }
 
 /// 向返回 SSE 的接口发 POST，逐帧回调。
@@ -1079,7 +1079,11 @@ function submitInput() {
   const command = value.startsWith("/") ? value.slice(1).trim() : "ask " + value;
   cmdInput.value = "";
   hideSuggest();
-  if (command) runCommand(command);
+  if (!command) return;
+  // 提问/核对/总结后保持笔记滚动位置，不跳回开头
+  const first = command.split(/\s+/)[0];
+  const keepScroll = ["ask", "q", "check", "sum"].includes(first);
+  runCommand(command, { keepScroll });
 }
 
 // ===== 文件导入（上传 + 拖拽） =====
