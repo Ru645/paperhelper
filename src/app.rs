@@ -801,7 +801,7 @@ PaperHelper 命令：
         let content = match fmt {
             "md" | "markdown" => export::to_markdown(note),
             "mindmap" | "mm" => export::to_mindmap(note),
-            "html" | "htm" => export::to_html(note, &self.session.conversation),
+            "html" | "htm" => export::to_html(note, &self.session.conversation, &self.session.annotations),
             _ => unreachable!(),
         };
         std::fs::write(&path, content)?;
@@ -977,7 +977,7 @@ PaperHelper 命令：
         }
         self.export_path = Some(export_file.clone());
         if let Some(note) = &self.session.notes {
-            std::fs::write(&export_file, export::render_for(&export_file, note, &self.session.conversation))?;
+            std::fs::write(&export_file, export::render_for(&export_file, note, &self.session.conversation, &self.session.annotations))?;
             outln!(self, "{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
         self.update_completions();
@@ -1227,7 +1227,7 @@ PaperHelper 命令：
         }
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
-                if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
+                if std::fs::write(p, export::render_for(p, note, &self.session.conversation, &self.session.annotations)).is_ok() {
                     let location = block_id_for_hint.and_then(|bid| {
                         note.find_block(bid).map(|b| {
                             let num = if b.number.is_empty() { String::new() } else { format!("{} ", b.number) };
@@ -1392,7 +1392,7 @@ PaperHelper 命令：
         // 自动同步导出（与 ask 相同逻辑）
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
-                if std::fs::write(p, export::render_for(p, note, &self.session.conversation)).is_ok() {
+                if std::fs::write(p, export::render_for(p, note, &self.session.conversation, &self.session.annotations)).is_ok() {
                     outln!(self, "{} 笔记已同步更新到 {}（已插入总结）", "✓".green().bold(), p);
                 }
             }

@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 use crate::conversation::Conversation;
 use crate::notes::{Block, BlockKind, Explanation, Note};
+use crate::session::Annotation;
 
 /// 整棵笔记渲染为 Markdown（根标题 + 逐块递归，追问挂在所属块下）。
 pub fn to_markdown(note: &Note) -> String {
@@ -208,9 +209,9 @@ fn render_explanation_mm(e: &Explanation, depth: usize, s: &mut String) {
 }
 
 /// 按导出路径扩展名选择格式：.html → 自包含 HTML；其余 → Markdown。
-pub fn render_for(path: &str, note: &Note, conv: &Conversation) -> String {
+pub fn render_for(path: &str, note: &Note, conv: &Conversation, annotations: &[Annotation]) -> String {
     if path.to_lowercase().ends_with(".html") {
-        to_html(note, conv)
+        to_html(note, conv, annotations)
     } else {
         to_markdown(note)
     }
@@ -219,24 +220,240 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation) -> String {
 /// 生成自包含 HTML：单文件，CDN 引入 marked + KaTeX 渲染 Markdown 与公式；
 /// 左侧对话树（当前节点高亮），右侧笔记；CDN 不可用时降级显示原文。
 /// 资源加载带 fallback：jsdelivr 失败自动切 npmmirror。
-pub fn to_html(note: &Note, conv: &Conversation) -> String {
-    to_html_with(note, conv, true, &HashSet::new())
+/// `annotations`：批注（引用文字+问答线程）——正文隐藏其问答，改为文字高亮 +
+/// 点击弹出只读小窗口；高亮失败的在文末「批注」列表兜底。
+pub fn to_html(note: &Note, conv: &Conversation, annotations: &[Annotation]) -> String {
+    let hidden = annotation_hidden_ids(annotations, conv);
+    to_html_with(note, conv, true, &hidden, annotations)
 }
 
 /// 只渲染笔记正文、不含左侧对话树（Web 内嵌用，避免与页面自身树重复）。
 /// `hidden` 为批注线程的解释 id 集合：这些问答不在正文内联显示（只在弹窗看）。
 pub fn to_html_bare(note: &Note, conv: &Conversation, hidden: &HashSet<String>) -> String {
-    to_html_with(note, conv, false, hidden)
+    to_html_with(note, conv, false, hidden, &[])
 }
+
+/// 批注线程涉及的所有解释 id（正文隐藏这些问答）。
+fn annotation_hidden_ids(annotations: &[Annotation], conv: &Conversation) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for ann in annotations {
+        let mut stack = vec![ann.root_node_id.clone()];
+        while let Some(id) = stack.pop() {
+            if let Some(n) = conv.nodes.iter().find(|n| n.id == id) {
+                if let Some(e) = &n.explanation_id {
+                    set.insert(e.clone());
+                }
+                for c in conv
+                    .nodes
+                    .iter()
+                    .filter(|c| c.parent.as_deref() == Some(id.as_str()))
+                {
+                    stack.push(c.id.clone());
+                }
+            }
+        }
+    }
+    set
+}
+
+/// 把以 `root` 为根的会话子树转成 JSON（`{question, answer, is_check, children}`）。
+fn thread_json(conv: &Conversation, root: &str) -> serde_json::Value {
+    let Some(n) = conv.nodes.iter().find(|x| x.id == root) else {
+        return serde_json::Value::Null;
+    };
+    let children: Vec<serde_json::Value> = conv
+        .nodes
+        .iter()
+        .filter(|x| x.parent.as_deref() == Some(root))
+        .map(|c| thread_json(conv, &c.id))
+        .collect();
+    serde_json::json!({
+        "question": n.question,
+        "answer": n.answer,
+        "is_check": n.explanation_id.is_none(),
+        "children": children,
+    })
+}
+
+/// 批注相关的 CSS（注入导出 HTML；单独字符串避免 `format!` 花括号转义）。
+const ANN_CSS: &str = r#"
+  main mark.ann-mark { background: #fff3a3; cursor: pointer; padding: 0 1px; border-radius: 2px; }
+  main mark.ann-mark:hover { background: #ffe066; }
+  .ann-popup { position: fixed; z-index: 90; width: 380px; max-height: 70vh; background: #fff; border: 1px solid #ddd; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column; }
+  .ann-popup.hidden { display: none; }
+  .ann-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #ddd; }
+  .ann-head .ann-quote { font-size: 12px; color: #555; background: #fff7cc; padding: 2px 6px; border-radius: 4px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ann-close { margin-left: auto; border: none; background: none; font-size: 18px; cursor: pointer; color: #888; }
+  .ann-thread { overflow-y: auto; padding: 8px 10px; }
+  .ann-node { border-left: 2px solid #dbeafe; padding: 6px 8px; margin: 6px 0; border-radius: 0 6px 6px 0; background: #fafafa; }
+  .ann-node.check { border-left-color: #f59e0b; }
+  .ann-q { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .ann-a { font-size: 13px; line-height: 1.6; color: #333; }
+  .ann-a p { margin: 4px 0; }
+  .ann-a .katex-display { overflow-x: auto; }
+  .ann-fallback { margin-top: 40px; border-top: 1px solid #ddd; padding-top: 16px; }
+  .ann-fallback:empty { display: none; }
+  .ann-fallback h2 { font-size: 18px; }
+  .ann-fallback-item { margin: 12px 0; padding: 8px 12px; background: #fafafa; border-radius: 8px; }
+  .ann-fallback-item .ann-quote { font-size: 12px; color: #555; background: #fff7cc; padding: 2px 6px; border-radius: 4px; display: inline-block; }
+"#;
+
+/// 批注相关的 JS（只读：高亮 + 点击弹窗；注入导出 HTML）。
+const ANN_SCRIPT: &str = r#"
+function renderMd(md) {
+  if (!window.marked) return md;
+  const store = [];
+  const token = (i) => '\u2063M' + i + '\u2063';
+  let src = md.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
+  src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
+  let html = marked.parse(src);
+  html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
+    const entry = store[+i];
+    const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, '').trim();
+    const display = entry[1];
+    if (window.katex) {
+      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false }); } catch (e) {}
+    }
+    const raw = display ? '$$' + tex + '$$' : '$' + tex + '$';
+    return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  });
+  return html;
+}
+function wrapQuote(doc, range, quote, ann) {
+  if (!quote) return false;
+  const walker = doc.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (range.intersectsNode(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  const full = nodes.map((n) => n.nodeValue).join('');
+  const idx = full.indexOf(quote);
+  if (idx < 0) return false;
+  let acc = 0, startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+  for (const n of nodes) {
+    const len = n.nodeValue.length;
+    if (!startNode && idx < acc + len) { startNode = n; startOffset = idx - acc; }
+    if (!endNode && idx + quote.length <= acc + len) { endNode = n; endOffset = idx + quote.length - acc; break; }
+    acc += len;
+  }
+  if (!startNode || !endNode) return false;
+  const r = doc.createRange();
+  r.setStart(startNode, startOffset);
+  r.setEnd(endNode, endOffset);
+  const mark = doc.createElement('mark');
+  mark.className = 'ann-mark';
+  try {
+    r.surroundContents(mark);
+  } catch (e) {
+    try { const frag = r.extractContents(); mark.appendChild(frag); r.insertNode(mark); } catch (e2) { return false; }
+  }
+  mark.onclick = (ev) => { ev.stopPropagation(); showAnnPopup(ann, ev); };
+  return true;
+}
+function applyAnnotations() {
+  const note = document.getElementById('note');
+  if (!note) return;
+  const failed = [];
+  for (const ann of ANNOTATIONS) {
+    const anchor = document.getElementById('blk-' + ann.block_id);
+    if (!anchor) { failed.push(ann); continue; }
+    const anchors = note.querySelectorAll('a[id^="blk-"]');
+    let next = null;
+    for (const a of anchors) {
+      if (a.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_PRECEDING) { next = a; break; }
+    }
+    const range = document.createRange();
+    range.setStartAfter(anchor);
+    if (next) range.setEndBefore(next); else range.setEnd(note, note.childNodes.length);
+    if (!wrapQuote(document, range, ann.quote, ann)) failed.push(ann);
+  }
+  renderFallback(failed);
+}
+function renderThread(container, node, depth) {
+  const div = document.createElement('div');
+  div.className = 'ann-node' + (node.is_check ? ' check' : '');
+  div.style.marginLeft = depth * 10 + 'px';
+  const q = document.createElement('div');
+  q.className = 'ann-q';
+  q.textContent = (node.is_check ? '[核对] ' : '') + node.question;
+  const a = document.createElement('div');
+  a.className = 'ann-a';
+  a.innerHTML = renderMd(node.answer || '');
+  div.appendChild(q);
+  div.appendChild(a);
+  container.appendChild(div);
+  (node.children || []).forEach((c) => renderThread(container, c, depth + 1));
+}
+function showAnnPopup(ann, ev) {
+  const el = document.getElementById('ann-popup');
+  el.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'ann-head';
+  const quote = document.createElement('span');
+  quote.className = 'ann-quote';
+  quote.textContent = ann.quote;
+  const close = document.createElement('button');
+  close.className = 'ann-close';
+  close.textContent = '\u00d7';
+  close.onclick = () => el.classList.add('hidden');
+  head.appendChild(quote);
+  head.appendChild(close);
+  const thread = document.createElement('div');
+  thread.className = 'ann-thread';
+  if (ann.thread) renderThread(thread, ann.thread, 0); else thread.textContent = '（无）';
+  el.appendChild(head);
+  el.appendChild(thread);
+  el.classList.remove('hidden');
+  const x = Math.min(window.innerWidth - 400, ev.clientX);
+  const y = Math.min(window.innerHeight - 220, ev.clientY + 12);
+  el.style.left = Math.max(8, x) + 'px';
+  el.style.top = Math.max(8, y) + 'px';
+}
+function renderFallback(failed) {
+  const sec = document.getElementById('ann-fallback');
+  if (!sec) return;
+  if (!failed.length) { sec.style.display = 'none'; return; }
+  sec.innerHTML = '<h2>批注（未能定位高亮）</h2>';
+  for (const ann of failed) {
+    const div = document.createElement('div');
+    div.className = 'ann-fallback-item';
+    const q = document.createElement('div');
+    q.className = 'ann-quote';
+    q.textContent = '引用：' + ann.quote;
+    div.appendChild(q);
+    const thread = document.createElement('div');
+    thread.className = 'ann-thread';
+    if (ann.thread) renderThread(thread, ann.thread, 0);
+    div.appendChild(thread);
+    sec.appendChild(div);
+  }
+}
+document.addEventListener('click', (e) => {
+  const p = document.getElementById('ann-popup');
+  if (p && !(e.target.closest && e.target.closest('#ann-popup'))) p.classList.add('hidden');
+});
+"#;
 
 fn to_html_with(
     note: &Note,
     conv: &Conversation,
     include_tree: bool,
     hidden: &HashSet<String>,
+    annotations: &[Annotation],
 ) -> String {
     let md = convert_inline_math_delims(&to_markdown_with(note, true, hidden));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
+    let anns: Vec<serde_json::Value> = annotations
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "block_id": a.block_id,
+                "quote": a.quote,
+                "thread": thread_json(conv, &a.root_node_id),
+            })
+        })
+        .collect();
+    let annotations_json = serde_json::to_string(&anns).unwrap_or_else(|_| "[]".to_string());
     let aside = if include_tree {
         format!(
             "  <aside>\n    <h2>对话轨迹</h2>\n    {}\n  </aside>\n",
@@ -278,15 +495,17 @@ fn to_html_with(
   main th {{ background: #f3f4f6; }}
   main pre {{ background: #f3f4f6; padding: 10px; border-radius: 6px; overflow-x: auto; }}
   #fallback {{ display: none; white-space: pre-wrap; font-family: monospace; font-size: 13px; }}
-</style>
+{ann_css}</style>
 </head>
 <body>
 <div class="layout">
 {aside}  <main>
     <div id="note"></div>
     <pre id="fallback"></pre>
+    <section id="ann-fallback" class="ann-fallback"></section>
   </main>
 </div>
+<div id="ann-popup" class="ann-popup hidden"></div>
 <script>
 // 资源加载器：按序尝试多个 CDN（jsdelivr → npmmirror），全部失败走降级
 const CDNS = [
@@ -336,6 +555,8 @@ function loadScripts(paths) {{
   }})), Promise.resolve(true));
 }}
 const MD = {md_json};
+const ANNOTATIONS = {annotations_json};
+{ann_script}
 (async () => {{
   await loadCss(['katex@0.16.9/dist/katex.min.css']);
   await loadScripts([
@@ -343,29 +564,8 @@ const MD = {md_json};
     'katex@0.16.9/dist/katex.min.js'
   ]);
   if (window.marked) {{
-    // 数学公式保护 + 渲染：
-    // marked 会把公式里的 _ ^ \ 当作 Markdown 语法（如下划线配对成 <em>），
-    // 也会把 < 当作 HTML 标签，嵌套追问的引用前缀 > 还会混进公式。
-    // 因此：① 先把 $$...$$ / $...$ 抽成占位符；② 渲染 Markdown；③ 逐个用
-    // KaTeX 渲染回填（渲染前去掉行首的 blockquote 标记）。这样公式内容完全不
-    // 经过 marked，LaTeX 保持原样。
-    const store = [];
-    const token = (i) => '\u2063M' + i + '\u2063';
-    let src = MD.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => {{ store.push([tex, true]); return token(store.length - 1); }});
-    src = src.replace(/\$([^$\n]+?)\$/g, (m, tex) => {{ store.push([tex, false]); return token(store.length - 1); }});
-    let html = marked.parse(src);
-    html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {{
-      const entry = store[+i];
-      const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, '').trim();
-      const display = entry[1];
-      if (window.katex) {{
-        try {{ return katex.renderToString(tex, {{ displayMode: display, throwOnError: false }}); }} catch (e) {{}}
-      }}
-      // 无 KaTeX 时降级：HTML 转义后按源码显示
-      const raw = display ? '$$' + tex + '$$' : '$' + tex + '$';
-      return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }});
-    document.getElementById('note').innerHTML = html;
+    document.getElementById('note').innerHTML = renderMd(MD);
+    applyAnnotations();
   }} else {{
     // CDN 全部不可用时降级为纯文本
     document.getElementById('fallback').style.display = 'block';
@@ -378,7 +578,10 @@ const MD = {md_json};
 "#,
         title = title,
         aside = aside,
-        md_json = md_json
+        md_json = md_json,
+        annotations_json = annotations_json,
+        ann_css = ANN_CSS,
+        ann_script = ANN_SCRIPT
     )
 }
 

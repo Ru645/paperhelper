@@ -925,7 +925,7 @@ mod tests {
             label: "概念X".into(),
         });
         conv.current = Some("n1".into());
-        let html = crate::export::to_html(&note, &conv);
+        let html = crate::export::to_html(&note, &conv, &[]);
         // 结构完整
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("katex"), "应引 KaTeX");
@@ -938,8 +938,8 @@ mod tests {
         // markdown 以 JS 字符串嵌入
         assert!(html.contains("const MD = "));
         // render_for 按扩展名分流
-        assert!(crate::export::render_for("a.html", &note, &conv).contains("<!DOCTYPE"));
-        assert!(crate::export::render_for("a.md", &note, &conv).contains("# T"));
+        assert!(crate::export::render_for("a.html", &note, &conv, &[]).contains("<!DOCTYPE"));
+        assert!(crate::export::render_for("a.md", &note, &conv, &[]).contains("# T"));
     }
 
     #[test]
@@ -950,7 +950,7 @@ mod tests {
         let md = "# T\n## M\n> > $$\n> > S_{\\text{n-gram}}^{\\text{Avg}}(i) = -\\frac{1}{J}\\sum_{j}\\log \\tilde p_{ij}\n> > $$\n";
         let note = parse_markdown_note(md, "raw");
         let conv = crate::conversation::Conversation::default();
-        let html = crate::export::to_html(&note, &conv);
+        let html = crate::export::to_html(&note, &conv, &[]);
         assert!(html.contains("marked.parse(src)"), "应先渲染 markdown");
         assert!(html.contains("katex.renderToString"), "应用 KaTeX 回填公式");
         assert!(html.contains("store.push"), "应抽取公式占位符");
@@ -1023,7 +1023,7 @@ mod tests {
         let md = "# T\n## M\nSome method.\n";
         let note = parse_markdown_note(md, "raw");
         let conv = crate::conversation::Conversation::default();
-        let full = crate::export::to_html(&note, &conv);
+        let full = crate::export::to_html(&note, &conv, &[]);
         let bare = crate::export::to_html_bare(&note, &conv, &std::collections::HashSet::new());
         assert!(full.contains("<aside>"), "完整导出应含对话树侧栏");
         assert!(!bare.contains("<aside>"), "bare 导出不应含树侧栏");
