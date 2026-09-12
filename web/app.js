@@ -269,19 +269,34 @@ function renderConcepts(st) {
 }
 
 let pendingAnchor = null;
+let pendingScrollTop = null;
 
-// iframe 重载完成后，若有待定锚点则滚动定位（等 marked/KaTeX 执行）
+// iframe 重载完成后，若有待定锚点则滚动定位；若需保持滚动位置则恢复（等 marked/KaTeX 执行）
 noteFrame.addEventListener("load", () => {
   if (pendingAnchor !== null) {
     const a = pendingAnchor;
     pendingAnchor = null;
     setTimeout(() => scrollNoteTo(a), 60);
+  } else if (pendingScrollTop !== null) {
+    const y = pendingScrollTop;
+    pendingScrollTop = null;
+    setTimeout(() => {
+      const w = noteFrame.contentWindow;
+      if (w) w.scrollTo(0, y);
+    }, 60);
   }
   onNoteLoaded();
 });
 
-function reloadNote(anchor) {
+/// 重载笔记。`anchor` 非空则定位到某解释；`keepScroll=true` 则保持当前滚动位置。
+function reloadNote(anchor, keepScroll) {
   pendingAnchor = anchor || null;
+  if (keepScroll) {
+    const w = noteFrame.contentWindow;
+    pendingScrollTop = w ? w.scrollY : 0;
+  } else {
+    pendingScrollTop = null;
+  }
   noteFrame.src = "/api/note?format=html&t=" + Date.now();
 }
 
@@ -497,7 +512,7 @@ async function deleteAnnotation(annId) {
   }
   if (currentAnnotation && currentAnnotation.id === annId) closeAnnPopup();
   await refreshState();
-  reloadNote();
+  reloadNote(null, true); // 保持当前滚动位置
 }
 
 // ---- 高亮 ----
