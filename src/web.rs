@@ -62,6 +62,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/kb/concept/delete", post(api_concept_delete))
         .route("/api/annotate", post(api_annotate))
         .route("/api/annotate/reply", post(api_annotate_reply))
+        .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
         .route(
             "/api/upload",
@@ -801,6 +802,23 @@ async fn api_annotate_reply(
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct AnnotationDeleteReq {
+    annotation_id: String,
+}
+
+async fn api_annotation_delete(
+    State(app): State<SharedApp>,
+    Json(req): Json<AnnotationDeleteReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    a.emitter = Emitter::terminal();
+    a.delete_annotation(&req.annotation_id)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let _ = a.auto_persist();
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value> {

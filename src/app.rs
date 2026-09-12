@@ -62,12 +62,13 @@ const COMMANDS: &[&str] = &[
     "budget", "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
 ];
 
-/// `del` 的撤销快照：只保存可恢复的笔记与对话树，不含 stats
+/// `del`/批注删除的撤销快照：保存可恢复的笔记、对话树与批注，不含 stats
 /// （成本是真实发生的，撤销删除不应回退用量统计）。
 #[derive(Clone)]
 struct UndoSnapshot {
     notes: Option<crate::notes::Note>,
     conversation: Conversation,
+    annotations: Vec<Annotation>,
 }
 
 /// 配置键定义表：补全与用法提示的单一来源。
@@ -1317,6 +1318,37 @@ PaperHelper 命令：
         None
     }
 
+    /// 删除整条批注（Web 右键高亮文字）：移除批注条目、其会话子树、笔记中对应解释。
+    /// 入撤销栈，可用 `undo` 恢复。
+    pub fn delete_annotation(&mut self, annotation_id: &str) -> Result<()> {
+        let Some(idx) = self.session.annotations.iter().position(|a| a.id == annotation_id) else {
+            bail!("找不到该批注");
+        };
+        let root = self.session.annotations[idx].root_node_id.clone();
+        self.undo_stack.push(UndoSnapshot {
+            notes: self.session.notes.clone(),
+            conversation: self.session.conversation.clone(),
+            annotations: self.session.annotations.clone(),
+        });
+        if self.undo_stack.len() > 20 {
+            self.undo_stack.remove(0);
+        }
+        let subtree = self.collect_subtree(&root);
+        let expl_ids: Vec<String> = subtree
+            .iter()
+            .filter_map(|(_, n)| n.explanation_id.clone())
+            .collect();
+        if let Some(note) = self.session.notes.as_mut() {
+            for eid in &expl_ids {
+                let _ = note.remove_explanation(eid);
+            }
+        }
+        self.session.conversation.remove_subtree(&root);
+        self.session.annotations.remove(idx);
+        self.update_completions();
+        Ok(())
+    }
+
     /// sum：把当前对话节点子树（含自己）的全部问答概括成"总结"，写入笔记。
     /// 流程：DFS 收集子树 → 预算检查 → LLM 概括（进度条）→ 找到当前节点向上最近
     /// 带解释的祖先（跳过 check）→ 给该 Explanation 写 summary 并折叠（collapsed）
@@ -1453,6 +1485,7 @@ PaperHelper 命令：
         self.undo_stack.push(UndoSnapshot {
             notes: self.session.notes.clone(),
             conversation: self.session.conversation.clone(),
+            annotations: self.session.annotations.clone(),
         });
         if self.undo_stack.len() > 20 {
             self.undo_stack.remove(0);
@@ -1473,7 +1506,7 @@ PaperHelper 命令：
         Ok(())
     }
 
-    /// undo：撤销上一次 `del`（恢复笔记与对话树，不影响用量统计）。
+    /// undo：撤销上一次 `del` 或批注删除（恢复笔记、对话树与批注，不影响用量统计）。
     async fn cmd_undo(&mut self) -> Result<()> {
         let snap = self
             .undo_stack
@@ -1481,6 +1514,7 @@ PaperHelper 命令：
             .ok_or_else(|| anyhow!("没有可撤销的删除操作"))?;
         self.session.notes = snap.notes;
         self.session.conversation = snap.conversation;
+        self.session.annotations = snap.annotations;
         self.update_completions();
         outln!(self, "✓ 已撤销上一次删除");
         Ok(())

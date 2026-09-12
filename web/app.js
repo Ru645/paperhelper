@@ -461,15 +461,43 @@ function onNoteLoaded() {
     doc.__annBound = true;
     doc.addEventListener("mouseup", () => setTimeout(showSelButton, 0));
     doc.addEventListener("click", (e) => {
+      hideCtxMenu();
       const mark = e.target && e.target.closest ? e.target.closest("mark.ann-mark") : null;
       if (mark) {
         e.preventDefault();
         openAnnotationView(mark.dataset.annId);
       }
     });
+    doc.addEventListener("contextmenu", (e) => {
+      const mark = e.target && e.target.closest ? e.target.closest("mark.ann-mark") : null;
+      if (!mark) return;
+      e.preventDefault();
+      const fr = noteFrame.getBoundingClientRect();
+      showAnnMarkMenu(mark.dataset.annId, fr.left + e.clientX, fr.top + e.clientY);
+    });
     doc.addEventListener("scroll", hideSelButton, true);
   }
   applyHighlights();
+}
+
+/// 右键高亮文字：打开 / 删除整条批注。
+function showAnnMarkMenu(annId, x, y) {
+  showMenu(x, y, [
+    { label: "打开批注", fn: () => openAnnotationView(annId) },
+    { label: "删除该批注", danger: true, fn: () => deleteAnnotation(annId) },
+  ]);
+}
+
+async function deleteAnnotation(annId) {
+  if (!confirm("删除该批注及其全部问答？（可用 /undo 撤销）")) return;
+  try {
+    await postJson("/api/annotate/delete", { annotation_id: annId });
+  } catch (e) {
+    appendConsole("❌ 删除批注失败: " + e.message, "err");
+  }
+  if (currentAnnotation && currentAnnotation.id === annId) closeAnnPopup();
+  await refreshState();
+  reloadNote();
 }
 
 // ---- 高亮 ----
