@@ -60,3 +60,17 @@ paperhelper              # 进入 REPL
 - 跨论文知识库 `.paperhelper/knowledge.json`：累积读过论文+学过概念，ask 时按关键词检索注入"相关概念"。
 - token/成本：会话级 + 跨会话累计；预算到上限自动中断。
 - >3秒任务用 indicatif 进度条 + LLM 流式输出实时渲染，Ctrl-C 打断。
+
+## 约定
+
+- **图片素材**：生成的截图等图片统一放项目根的 `screenshots/`，**不要**写到 `~` 或 `/tmp`（snap Chromium 的 `/tmp` 为私有，写不进去）。截图流程示例：
+
+  ```bash
+  ./target/debug/paperhelper web --port 18090 &   # 后台起服务
+  # 载入含笔记的会话，让界面有内容（会话 id 见 .paperhelper/sessions/）
+  curl -s -X POST http://127.0.0.1:18090/api/sessions/load \
+    -H 'Content-Type: application/json' -d '{"id":"<会话id>"}'
+  /snap/bin/chromium --headless --no-sandbox --disable-gpu --hide-scrollbars \
+    --window-size=1440,900 --virtual-time-budget=8000 \
+    --screenshot=screenshots/ui.png http://127.0.0.1:18090/
+  ```

@@ -97,6 +97,8 @@ paperhelper web --port 9000  # 指定端口
 
 ## Web 界面详解
 
+![PaperHelper Web 界面](screenshots/ui.png)
+
 **顶栏**：`＋ 导入` · `导出 ▾`（Markdown / 思维导图 / HTML，浏览器下载）· `撤销` · `帮助` · `配置` · `刷新`，并显示当前模型。
 
 **笔记区**（主区「笔记」标签）：
