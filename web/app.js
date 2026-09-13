@@ -1280,7 +1280,70 @@ async function saveConfig() {
 
 // ===== 事件绑定 =====
 
+// ===== 侧栏：活动栏切换 + 宽度拖拽 =====
+const PANEL_KEY = "ph.panel";
+const WIDTH_KEY = "ph.sidebarWidth";
+
+function setupSidebar() {
+  const acts = document.querySelectorAll("#activitybar .act");
+  const sidebar = $("sidebar");
+  const panels = document.querySelectorAll("#sidebar-panels section[data-panel]");
+  if (!acts.length || !sidebar) return;
+
+  const apply = (name) => {
+    acts.forEach((b) => b.classList.toggle("active", b.dataset.panel === name));
+    panels.forEach((p) => p.classList.toggle("active", p.dataset.panel === name));
+  };
+
+  let current = localStorage.getItem(PANEL_KEY) || "outline";
+  if (![...panels].some((p) => p.dataset.panel === current)) current = "outline";
+  apply(current);
+
+  acts.forEach((b) => {
+    b.onclick = () => {
+      // 再点当前面板 = 收起/展开侧栏（VS Code 行为）
+      if (b.classList.contains("active") && !sidebar.classList.contains("collapsed")) {
+        sidebar.classList.add("collapsed");
+        return;
+      }
+      sidebar.classList.remove("collapsed");
+      current = b.dataset.panel;
+      localStorage.setItem(PANEL_KEY, current);
+      apply(current);
+    };
+  });
+
+  // 宽度拖拽
+  const saved = parseInt(localStorage.getItem(WIDTH_KEY) || "", 10);
+  if (saved >= 180 && saved <= 640) sidebar.style.setProperty("--sidebar-width", saved + "px");
+  const resizer = $("sidebar-resizer");
+  if (!resizer) return;
+  let dragging = false;
+  resizer.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    resizer.classList.add("dragging");
+    resizer.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  resizer.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const left = sidebar.getBoundingClientRect().left;
+    const w = Math.min(640, Math.max(180, e.clientX - left));
+    sidebar.style.setProperty("--sidebar-width", w + "px");
+  });
+  const stopDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    localStorage.setItem(WIDTH_KEY, String(Math.round(sidebar.getBoundingClientRect().width)));
+  };
+  resizer.addEventListener("pointerup", stopDrag);
+  resizer.addEventListener("pointercancel", stopDrag);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  setupSidebar();
+
   document.querySelectorAll(".tab[data-key]").forEach((t) => (t.onclick = () => switchTab(t.dataset.key)));
 
   // 顶栏：导出 / 撤销 / 帮助

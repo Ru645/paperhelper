@@ -29,28 +29,37 @@
 </header>
 
 <div class="layout">
+  <nav id="activitybar">
+    <button class="act active" data-panel="outline" title="笔记结构" aria-label="笔记结构">≡</button>
+    <button class="act" data-panel="sessions" title="会话历史" aria-label="会话历史">⟳</button>
+    <button class="act" data-panel="papers" title="已读论文" aria-label="已读论文">▤</button>
+    <button class="act" data-panel="concepts" title="已学概念" aria-label="已学概念">◈</button>
+  </nav>
   <aside id="sidebar">
-    <section>
+    <div id="sidebar-panels">
+      <section data-panel="outline" class="active">
+        <h3>笔记结构</h3>
+        <ul id="outline" class="outline"><li class="muted">（还没有笔记）</li></ul>
+      </section>
+      <section data-panel="sessions">
+        <h3>会话历史</h3>
+        <ul id="sessions" class="session-list"><li class="muted">（无）</li></ul>
+      </section>
+      <section data-panel="papers">
+        <h3>已读论文</h3>
+        <ul id="papers" class="plain"><li class="muted">（无）</li></ul>
+      </section>
+      <section data-panel="concepts">
+        <h3>已学概念</h3>
+        <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
+      </section>
+    </div>
+    <section id="sidebar-usage">
       <h3>用量</h3>
       <div id="usage" class="usage"></div>
     </section>
-    <section>
-      <h3>笔记结构</h3>
-      <ul id="outline" class="outline"><li class="muted">（还没有笔记）</li></ul>
-    </section>
-    <section>
-      <h3>会话历史</h3>
-      <ul id="sessions" class="session-list"><li class="muted">（无）</li></ul>
-    </section>
-    <section>
-      <h3>已读论文</h3>
-      <ul id="papers" class="plain"><li class="muted">（无）</li></ul>
-    </section>
-    <section>
-      <h3>已学概念</h3>
-      <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
-    </section>
   </aside>
+  <div id="sidebar-resizer" title="拖动调整宽度"></div>
 
   <main id="main">
     <div class="tabs" id="tabs">

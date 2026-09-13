@@ -42,20 +42,52 @@ body {
 /* ===== 布局 ===== */
 .layout { flex: 1; display: flex; min-height: 0; }
 
+/* 活动栏（VS Code 式）：切换侧栏面板 */
+#activitybar {
+  width: 44px; flex-shrink: 0;
+  background: #f4f4f2; border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; align-items: center;
+  padding-top: 6px; gap: 2px;
+}
+#activitybar .act {
+  width: 40px; height: 40px; padding: 0;
+  border: none; border-left: 2px solid transparent; border-radius: 0;
+  background: none; color: var(--muted); font-size: 18px; line-height: 1;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+#activitybar .act:hover { color: #333; background: #e8e8e5; }
+#activitybar .act.active { color: var(--blue); border-left-color: var(--blue); background: var(--blue-light); }
+
 #sidebar {
-  width: 290px;
-  flex-shrink: 0;
+  width: var(--sidebar-width, 290px);
+  flex-shrink: 0; min-width: 0;
   background: var(--panel);
   border-right: 1px solid var(--line);
-  padding: 12px;
-  overflow-y: auto;
+  display: flex; flex-direction: column; overflow: hidden;
 }
-#sidebar section { margin-bottom: 18px; }
+#sidebar.collapsed { display: none; }
+#sidebar.collapsed ~ #sidebar-resizer { display: none; }
+
+/* 可切换面板区（可滚动） */
+#sidebar-panels { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; }
+#sidebar-panels section { display: none; }
+#sidebar-panels section.active { display: block; }
+
+/* 底部常驻用量 */
+#sidebar-usage { flex: none; padding: 10px 12px; border-top: 1px solid var(--line); background: #ececea; }
+
 #sidebar h3 {
   font-size: 13px; color: #555; margin-bottom: 8px;
   display: flex; align-items: center; justify-content: space-between;
 }
 .tree-actions { display: flex; gap: 4px; }
+
+/* 侧栏宽度拖拽条 */
+#sidebar-resizer {
+  width: 4px; flex-shrink: 0; cursor: col-resize;
+  background: transparent; margin-left: -2px; z-index: 5;
+}
+#sidebar-resizer:hover, #sidebar-resizer.dragging { background: var(--blue); }
 
 /* 用量 */
 .usage { font-size: 12px; }
