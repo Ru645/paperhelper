@@ -4,7 +4,7 @@
 
 PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问是树上的一个节点，随时跳回主线或其他分支继续提问；在笔记里**选中文字即可就地提问**，答案钉在原文位置，点击高亮即可回看。
 
-主界面是**浏览器 Web 应用**（`paperhelper web`），也提供功能等价的**命令行界面（CLI）**。
+主界面是**浏览器 Web 应用**（`paperhelper web`），也提供功能等价的**命令行界面（CLI）**。安装与启动见文末[「安装与部署」](#安装与部署)。
 
 ## 核心功能
 
@@ -17,76 +17,12 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 - **导出**：一键下载 Markdown / 思维导图（markmap）/ 自包含 HTML（KaTeX 公式渲染，含只读批注弹窗）
 - **成本可控**：精确统计每次调用的 token 与成本，可设 token 预算，到上限自动中断
 - **会话历史**：自动保存，可列表查看、置顶 / 重命名 / 删除、随时恢复
+- **随时中止**：导入 / 提问 / 批注等长任务，Web 端点「停止」、CLI 按 `Ctrl-C` 立即打断（含卡住的网络请求与 PDF / OCR 子进程）
+- **可排查的错误**：后端错误归类成中文提示（Key 无效 / 端点错 / 限流 / 超上下文…），可展开「详情」查看原始 API Response；配置弹窗内置「测试连接」
+- **运行日志**：启动、HTTP 请求、LLM 调用、上传、命令执行都写入 stderr 与 `.paperhelper/logs/paperhelper.log`
 - **CLI（附带）**：功能等价的全键盘 REPL，适合脚本化与服务器环境
 
-## 快速开始
-
-### 1. 安装依赖
-
-| 依赖 | 用途 | 必需性 |
-|------|------|--------|
-| Rust 1.85+ | 编译 | 必需 |
-| Python 3 + PyMuPDF | PDF 文本层提取 | 必需 |
-| tesseract + 中文语言包 | OCR 扫描件（`ingest --ocr`） | 可选（仅扫描版 PDF 需要） |
-
-```bash
-# ① Rust（需 1.85+）
-rustc --version
-
-# ② PDF 解析（Python 的 PyMuPDF，Rust 通过子进程调用）
-pip install pymupdf
-
-# ③ OCR（可选）
-sudo apt install tesseract-ocr tesseract-ocr-chi-sim    # Debian/Ubuntu
-brew install tesseract tesseract-lang                    # macOS
-# 无 sudo 权限时可用 conda 装用户级：
-# conda install -c conda-forge tesseract tesseract-data-chi_sim
-```
-
-> 没装 tesseract 时只有 `--ocr` 不可用，其余功能不受影响。
-
-### 2. 编译
-
-直接 clone 出来就是一个独立 Cargo crate，正常构建即可。若你的上级目录恰好是 Cargo workspace，则加 `-p paperhelper`：
-
-```bash
-git clone <仓库地址> && cd paperhelper
-cargo build                 # 独立 crate 直接构建
-cargo build -p paperhelper  # 在 workspace 下时加 -p
-cargo test                  # 运行测试（32 个）
-```
-
-编译产物在 `./target/debug/paperhelper`。
-
-### 3. 配置大模型
-
-任选其一（优先级：环境变量 > `.env` > `.paperhelper/config.toml`）。
-
-**方式 1：Web 配置弹窗（推荐）** —— 启动后点顶栏「配置」即可改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存。
-
-**方式 2：`.env`（已被 gitignore，不会泄露）**
-```bash
-cat > .env <<'EOF'
-PAPERHELPER_API_KEY=sk-xxxxxxxx
-PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-PAPERHELPER_MODEL=deepseek-v4-pro
-PAPERHELPER_CONTEXT_LENGTH=64000
-EOF
-```
-
-**方式 3：CLI 交互式**
-```bash
-paperhelper
-> config set llm.api_key sk-xxxxxxxx
-> config set llm.model deepseek-v4-pro
-> config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
-```
-
-> ⚠️ `api_endpoint` 必须是**完整 URL**（含 `/chat/completions`），不是文档里的 `base_url`。
-> DeepSeek：`https://api.deepseek.com/v1/chat/completions`
-> OpenAI：`https://api.openai.com/v1/chat/completions`
-
-### 4. 启动 Web 界面（推荐）
+## Web 界面详解
 
 ```bash
 paperhelper web              # 默认 http://127.0.0.1:8080
@@ -95,11 +31,9 @@ paperhelper web --port 9000  # 指定端口
 
 浏览器打开后即可使用。在运行服务的终端按 `Ctrl-C` 停止服务。
 
-## Web 界面详解
-
 ![PaperHelper Web 界面](screenshots/ui.png)
 
-**顶栏**：`＋ 导入` · `导出 ▾`（Markdown / 思维导图 / HTML，浏览器下载）· `撤销` · `帮助` · `配置` · `刷新`，并显示当前模型。
+**顶栏**：`导出 ▾`（Markdown / 思维导图 / HTML，浏览器下载）· `撤销` · `帮助` · `配置` · `刷新`，并显示当前模型。
 
 **笔记区**（主区「笔记」标签）：
 - **选中提问**：在笔记里选中一段文字 → 浮出「提问」→ 小窗口内输入问题（可切 ask / check）→ 回车发送；回答流式显示，并与所选文字**高亮绑定**，点击高亮可重新打开小窗口。
@@ -115,9 +49,13 @@ paperhelper web --port 9000  # 指定端口
 - **会话历史**：顶部「＋ 新会话」；点条目加载；右键置顶 / 重命名 / 删除。
 - **已读论文 / 已学概念**：点击查看详情；右键置顶 / 删除。
 
-**导入**：点「＋ 导入」选择文件，或直接把 PDF / TXT 拖进窗口；上传后自动执行 ingest（并询问笔记文件名），无需手输命令。解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。
+**导入**：新建会话（或还没有笔记）时，「笔记」页中央显示「＋ 导入论文」按钮，点击选择文件；也可直接把 PDF / TXT 拖进窗口。上传后自动执行导入（并询问笔记文件名），无需手输命令。上传时显示百分比；解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。
 
-实现方式：`paperhelper web` 启动内嵌的 axum 服务，把业务输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。
+**运行中与中止**：长任务（导入 / 提问 / 批注 / 总结）进行时，标签栏右侧显示进度与「⏹ 停止」按钮，点击立即中止（后端打断 + 断开本地流）；批注弹窗右上角也有「停止」。
+
+**错误与测试**：出错时控制台显示**中文摘要**（如「API Key 无效或未授权」「输入超出模型上下文长度」），并给出「查看详情」展开**原始 API Response / 错误链**。配置弹窗的「测试连接」可用当前表单值发一条请求，显示 HTTP 状态、耗时与原始响应，便于保存前排查。
+
+实现方式：`paperhelper web` 启动内嵌的 axum 服务，把业务输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。每个请求、每次 LLM 调用与命令执行都会写入日志（见[「日志与排错」](#日志与排错)）。
 
 ## 命令行界面（CLI）
 
@@ -176,7 +114,7 @@ source ~/.bashrc
 
 ### REPL 操作与补全
 
-- `↑↓` 切换历史命令，`←→` 移动光标，`Ctrl-C` 打断当前任务
+- `↑↓` 切换历史命令，`←→` 移动光标，`Ctrl-C` 立即打断当前任务（网络请求挂起、PDF/OCR 卡住时也有效）
 - Tab 补全：命令名；`ingest/save/load/export` 补全文件路径；`goto` 补全节点编号；`ask/check` 补全笔记编号；`config set` 补全键名与常用值
 
 ## 命令一览（CLI）
@@ -202,7 +140,86 @@ source ~/.bashrc
 | `save [file]` / `load <file>` | 保存 / 加载会话 |
 | `new` | 新建会话 |
 | `config show` / `config set <k> <v>` | 查看 / 设置配置 |
+| `config test` | 用当前配置发一条最小请求，测试端点 / Key / 模型；失败打印原始响应 |
 | `exit` | 退出（自动保存会话，告知恢复方式） |
+
+---
+
+## 安装与部署
+
+### 1. 安装依赖
+
+| 依赖 | 用途 | 必需性 |
+|------|------|--------|
+| Rust 1.85+ | 编译 | 必需 |
+| Python 3 + PyMuPDF | PDF 文本层提取 | 必需 |
+| tesseract + 中文语言包 | OCR 扫描件（`ingest --ocr`） | 可选（仅扫描版 PDF 需要） |
+
+```bash
+# ① Rust（需 1.85+）
+rustc --version
+
+# ② PDF 解析（Python 的 PyMuPDF，Rust 通过子进程调用）
+pip install pymupdf
+
+# ③ OCR（可选）
+sudo apt install tesseract-ocr tesseract-ocr-chi-sim    # Debian/Ubuntu
+brew install tesseract tesseract-lang                    # macOS
+# 无 sudo 权限时可用 conda 装用户级：
+# conda install -c conda-forge tesseract tesseract-data-chi_sim
+```
+
+> 没装 tesseract 时只有 `--ocr` 不可用，其余功能不受影响。
+
+### 2. 编译
+
+直接 clone 出来就是一个独立 Cargo crate，正常构建即可。若你的上级目录恰好是 Cargo workspace，则加 `-p paperhelper`：
+
+```bash
+git clone <仓库地址> && cd paperhelper
+cargo build                 # 独立 crate 直接构建
+cargo build -p paperhelper  # 在 workspace 下时加 -p
+cargo test                  # 运行测试（37 个）
+```
+
+编译产物在 `./target/debug/paperhelper`。
+
+### 3. 配置大模型
+
+任选其一（优先级：环境变量 > `.env` > `.paperhelper/config.toml`）。
+
+**方式 1：Web 配置弹窗（推荐）** —— 启动后点顶栏「配置」即可改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存。
+
+**方式 2：`.env`（已被 gitignore，不会泄露）**
+```bash
+cat > .env <<'EOF'
+PAPERHELPER_API_KEY=sk-xxxxxxxx
+PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
+PAPERHELPER_MODEL=deepseek-v4-pro
+PAPERHELPER_CONTEXT_LENGTH=64000
+EOF
+```
+
+**方式 3：CLI 交互式**
+```bash
+paperhelper
+> config set llm.api_key sk-xxxxxxxx
+> config set llm.model deepseek-v4-pro
+> config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
+```
+
+> ⚠️ `api_endpoint` 必须是**完整 URL**（含 `/chat/completions`），不是文档里的 `base_url`。
+> DeepSeek：`https://api.deepseek.com/v1/chat/completions`
+> OpenAI：`https://api.openai.com/v1/chat/completions`
+
+### 4. 启动
+
+```bash
+paperhelper web              # Web 界面（推荐，默认 http://127.0.0.1:8080）
+paperhelper                  # CLI REPL
+```
+
+在运行 Web 服务的终端按 `Ctrl-C` 停止服务；CLI 下 `Ctrl-C` 是打断当前任务。
 
 ## 配置项
 
@@ -230,6 +247,8 @@ source ~/.bashrc
 │   ├── ask.txt          # ask/check 的 system prompt
 │   └── note.txt         # 笔记生成模板（{raw_text} 为论文占位符）
 ├── uploads/             # Web 端上传的论文文件
+├── logs/                # 运行日志（超过 5MB 轮转为 paperhelper.log.1）
+│   └── paperhelper.log
 └── sessions/            # 会话存档（文件名 = 会话编号 = 首次保存时间戳）
     ├── 20260909_021633.json
     └── 20260909_033219.json
@@ -237,7 +256,18 @@ source ~/.bashrc
 
 所有文件已被 `.gitignore` 忽略，不会泄露。
 
-### 自定义提示词与补全预设
+## 日志与排错
+
+- **日志**：启动横幅（cwd / 数据目录 / 端点 / 模型 / Key 脱敏 / 端口）、每个 HTTP 请求（方法 / 路径 / 状态 / 耗时）、每次 LLM 调用（模型 / 消息数 / 耗时 / token / 重试）、命令执行、上传、PDF/OCR 子进程都会写入 **stderr 与 `.paperhelper/logs/paperhelper.log`**。级别用环境变量 `PAPERHELPER_LOG` 控制（`error`/`warn`/`info`/`debug`，默认 `info`）：
+  ```bash
+  PAPERHELPER_LOG=debug paperhelper web   # CLI 同理
+  tail -f .paperhelper/logs/paperhelper.log
+  ```
+- **测试连接**：CLI `config test`，或 Web「配置 → 测试连接」，显示 HTTP 状态 / 耗时 / 原始响应。
+- **错误详情**：Web 控制台里错误显示中文摘要，可展开「详情」看完整错误链与**原始 API Response**；CLI 直接打印 `{e:#}` 错误链。
+- **常见错误对照**：`401/403` → Key 无效/无权限；`404` → 端点路径不对（需含 `/chat/completions`）；`429` → 限流或额度不足；`400 + context` → 超出上下文；连接失败 → 网络/代理问题；上传失败/`413` → 文件超过 200MB 上限。
+
+## 自定义提示词与补全预设
 
 - **提示词**：直接编辑 `.paperhelper/prompts/ask.txt` 和 `note.txt`。`note.txt` 中 `{raw_text}` 会被替换为论文全文。改完重启生效；删除文件则恢复内置默认。
 - **补全预设**：`config.toml` 的 `[presets]` 节可增删 `config set llm.model` / `llm.api_endpoint` 的 Tab 补全候选：
@@ -248,22 +278,26 @@ models = ["deepseek-v4-pro", "deepseek-v4-flash", "gpt-4o-mini"]
 endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai.com/v1/chat/completions"]
 ```
 
+---
+
 ## 技术架构
 
 - **Rust 主控**：PDF 解析、笔记树、对话树、编号、定位、导出、统计——全部 Rust 确定性逻辑
 - **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名、生成总结
 - **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，`sum` 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **文本锚点批注**：批注记录 `block_id + 选中文字`，渲染时按文本引用定位并高亮，点击可重开弹窗
-- **流式输出 + 进度**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
+- **流式输出 + 进度**：LLM 输出实时渲染，耗时任务显示进度条与实时字数/耗时
+- **可中止**：`interrupt` 全局信号 + `tokio::select!`——LLM 的发送/读取、重试等待、PDF/OCR 子进程（`kill_on_drop`）都能被 `Ctrl-C` / Web「停止」立即打断
 - **Web / CLI 双前端**：业务输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
-- **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断
+- **错误归类 + 日志**：HTTP/网络错误映射成中文摘要与排查建议（原始响应进错误链与日志）；`src/logging.rs` 轻量日志写 stderr 与 `.paperhelper/logs/`
+- **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断、上传流式写盘并限 200MB
 - **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
 
 ## 开发
 
 ```bash
 cargo build                 # 构建
-cargo test                  # 32 个单元测试
+cargo test                  # 37 个单元测试
 cargo build --release       # 发布构建
 ```
 
