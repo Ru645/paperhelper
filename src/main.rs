@@ -15,6 +15,7 @@ mod export;
 mod interrupt;
 mod knowledge;
 mod llm;
+mod logging;
 mod notes;
 mod output;
 mod paths;
@@ -44,12 +45,33 @@ complete -F _paperhelper paperhelper
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::init();
     let config = config::Config::load()?;
     let kb = knowledge::KnowledgeBase::load()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()?;
     let mut app = app::App::new(config, kb, client);
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    logging::info(format!(
+        "PaperHelper v{} 启动 | cwd={} | 数据目录={} | 日志={}",
+        env!("CARGO_PKG_VERSION"),
+        cwd,
+        paths::data_dir().display(),
+        logging::log_path().display(),
+    ));
+    logging::info(format!(
+        "LLM 配置：endpoint={} | model={} | key={} | context={} | thinking={} | budget={}",
+        app.config.llm.api_endpoint,
+        app.config.llm.model,
+        app::mask_key(&app.config.llm.api_key),
+        app.config.llm.context_length,
+        app.config.llm.thinking_mode,
+        app.config.budget.token_budget,
+    ));
 
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();

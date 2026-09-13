@@ -9,6 +9,8 @@ const noteFrame = $("note-frame");
 let running = false;
 let streamSpan = null;      // 当前流式 token 的容器
 let lastState = null;       // 最近一次 /api/state 快照
+let currentAbort = null;    // 当前 /api/run 的 AbortController
+let annAbort = null;        // 当前批注请求的 AbortController
 const dynamicTabs = new Map(); // key -> { btn, pane }
 // 批注（选中文字提问）
 let annotationsCache = [];
@@ -64,6 +66,7 @@ function appendToken(t) {
 let progressLabel = "";
 let progressStart = 0;
 let progressChars = 0;
+let progressUploadPct = -1;  // 上传百分比（0~1），-1 表示不显示
 let progressTimer = null;
 
 function updateProgressText() {
@@ -71,7 +74,8 @@ function updateProgressText() {
   if (!el || !progressLabel) return;
   const secs = Math.round((Date.now() - progressStart) / 1000);
   let meta = secs + "s";
-  if (progressChars > 0) meta = progressChars.toLocaleString() + " 字 · " + meta;
+  if (progressUploadPct >= 0) meta = Math.round(progressUploadPct * 100) + "% · " + meta;
+  else if (progressChars > 0) meta = progressChars.toLocaleString() + " 字 · " + meta;
   el.innerHTML = `<span class="spin"></span><span>${esc(progressLabel)}</span><b class="meta">${meta}</b>`;
 }
 
@@ -82,6 +86,7 @@ function setProgress(msg) {
     progressLabel = msg;
     progressStart = Date.now();
     progressChars = 0;
+    progressUploadPct = -1;
   }
   $("progress").classList.remove("hidden");
   $("progress-bar").classList.remove("hidden");
@@ -89,9 +94,16 @@ function setProgress(msg) {
   if (!progressTimer) progressTimer = setInterval(updateProgressText, 400);
 }
 
+/// 上传百分比（0~1），不重置已用时间。
+function setUploadPct(p) {
+  progressUploadPct = p;
+  updateProgressText();
+}
+
 function stopProgress() {
   progressLabel = "";
   progressChars = 0;
+  progressUploadPct = -1;
   $("progress").classList.add("hidden");
   $("progress-bar").classList.add("hidden");
   if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
@@ -100,6 +112,7 @@ function stopProgress() {
 function setRunning(v) {
   running = v;
   if (!v) setProgress("");
+  $("btn-stop").classList.toggle("hidden", !v);
 }
 
 // ===== 标签页 =====
@@ -157,10 +170,50 @@ function handleFrame(frame) {
     case "token": appendToken(text); break;
     case "progress": setProgress(text); break;
     case "progress_done": setProgress(""); break;
-    case "error": appendConsole("❌ " + text, "err"); switchTab("console"); break;
+    case "aborted": appendConsole("⏹ 已中止", "warn"); setProgress(""); break;
+    case "error": renderError(text); break;
     case "done": appendConsole("✓ 完成", "ok"); break;
     default: if (text) appendConsole(text);
   }
+}
+
+/// 从 error 事件数据里取出 {summary, detail}（兼容对象或字符串）。
+function parseError(data) {
+  let obj = data;
+  if (typeof obj === "string") {
+    try { obj = JSON.parse(obj); } catch (e) { obj = null; }
+  }
+  if (obj && typeof obj === "object" && obj.summary) {
+    return { summary: String(obj.summary), detail: String(obj.detail || "") };
+  }
+  return { summary: typeof data === "string" ? data : JSON.stringify(data), detail: "" };
+}
+
+/// 展示错误：中文摘要 + 可展开的「详情」（原始 API Response / 错误链）。
+function renderError(data) {
+  const { summary, detail } = parseError(data);
+  appendConsole("❌ " + summary, "err");
+  if (detail && detail !== summary) {
+    const det = document.createElement("details");
+    det.className = "err-detail";
+    const sum = document.createElement("summary");
+    sum.textContent = "查看详情（原始响应 / 错误链）";
+    const pre = document.createElement("pre");
+    pre.textContent = detail;
+    det.appendChild(sum);
+    det.appendChild(pre);
+    consoleEl.appendChild(det);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+  switchTab("console");
+}
+
+/// 请求中止当前任务：通知后端打断 + 断开本地 SSE 流（立即恢复 UI）。
+async function stopCurrent() {
+  appendConsole("⏹ 正在中止…", "warn");
+  try { await fetch("/api/interrupt", { method: "POST" }); } catch (e) { /* 忽略 */ }
+  if (currentAbort) { try { currentAbort.abort(); } catch (e) { /* 忽略 */ } }
+  if (annAbort) { try { annAbort.abort(); } catch (e) { /* 忽略 */ } }
 }
 
 async function runCommand(command, opts = {}) {
@@ -169,16 +222,18 @@ async function runCommand(command, opts = {}) {
   setRunning(true);
   appendConsole("> " + command, "ok");
   // 不自动跳控制台；仅出错时（handleFrame 的 error）切过去
+  const controller = new AbortController();
+  currentAbort = controller;
   try {
     const res = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ command, export: opts.export || null }),
+      signal: controller.signal,
     });
     if (!res.ok || !res.body) {
       appendConsole("❌ 请求失败: HTTP " + res.status, "err");
       switchTab("console");
-      setRunning(false);
       return;
     }
     const reader = res.body.getReader();
@@ -196,9 +251,14 @@ async function runCommand(command, opts = {}) {
       }
     }
   } catch (e) {
-    appendConsole("❌ 连接中断: " + e, "err");
-    switchTab("console");
+    if (e && e.name === "AbortError") {
+      appendConsole("⏹ 已中止", "warn");
+    } else {
+      appendConsole("❌ 连接中断: " + e, "err");
+      switchTab("console");
+    }
   } finally {
+    if (currentAbort === controller) currentAbort = null;
     setRunning(false);
     await refreshState();
     if (opts.skipReload) {
@@ -220,6 +280,7 @@ async function refreshState() {
     renderUsage(st);
     renderPapers(st);
     renderConcepts(st);
+    renderNoteEmpty(st);
   } catch (e) {
     console.error(e);
   }
@@ -227,6 +288,15 @@ async function refreshState() {
   await refreshAnnotations();
   renderOutline(lastState);
   applyHighlights();
+}
+
+/// 无笔记时隐藏 iframe，显示居中的导入入口（导入只在新笔记时需要）。
+function renderNoteEmpty(st) {
+  const empty = $("note-empty");
+  if (!empty) return;
+  const has = !!(st && st.has_note);
+  empty.classList.toggle("hidden", has);
+  noteFrame.classList.toggle("hidden", !has);
 }
 
 function renderModel(st) {
@@ -893,11 +963,19 @@ async function sendAnnotation() {
     body = { node_id: nodeId, question: q, mode: annMode };
   }
   let streamed = "";
+  const controller = new AbortController();
+  annAbort = controller;
+  $("ann-stop").classList.remove("hidden");
   try {
     await postSse(url, body, ({ name, text }) => {
       if (name === "error") {
-        appendConsole("❌ " + text, "err");
-        ansEl.textContent = "（出错：" + text + "）";
+        const { summary, detail } = parseError(text);
+        appendConsole("❌ " + summary, "err");
+        ansEl.textContent = "（出错：" + summary + "）";
+        if (detail) appendConsole("详情：\n" + detail);
+      } else if (name === "aborted") {
+        appendConsole("⏹ 已中止", "warn");
+        ansEl.textContent = "（已中止）";
       } else if (name === "token") {
         streamed += text;
         ansEl.textContent = streamed;
@@ -911,11 +989,18 @@ async function sendAnnotation() {
       } else if (name === "progress_done") {
         $("ann-progress").textContent = "";
       }
-    });
+    }, { signal: controller.signal });
   } catch (e) {
-    appendConsole("❌ " + e, "err");
-    ansEl.textContent = "（出错：" + e + "）";
+    if (e && e.name === "AbortError") {
+      appendConsole("⏹ 已中止", "warn");
+      ansEl.textContent = "（已中止）";
+    } else {
+      appendConsole("❌ " + e, "err");
+      ansEl.textContent = "（出错：" + e + "）";
+    }
   }
+  if (annAbort === controller) annAbort = null;
+  $("ann-stop").classList.add("hidden");
   $("ann-send").disabled = false;
   $("ann-progress").textContent = "";
   await refreshState();
@@ -939,11 +1024,12 @@ async function sendAnnotation() {
 }
 
 /// 向返回 SSE 的接口发 POST，逐帧回调。
-async function postSse(url, body, onEvent) {
+async function postSse(url, body, onEvent, opts = {}) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: opts.signal,
   });
   if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
   const reader = res.body.getReader();
@@ -1185,6 +1271,38 @@ function scrollNoteToBlock(blockId) {
 // ===== 文件导入（上传 + 拖拽） =====
 
 /// 上传文件到服务器，再按类型执行 ingest。
+/// 用 XHR 上传（fetch 无法获取上传进度），返回解析后的 JSON。
+function uploadFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText || "{}"));
+        } catch (e) {
+          reject(new Error("服务器响应无法解析"));
+        }
+        return;
+      }
+      let msg = xhr.responseText || ("HTTP " + xhr.status);
+      try {
+        const o = JSON.parse(xhr.responseText || "{}");
+        if (o && o.error) msg = o.error;
+      } catch (e) { /* 非 JSON，保留原文 */ }
+      if (xhr.status === 413 && !msg) msg = "文件超过服务器大小上限";
+      reject(new Error(msg));
+    };
+    xhr.onerror = () => reject(new Error("上传中断（网络问题，或文件超过服务器上限）"));
+    const fd = new FormData();
+    fd.append("file", file);
+    xhr.send(fd);
+  });
+}
+
 async function importFile(file) {
   if (!file) return;
   if (running) { alert("有任务正在运行，请稍后再导入。"); return; }
@@ -1198,23 +1316,16 @@ async function importFile(file) {
   switchTab("console");
   appendConsole("> 导入文件: " + file.name);
   try {
-    const fd = new FormData();
-    fd.append("file", file);
-    const res = await fetch("/api/upload", { method: "POST", body: fd });
-    if (!res.ok) {
-      appendConsole("❌ 上传失败: " + (await res.text()), "err");
-      setProgress("");
-      return;
-    }
-    const j = await res.json();
+    const j = await uploadFile(file, (p) => setUploadPct(p));
     setProgress("");
     // .txt/.md 走 --text（跳过 PDF 解析），其余按 PDF 处理
     const isText = /\.(txt|md|markdown)$/i.test(file.name);
     const cmd = (isText ? "ingest --text " : "ingest ") + shellQuote(j.path);
     await runCommand(cmd, { export: exportName });
   } catch (e) {
-    appendConsole("❌ 导入失败: " + e, "err");
+    appendConsole("❌ 上传失败: " + e.message, "err");
     setProgress("");
+    switchTab("console");
   }
 }
 
@@ -1239,6 +1350,7 @@ async function openConfig() {
     $("cfg-budget").value = c.budget.token_budget;
     $("cfg-status").textContent = "";
     $("cfg-status").className = "status";
+    $("cfg-test-result").classList.add("hidden");
     $("config-modal").classList.remove("hidden");
   } catch (e) {
     alert("读取配置失败: " + e);
@@ -1275,6 +1387,52 @@ async function saveConfig() {
   } catch (e) {
     status.textContent = "❌ " + e.message;
     status.className = "status err";
+  }
+}
+
+/// 测试当前表单里的 LLM 配置（保存前也可测），展示耗时/状态/原始响应。
+async function testConfig() {
+  const result = $("cfg-test-result");
+  result.classList.remove("hidden");
+  result.className = "test-result";
+  result.textContent = "测试中…";
+  try {
+    const res = await fetch("/api/config/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        endpoint: $("cfg-endpoint").value.trim(),
+        model: $("cfg-model").value.trim(),
+        api_key: $("cfg-key").value.trim(),
+      }),
+    });
+    const r = await res.json();
+    result.innerHTML = "";
+    if (r.ok) {
+      result.className = "test-result ok";
+      result.textContent =
+        `✓ 连接成功 · HTTP ${r.status} · ${r.latency_ms}ms · 模型 ${r.model}` +
+        ` · 回复「${r.reply}」· tokens ${r.input_tokens}/${r.output_tokens}`;
+    } else {
+      result.className = "test-result err";
+      const head = document.createElement("div");
+      head.textContent =
+        `✗ 连接失败 · ${r.status ? "HTTP " + r.status : "网络错误"} · ${r.latency_ms}ms`;
+      result.appendChild(head);
+      if (r.raw) {
+        const det = document.createElement("details");
+        const sum = document.createElement("summary");
+        sum.textContent = "查看原始响应";
+        const pre = document.createElement("pre");
+        pre.textContent = r.raw;
+        det.appendChild(sum);
+        det.appendChild(pre);
+        result.appendChild(det);
+      }
+    }
+  } catch (e) {
+    result.className = "test-result err";
+    result.textContent = "❌ 测试请求失败: " + e.message;
   }
 }
 
@@ -1344,6 +1502,10 @@ function setupSidebar() {
 document.addEventListener("DOMContentLoaded", () => {
   setupSidebar();
 
+  // 中止：进度条旁的停止按钮 / 批注弹窗停止按钮（等同 Ctrl-C）
+  $("btn-stop").onclick = stopCurrent;
+  $("ann-stop").onclick = stopCurrent;
+
   document.querySelectorAll(".tab[data-key]").forEach((t) => (t.onclick = () => switchTab(t.dataset.key)));
 
   // 顶栏：导出 / 撤销 / 帮助
@@ -1365,7 +1527,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // 文件导入：按钮 + 拖拽
-  $("btn-upload").onclick = () => $("file-input").click();
+  $("btn-import").onclick = () => $("file-input").click();
   $("file-input").onchange = (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = "";
@@ -1410,6 +1572,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("btn-config").onclick = openConfig;
   $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
+  $("btn-config-test").onclick = testConfig;
   $("btn-config-save").onclick = saveConfig;
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });

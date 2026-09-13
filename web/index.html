@@ -11,7 +11,6 @@
   <div class="brand">PaperHelper <span class="sub">论文学习助手</span></div>
   <div class="model" id="model"></div>
   <div class="actions">
-    <button id="btn-upload" class="ghost" title="导入论文文件（PDF/TXT）">＋ 导入</button>
     <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
     <div class="dropdown">
       <button id="btn-export" class="ghost">导出 ▾</button>
@@ -67,12 +66,20 @@
       <button class="tab" data-key="console">控制台</button>
       <span class="spacer" id="tab-spacer"></span>
       <span id="progress" class="progress hidden"></span>
+      <button id="btn-stop" class="stop-btn hidden" title="中止当前任务（等同 Ctrl-C）">⏹ 停止</button>
     </div>
     <div id="progress-bar" class="progress-bar hidden"><div class="progress-bar-fill"></div></div>
 
     <div class="panes" id="panes">
       <div id="pane-note" class="pane active" data-key="note">
         <iframe id="note-frame" src="/api/note?format=html" title="笔记"></iframe>
+        <div id="note-empty" class="note-empty hidden">
+          <div class="ne-icon">▤</div>
+          <h2>还没有笔记</h2>
+          <p>导入一篇论文（PDF / TXT），自动生成结构化笔记</p>
+          <button id="btn-import" class="primary">＋ 导入论文</button>
+          <p class="ne-hint">也可以直接把文件拖进窗口</p>
+        </div>
       </div>
       <div id="pane-console" class="pane" data-key="console">
         <pre id="console"></pre>
@@ -94,6 +101,7 @@
     <span class="ann-quote" id="ann-quote"></span>
     <span class="ann-spacer"></span>
     <span class="ann-progress" id="ann-progress"></span>
+    <button id="ann-stop" class="mini ghost hidden" title="中止当前提问">停止</button>
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>
   <div class="ann-thread" id="ann-thread"></div>
@@ -117,8 +125,10 @@
     <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
     <div class="modal-actions">
       <button id="btn-config-cancel" class="ghost">取消</button>
+      <button id="btn-config-test" class="ghost">测试连接</button>
       <button id="btn-config-save" class="primary">保存</button>
     </div>
+    <div id="cfg-test-result" class="test-result hidden"></div>
     <p id="cfg-status" class="status"></p>
   </div>
 </div>
@@ -127,7 +137,7 @@
   <div class="modal-box">
     <h2>使用帮助</h2>
     <ul class="help-list">
-      <li><b>导入</b>：点「＋ 导入」选择 PDF/TXT，或直接把文件拖进窗口。</li>
+      <li><b>导入</b>：在还没有笔记的「笔记」页点「＋ 导入论文」，或直接把 PDF/TXT 拖进窗口。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>

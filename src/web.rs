@@ -16,8 +16,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -32,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::App;
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, paths, session};
+use crate::{export, llm, logging, paths, session};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -48,6 +49,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/note", get(api_note))
         .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
+        .route("/api/config/test", post(api_config_test))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
         .route("/api/sessions/save", post(api_session_save))
@@ -67,9 +69,29 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/annotations", get(api_annotations))
         .route(
             "/api/upload",
-            post(api_upload).layer(DefaultBodyLimit::max(200 * 1024 * 1024)),
+            post(api_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
         )
+        .layer(middleware::from_fn(log_requests))
         .with_state(app)
+}
+
+/// 上传大小上限（200MB，与前端提示一致）。
+const MAX_UPLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+/// 每个请求记一条日志：方法、路径、状态码、耗时。
+async fn log_requests(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let t0 = std::time::Instant::now();
+    let resp = next.run(req).await;
+    logging::info(format!(
+        "HTTP {} {} → {}（{:.0}ms）",
+        method,
+        path,
+        resp.status().as_u16(),
+        t0.elapsed().as_millis()
+    ));
+    resp
 }
 
 /// 启动 Web 服务（仅监听 127.0.0.1，本机使用）。
@@ -79,14 +101,13 @@ pub async fn serve(app: App, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("PaperHelper Web 已启动: http://{addr}");
     println!("（Ctrl-C 停止服务）");
+    logging::info(format!("Web 服务监听 http://{addr}（数据目录 {}）", paths::data_dir().display()));
 
     // web 模式不安装 CLI 的 REPL 打断器，这里自行监听 Ctrl-C 并终止整个进程。
     // 直接 exit 以确保即使有浏览器 SSE 长连接也能立即退出（不做 graceful 等待）。
     tokio::spawn(async {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
+        if tokio::signal::ctrl_c().await.is_ok() {
+            logging::warn("收到 Ctrl-C，停止 Web 服务");
             eprintln!("\n[收到 Ctrl-C，停止服务]");
             interrupt::request(); // 若有在途任务，先请求中止
             std::process::exit(0);
@@ -157,15 +178,13 @@ async fn api_run(
             first,
             "ingest" | "pdf" | "ask" | "q" | "check" | "sum" | "del" | "rm" | "undo"
         );
-        match guard.run_command(&req.command).await {
-            Ok(()) => {
-                if mutating {
-                    let _ = guard.auto_persist();
-                }
-                guard.emitter.done();
-            }
-            Err(e) => guard.emitter.error(format!("{e:#}")),
+        logging::info(format!("执行命令: {}", req.command));
+        let t0 = std::time::Instant::now();
+        let result = guard.run_command(&req.command).await;
+        if result.is_ok() && mutating {
+            let _ = guard.auto_persist();
         }
+        emit_result(&guard.emitter, result, &format!("命令 `{}`", req.command), t0);
         // 关键：恢复为终端输出器，丢弃 SSE sender，让接收端在 done 后正常结束流
         guard.emitter = Emitter::terminal();
     });
@@ -175,7 +194,12 @@ async fn api_run(
 }
 
 /// 把内部输出事件转成 SSE（data 用 JSON 字符串编码，避免换行破坏协议）。
+/// 错误事件发结构化 JSON 对象 `{summary, detail}`，前端可展示摘要+原始详情。
 fn to_sse(ev: OutEvent) -> SseEvent {
+    if let OutEvent::Error { summary, detail } = ev {
+        let obj = serde_json::json!({ "summary": summary, "detail": detail });
+        return SseEvent::default().event("error").data(obj.to_string());
+    }
     let (name, data) = match ev {
         OutEvent::Stdout(s) => ("stdout", s),
         OutEvent::Stderr(s) => ("stderr", s),
@@ -183,10 +207,32 @@ fn to_sse(ev: OutEvent) -> SseEvent {
         OutEvent::Progress(s) => ("progress", s),
         OutEvent::ProgressDone => ("progress_done", String::new()),
         OutEvent::Done => ("done", String::new()),
-        OutEvent::Error(s) => ("error", s),
+        OutEvent::Aborted => ("aborted", String::new()),
+        OutEvent::Error { .. } => unreachable!("错误事件已在上方处理"),
     };
     let data = serde_json::to_string(&data).unwrap_or_else(|_| "\"\"".to_string());
     SseEvent::default().event(name).data(data)
+}
+
+/// 统一处理命令结果 → SSE：成功 done、用户中止 aborted、其他错误 error{摘要,详情}。
+fn emit_result(emitter: &Emitter, result: anyhow::Result<()>, what: &str, t0: std::time::Instant) {
+    match result {
+        Ok(()) => {
+            logging::info(format!("{what} 完成（{:.1}s）", t0.elapsed().as_secs_f64()));
+            emitter.done();
+        }
+        Err(e) => {
+            logging::error(format!(
+                "{what} 失败（{:.1}s）：{e:#}",
+                t0.elapsed().as_secs_f64()
+            ));
+            if llm::is_interrupted_error(&e) || interrupt::is_interrupted() {
+                emitter.aborted();
+            } else {
+                emitter.error(format!("{e}"), format!("{e:#}"));
+            }
+        }
+    }
 }
 
 async fn api_interrupt() -> Json<serde_json::Value> {
@@ -310,7 +356,7 @@ struct NoteQuery {
 async fn api_note(State(app): State<SharedApp>, Query(q): Query<NoteQuery>) -> Response {
     let a = app.lock().await;
     let Some(note) = &a.session.notes else {
-        return (StatusCode::NOT_FOUND, "还没有笔记，请先 ingest 一篇论文").into_response();
+        return (StatusCode::NOT_FOUND, "还没有笔记，请先导入一篇论文").into_response();
     };
     let want_md = matches!(q.format.as_deref(), Some("md") | Some("markdown"));
     if want_md {
@@ -484,6 +530,41 @@ async fn api_config_set(
         .save()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize, Default)]
+struct ConfigTestReq {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// 测试 LLM 配置：可带未保存的表单值覆盖，返回结构化结果与原始响应。
+/// 先在锁内克隆配置/客户端，网络请求在锁外执行，避免阻塞其它接口。
+async fn api_config_test(
+    State(app): State<SharedApp>,
+    Json(req): Json<ConfigTestReq>,
+) -> Json<serde_json::Value> {
+    let (client, mut cfg) = {
+        let a = app.lock().await;
+        (a.client.clone(), a.config.llm.clone())
+    };
+    if let Some(ep) = req.endpoint.filter(|s| !s.trim().is_empty()) {
+        cfg.api_endpoint = ep.trim().to_string();
+    }
+    if let Some(m) = req.model.filter(|s| !s.trim().is_empty()) {
+        cfg.model = m.trim().to_string();
+    }
+    if let Some(k) = req.api_key.filter(|s| !s.trim().is_empty()) {
+        cfg.api_key = k.trim().to_string();
+    }
+    let result = llm::test(&client, &cfg).await;
+    Json(serde_json::to_value(result).unwrap_or_else(|_| {
+        json!({ "ok": false, "status": 0, "latency_ms": 0, "model": "", "reply": "", "input_tokens": 0, "output_tokens": 0, "raw": "结果序列化失败" })
+    }))
 }
 
 // ===== 会话历史 =====
@@ -853,16 +934,20 @@ async fn api_annotate(
         let mut guard = app2.lock().await;
         guard.emitter = Emitter::channel(tx);
         let is_check = matches!(req.mode.as_deref(), Some("check"));
-        match guard
+        let t0 = std::time::Instant::now();
+        let result = guard
             .annotate(&req.block_id, &req.quote, &req.question, is_check)
             .await
-        {
-            Ok(_) => {
-                let _ = guard.auto_persist();
-                guard.emitter.done();
-            }
-            Err(e) => guard.emitter.error(format!("{e:#}")),
+            .map(|_| ());
+        if result.is_ok() {
+            let _ = guard.auto_persist();
         }
+        emit_result(
+            &guard.emitter,
+            result,
+            &format!("批注提问「{}」", req.question),
+            t0,
+        );
         guard.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
@@ -887,16 +972,20 @@ async fn api_annotate_reply(
         let mut guard = app2.lock().await;
         guard.emitter = Emitter::channel(tx);
         let is_check = matches!(req.mode.as_deref(), Some("check"));
-        match guard
+        let t0 = std::time::Instant::now();
+        let result = guard
             .annotate_reply(&req.node_id, &req.question, is_check)
             .await
-        {
-            Ok(_) => {
-                let _ = guard.auto_persist();
-                guard.emitter.done();
-            }
-            Err(e) => guard.emitter.error(format!("{e:#}")),
+            .map(|_| ());
+        if result.is_ok() {
+            let _ = guard.auto_persist();
         }
+        emit_result(
+            &guard.emitter,
+            result,
+            &format!("批注追问「{}」", req.question),
+            t0,
+        );
         guard.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
@@ -996,39 +1085,78 @@ fn build_thread(
 
 // ===== 文件上传（Web 端导入论文文件） =====
 
+/// 上传失败统一返回 JSON `{error}`，前端直接展示中文原因。
+fn upload_err(
+    code: StatusCode,
+    msg: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (code, Json(json!({ "error": msg.into() })))
+}
+
+/// 上传：**流式写盘**（不再整文件读进内存，避免大文件 OOM/静默失败），
+/// 超过 `MAX_UPLOAD_BYTES` 时删除半成品并返回明确中文错误。
 async fn api_upload(
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    while let Some(field) = multipart
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取上传失败: {e}")))?
+        .map_err(|e| upload_err(StatusCode::BAD_REQUEST, format!("读取上传失败（连接可能中断）: {e}")))?
     {
-        let fname = field.name().map(|s| s.to_string());
-        if fname.as_deref() != Some("file") {
+        if field.name() != Some("file") {
             continue;
         }
         let filename = field.file_name().unwrap_or("upload.pdf").to_string();
-        let data = field
-            .bytes()
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取文件内容失败: {e}")))?;
-        if data.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "文件为空".to_string()));
-        }
-        paths::ensure_uploads_dir()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        paths::ensure_uploads_dir().map_err(|e| {
+            upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建上传目录失败: {e:#}"))
+        })?;
         let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let name = format!("{stamp}_{}", sanitize_upload_name(&filename));
         let path = paths::uploads_dir().join(&name);
-        std::fs::write(&path, &data)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("保存文件失败: {e}")))?;
+
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建文件失败: {e}")))?;
+        let mut total: u64 = 0;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| upload_err(StatusCode::BAD_REQUEST, format!("读取上传数据失败: {e}")))?
+        {
+            total += chunk.len() as u64;
+            if total > MAX_UPLOAD_BYTES {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                let limit_mb = MAX_UPLOAD_BYTES / 1024 / 1024;
+                logging::warn(format!("上传被拒（超过 {limit_mb}MB）：{filename}"));
+                return Err(upload_err(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("文件超过 {limit_mb}MB 上限，已拒绝"),
+                ));
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .map_err(|e| {
+                    upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("写入文件失败: {e}"))
+                })?;
+        }
+        if total == 0 {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(upload_err(StatusCode::BAD_REQUEST, "文件为空"));
+        }
+        logging::info(format!(
+            "上传完成：{filename}（{:.1}MB）→ {}",
+            total as f64 / 1024.0 / 1024.0,
+            path.display()
+        ));
         return Ok(Json(json!({
             "path": path.to_string_lossy(),
             "name": filename,
+            "size": total,
         })));
     }
-    Err((StatusCode::BAD_REQUEST, "缺少 file 字段".to_string()))
+    Err(upload_err(StatusCode::BAD_REQUEST, "缺少 file 字段"))
 }
 
 /// 上传文件名安全化：去掉路径分隔符与危险字符（保留空格/中文）。

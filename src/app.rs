@@ -512,8 +512,12 @@ impl App {
     /// 每条命令结束后统一刷新补全列表（区块/节点编号可能已变化）。
     /// 支持别名：tree|trajectory、ingest|pdf、ask|q、help|?。
     pub async fn run_command(&mut self, line: &str) -> Result<()> {
+        // 每条命令开始时清掉上一次的打断标志（CLI Ctrl-C / Web 停止按钮）
+        interrupt::reset();
         let (cmd, rest) = split_cmd(line);
-        match cmd {
+        crate::logging::debug(format!("收到命令: {line}"));
+        let t0 = std::time::Instant::now();
+        let result = match cmd {
             "help" | "?" => self.cmd_help(),
             "config" => self.cmd_config(rest).await,
             "budget" => self.cmd_budget(rest).await,
@@ -547,7 +551,13 @@ impl App {
                 outln!(self, "未知命令: {cmd}。输入 help 查看帮助。");
                 Ok(())
             }
-        }?;
+        };
+        crate::logging::info(format!(
+            "命令 `{cmd}` 用时 {:.2}s：{}",
+            t0.elapsed().as_secs_f64(),
+            if result.is_ok() { "ok" } else { "err" }
+        ));
+        result?;
         self.update_completions();
         Ok(())
     }
@@ -581,6 +591,7 @@ PaperHelper 命令：
   concepts                 列出已学概念(跨论文)
   config show              查看配置
   config set <k> <v>       设置(如 llm.api_key / llm.model / llm.context_length)
+  config test              测试 LLM 连接(端点/Key/模型)，失败显示原始响应
   new                      新建会话
   exit                     退出（自动保存会话）
 
@@ -631,7 +642,40 @@ PaperHelper 命令：
                 let display = if key == "llm.api_key" { mask_key(&val) } else { val.clone() };
                 outln!(self, "已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
             }
-            _ => outln!(self, "用法: config [show | set <key> <value>]"),
+            "test" => self.cmd_config_test().await?,
+            _ => outln!(self, "用法: config [show | set <key> <value> | test]"),
+        }
+        Ok(())
+    }
+
+    /// `config test`：用当前配置发一条最小请求，验证端点/Key/模型，失败展示原始响应。
+    async fn cmd_config_test(&mut self) -> Result<()> {
+        let cfg = self.config.llm.clone();
+        outln!(self, "正在测试 LLM 连接：{}（模型 {}）…", cfg.api_endpoint, cfg.model);
+        self.emitter.progress("测试连接中…");
+        interrupt::reset();
+        let r = llm::test(&self.client, &cfg).await;
+        self.emitter.progress_done();
+        if r.ok {
+            outln!(
+                self,
+                "{} 连接成功（HTTP {}，{}ms）",
+                "✓".green().bold(),
+                r.status,
+                r.latency_ms
+            );
+            outln!(self, "  模型: {}", r.model);
+            outln!(self, "  回复: {}", r.reply);
+            outln!(self, "  usage: in={} out={}", r.input_tokens, r.output_tokens);
+        } else {
+            outln!(
+                self,
+                "{} 连接失败（HTTP {}，{}ms）",
+                "✗".red().bold(),
+                r.status,
+                r.latency_ms
+            );
+            outln!(self, "原始响应：\n{}", r.raw);
         }
         Ok(())
     }
@@ -840,25 +884,20 @@ PaperHelper 命令：
         }
         interrupt::reset();
 
-        // 1. 抽取文本（PDF/OCR 是阻塞子进程，放 spawn_blocking 避免卡住 Web 服务器）
+        // 1. 抽取文本（PDF/OCR 子进程已异步，可被 Ctrl-C / Web 停止打断）
         let progress_msg = match mode {
             "text" => "读取文本文件…",
-            "ocr" => "OCR 识别中（可能较慢）…",
+            "ocr" => "OCR 识别中（可能较慢，可 Ctrl-C/停止 打断）…",
             _ => "解析 PDF…",
         };
         self.emitter.progress(progress_msg);
-        let mode_s = mode.to_string();
-        let file_s = file_path.clone();
-        let raw_text = tokio::task::spawn_blocking(move || -> Result<String> {
-            let p = Path::new(&file_s);
-            match mode_s.as_str() {
-                "text" => Ok(std::fs::read_to_string(p)?),
-                "ocr" => pdf::ocr_extract(p),
-                _ => Ok(pdf::extract_pages(p)?.join("\n\n")),
-            }
-        })
-        .await
-        .context("文本抽取任务失败")??;
+        let raw_text = match mode {
+            "text" => tokio::fs::read_to_string(&file_path)
+                .await
+                .with_context(|| format!("读取文本文件失败: {file_path}"))?,
+            "ocr" => pdf::ocr_extract(Path::new(&file_path)).await?,
+            _ => pdf::extract_pages(Path::new(&file_path)).await?.join("\n\n"),
+        };
         self.emitter.progress_done();
         if raw_text.trim().is_empty() {
             bail!("文本内容为空（可能是扫描件，试试 ingest --ocr <pdf>）");

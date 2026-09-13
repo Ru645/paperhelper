@@ -31,8 +31,10 @@ pub enum Event {
     ProgressDone,
     /// 命令正常结束
     Done,
-    /// 命令出错（消息为错误链文本）
-    Error(String),
+    /// 命令被用户中止（Ctrl-C / Web 停止按钮）
+    Aborted,
+    /// 命令出错：`summary` 给用户看的中文摘要，`detail` 完整错误链/原始响应
+    Error { summary: String, detail: String },
 }
 
 /// 可插拔输出器（克隆代价极小：Option<Sender> + Arc）。
@@ -141,9 +143,17 @@ impl Emitter {
         self.send(Event::Done);
     }
 
-    /// 命令出错（Web 端据此展示错误）。
-    pub fn error(&self, s: impl Into<String>) {
-        self.send(Event::Error(s.into()));
+    /// 命令被用户中止。
+    pub fn aborted(&self) {
+        self.send(Event::Aborted);
+    }
+
+    /// 命令出错：摘要给用户看，详情给「查看详情」/日志。
+    pub fn error(&self, summary: impl Into<String>, detail: impl Into<String>) {
+        self.send(Event::Error {
+            summary: summary.into(),
+            detail: detail.into(),
+        });
     }
 }
 

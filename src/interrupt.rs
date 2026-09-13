@@ -32,6 +32,23 @@ pub fn request() {
     }
 }
 
+/// 等待一次打断信号，供 `tokio::select!` 与长任务竞争。
+///
+/// 用 `Notified::enable()` 先注册再复查标志，避免「置位发生在注册之前」
+/// 导致永久等待的竞态。
+pub async fn wait() {
+    if is_interrupted() {
+        return;
+    }
+    let notified = notify().notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if is_interrupted() {
+        return;
+    }
+    notified.await;
+}
+
 pub fn install() {
     tokio::spawn(async {
         loop {

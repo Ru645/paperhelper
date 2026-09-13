@@ -63,6 +63,9 @@ paperhelper              # 进入 REPL
 
 ## 约定
 
+- **长任务必须可中止**：任何耗时/可能卡住的操作（LLM 请求、PDF/OCR 子进程等）都要能被 `Ctrl-C`（CLI）与 Web「停止」（`interrupt::request()`）打断。LLM 走 `llm::chat`（已用 `tokio::select!` + `interrupt::wait()`）；子进程用 `tokio::process` + `kill_on_drop(true)`。命令入口需 `interrupt::reset()`（`run_command` 已统一处理）。
+- **错误要能排查**：后端错误用中文摘要 + 排查建议（见 `llm::friendly_http_error`），原始响应保留在错误链里；界面提供「详情」与「测试连接」（`config test` / 配置弹窗）。
+- **日志**：用 `logging::{info,warn,error,debug}`（`src/logging.rs`），写 stderr 与 `.paperhelper/logs/paperhelper.log`；级别用 `PAPERHELPER_LOG=debug`。**不要记录 API Key 明文**（用 `app::mask_key`）。
 - **图片素材**：生成的截图等图片统一放项目根的 `screenshots/`，**不要**写到 `~` 或 `/tmp`（snap Chromium 的 `/tmp` 为私有，写不进去）。截图流程示例：
 
   ```bash

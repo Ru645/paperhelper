@@ -162,10 +162,33 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
   100% { transform: translateX(320%); }
 }
 
+/* 运行中的「停止」按钮（进度条旁） */
+.stop-btn {
+  border: 1px solid var(--danger); color: var(--danger); background: #fff;
+  font-size: 13px; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+  white-space: nowrap; flex: none;
+}
+.stop-btn:hover { background: var(--danger); color: #fff; }
+.stop-btn.hidden { display: none; }
+
 .panes { flex: 1; min-height: 0; display: flex; }
 .pane { flex: 1; min-height: 0; display: none; }
 .pane.active { display: flex; }
 #note-frame { flex: 1; border: none; width: 100%; background: #fff; }
+#note-frame.hidden { display: none; }
+
+/* 空笔记页：居中导入入口 */
+.note-empty {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center;
+  padding: 32px; gap: 6px; color: #666;
+}
+.note-empty.hidden { display: none; }
+.note-empty .ne-icon { font-size: 56px; color: var(--line); line-height: 1; margin-bottom: 6px; }
+.note-empty h2 { font-size: 24px; font-weight: 600; color: #333; }
+.note-empty p { font-size: 15px; color: #777; }
+.note-empty button { margin-top: 16px; font-size: 15px; padding: 10px 22px; }
+.note-empty .ne-hint { font-size: 13px; color: var(--muted); margin-top: 10px; }
 #console {
   flex: 1; overflow-y: auto; padding: 12px 16px; margin: 0;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -174,6 +197,15 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 #console .err { color: var(--danger); }
 #console .ok { color: var(--ok); }
 #console .stream { color: #111; }
+#console .warn { color: #b45309; }
+#console .err-detail { margin: 4px 0 8px; }
+#console .err-detail summary { cursor: pointer; color: var(--blue); font-size: 12px; }
+#console .err-detail pre,
+.test-result pre {
+  margin: 6px 0 0; padding: 8px 10px; background: #f7f7f5; border: 1px solid var(--line);
+  border-radius: 6px; font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; color: #444;
+}
 
 /* 详情标签页 */
 .detail { flex: 1; overflow-y: auto; padding: 24px 32px; max-width: 900px; margin: 0 auto; width: 100%; }
@@ -269,6 +301,11 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .status { font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
 .status.ok { color: var(--ok); }
 .status.err { color: var(--danger); }
+.test-result { font-size: 13px; color: #444; margin-top: 10px; max-height: 220px; overflow-y: auto; }
+.test-result.hidden { display: none; }
+.test-result.ok { color: var(--ok); }
+.test-result.err { color: var(--danger); }
+.test-result summary { cursor: pointer; color: var(--blue); font-size: 12px; }
 
 /* ===== 批注（选中文字提问） ===== */
 .sel-btn {

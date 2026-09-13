@@ -50,6 +50,19 @@ pub fn ensure_uploads_dir() -> Result<()> {
     Ok(())
 }
 
+/// 日志目录（Web/CLI 运行日志）。
+pub fn logs_dir() -> PathBuf {
+    data_dir().join("logs")
+}
+
+/// 确保日志目录存在。
+pub fn ensure_logs_dir() -> Result<()> {
+    if !logs_dir().exists() {
+        fs::create_dir_all(logs_dir())?;
+    }
+    Ok(())
+}
+
 /// 会话存档目录
 pub fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")
