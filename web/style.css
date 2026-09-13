@@ -105,7 +105,30 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .tab .close { color: var(--muted); font-size: 14px; line-height: 1; }
 .tab .close:hover { color: var(--danger); }
 .spacer { flex: 1; }
-.progress { color: var(--blue); font-size: 13px; }
+.progress {
+  color: var(--blue); font-size: 13px;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+}
+.progress.hidden { display: none; }
+.progress .meta { color: var(--muted); font-weight: 400; margin-left: 2px; }
+.progress .spin {
+  width: 11px; height: 11px; flex: none;
+  border: 2px solid var(--blue-light); border-top-color: var(--blue);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 顶部不定长进度条：任务进行中持续流动 */
+.progress-bar { height: 3px; background: var(--blue-light); overflow: hidden; flex: none; }
+.progress-bar.hidden { display: none; }
+.progress-bar-fill {
+  height: 100%; width: 35%; background: var(--blue);
+  animation: indeterminate 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+@keyframes indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
 
 .panes { flex: 1; min-height: 0; display: flex; }
 .pane { flex: 1; min-height: 0; display: none; }

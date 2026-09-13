@@ -50,6 +50,7 @@ function appendConsole(text, cls) {
 }
 
 function appendToken(t) {
+  if (progressLabel) progressChars += t.length;
   if (!streamSpan) {
     streamSpan = document.createElement("span");
     streamSpan.className = "stream";
@@ -59,7 +60,42 @@ function appendToken(t) {
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
 
-function setProgress(msg) { $("progress").textContent = msg || ""; }
+// ===== 进度指示（顶部动画进度条 + 实时字数/耗时）=====
+let progressLabel = "";
+let progressStart = 0;
+let progressChars = 0;
+let progressTimer = null;
+
+function updateProgressText() {
+  const el = $("progress");
+  if (!el || !progressLabel) return;
+  const secs = Math.round((Date.now() - progressStart) / 1000);
+  let meta = secs + "s";
+  if (progressChars > 0) meta = progressChars.toLocaleString() + " 字 · " + meta;
+  el.innerHTML = `<span class="spin"></span><span>${esc(progressLabel)}</span><b class="meta">${meta}</b>`;
+}
+
+/// 开始/更新一个进度提示（空串=结束）。
+function setProgress(msg) {
+  if (!msg) { stopProgress(); return; }
+  if (msg !== progressLabel) {
+    progressLabel = msg;
+    progressStart = Date.now();
+    progressChars = 0;
+  }
+  $("progress").classList.remove("hidden");
+  $("progress-bar").classList.remove("hidden");
+  updateProgressText();
+  if (!progressTimer) progressTimer = setInterval(updateProgressText, 400);
+}
+
+function stopProgress() {
+  progressLabel = "";
+  progressChars = 0;
+  $("progress").classList.add("hidden");
+  $("progress-bar").classList.add("hidden");
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
 
 function setRunning(v) {
   running = v;

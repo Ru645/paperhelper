@@ -912,16 +912,21 @@ PaperHelper 命令：
         ];
         let raw_clone = raw_text.clone();
         let emitter = self.emitter.clone();
+        let web = !emitter.is_terminal();
         let mut first_token = true;
         emitter.progress("笔记生成中…");
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
+            // CLI：首个 token 到达即收起 spinner，避免与流式输出交叠；
+            // Web：保持进度条到生成结束，由前端实时显示已生成字数与耗时。
             if first_token {
-                emitter.progress_done();
+                if !web {
+                    emitter.progress_done();
+                }
                 first_token = false;
             }
             emitter.token(t);
         }).await;
-        if first_token {
+        if first_token || web {
             emitter.progress_done();
         }
         self.emitter.stdout("");
