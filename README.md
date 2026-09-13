@@ -2,20 +2,22 @@
 
 读论文时遇到不懂的概念就追问，追问中又引出新的前置知识，等搞明白已经忘了主线？通用 AI 的对话只会向前延伸，几次深入追问后就丢失上下文。
 
-PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一个节点，随时跳回主线或其他分支继续提问，根路径自动成为上下文。
+PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问是树上的一个节点，随时跳回主线或其他分支继续提问；在笔记里**选中文字即可就地提问**，答案钉在原文位置，点击高亮即可回看。
+
+主界面是**浏览器 Web 应用**（`paperhelper web`），也提供功能等价的**命令行界面（CLI）**。
 
 ## 核心功能
 
-- **导入 PDF → 自动生成结构化笔记**：LLM 按固定四段架构（问题/前人方案/本文方案/前景）生成详细 Markdown 笔记，含公式、表格、数值结果
-- **按编号追问**：看笔记里的 `### 3.2 变体一：BERTScore`，直接 `ask 3.2 ...`，解释自动插入对应位置
-- **递归嵌套批注**：对追问的回答再追问，批注层层嵌套（check 核对想法不写入笔记）
-- **总结折叠**：`sum` 把当前追问子树折叠成「总结」（可点击展开原问答），精简笔记
-- **对话树**：`tree` 查看全部对话轨迹，`goto 2` 跳到任意节点继续，根路径即上下文
-- **跨论文知识库**：自动积累读过的论文和学过的概念，追问时自动关联已学知识
-- **HTML 笔记**：单文件网页（KaTeX 公式渲染 + 对话树侧栏），浏览器阅读与搜索
-- **会话自动保存**：退出时自动保存，`paperhelper -s <编号>` 直接恢复，对话位置不丢
-- **Web 界面**：`paperhelper web` 浏览器操作，SSE 实时流式输出 + 停止按钮 + 配置页 + 会话历史
-- **工程细节**：Tab 补全（命令/路径/编号/配置项）、网络抖动自动重试、token 预算自动中断
+- **Web 界面（主）**：导入、阅读笔记、选中提问、管理会话、配置模型、导出，全部在浏览器里完成
+- **笔记内就地提问**：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内问答；答案与所选文字绑定，点击高亮即可重新展开
+- **章节提问**：右键笔记标题（h1=全文，h2/h3=小节）→「对本章节提问」
+- **递归嵌套批注**：对追问的回答再追问，批注层层嵌套；`sum` 把子树折叠成「总结」并可展开
+- **导入 PDF → 结构化笔记**：LLM 按固定四段架构（问题 / 前人方案 / 本文方案 / 前景）生成详细 Markdown，含公式、表格、数值结果
+- **跨论文知识库**：自动积累读过的论文与学过的概念，追问时自动关联已学知识
+- **导出**：一键下载 Markdown / 思维导图（markmap）/ 自包含 HTML（KaTeX 公式渲染，含只读批注弹窗）
+- **成本可控**：精确统计每次调用的 token 与成本，可设 token 预算，到上限自动中断
+- **会话历史**：自动保存，可列表查看、置顶 / 重命名 / 删除、随时恢复
+- **CLI（附带）**：功能等价的全键盘 REPL，适合脚本化与服务器环境
 
 ## 快速开始
 
@@ -24,8 +26,8 @@ PaperHelper 用**树形对话**解决这个问题：每次追问是树上的一�
 | 依赖 | 用途 | 必需性 |
 |------|------|--------|
 | Rust 1.85+ | 编译 | 必需 |
-| Python 3 + PyMuPDF | PDF 文本层提取（`ingest <pdf>`） | 必需 |
-| tesseract + 中文语言包 | OCR 扫描件（`ingest --ocr`） | 可选（仅处理扫描版 PDF 时需要） |
+| Python 3 + PyMuPDF | PDF 文本层提取 | 必需 |
+| tesseract + 中文语言包 | OCR 扫描件（`ingest --ocr`） | 可选（仅扫描版 PDF 需要） |
 
 ```bash
 # ① Rust（需 1.85+）
@@ -34,43 +36,45 @@ rustc --version
 # ② PDF 解析（Python 的 PyMuPDF，Rust 通过子进程调用）
 pip install pymupdf
 
-# ③ OCR（可选，仅 ingest --ocr 需要）
+# ③ OCR（可选）
 sudo apt install tesseract-ocr tesseract-ocr-chi-sim    # Debian/Ubuntu
 brew install tesseract tesseract-lang                    # macOS
 # 无 sudo 权限时可用 conda 装用户级：
 # conda install -c conda-forge tesseract tesseract-data-chi_sim
 ```
 
-> 没装 tesseract 时 `ingest --ocr` 会提示安装方式，其余功能不受影响。
+> 没装 tesseract 时只有 `--ocr` 不可用，其余功能不受影响。
 
 ### 2. 编译
 
-直接 clone 出来就是一个独立 Cargo crate，正常构建即可。如果你的上级目录恰好是 Cargo workspace（`../Cargo.toml` 把子目录当成员），则需加 `-p paperhelper`：
+直接 clone 出来就是一个独立 Cargo crate，正常构建即可。若你的上级目录恰好是 Cargo workspace，则加 `-p paperhelper`：
 
 ```bash
 git clone <仓库地址> && cd paperhelper
 cargo build                 # 独立 crate 直接构建
-cargo build -p paperhelper   # 在 workspace 下时加 -p
-cargo test                  # 运行测试（25 个）
+cargo build -p paperhelper  # 在 workspace 下时加 -p
+cargo test                  # 运行测试（32 个）
 ```
 
 编译产物在 `./target/debug/paperhelper`。
 
-### 3. 加入 PATH（可选，方便直接用 `paperhelper` 命令）
+### 3. 配置大模型
 
+任选其一（优先级：环境变量 > `.env` > `.paperhelper/config.toml`）。
+
+**方式 1：Web 配置弹窗（推荐）** —— 启动后点顶栏「配置」即可改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存。
+
+**方式 2：`.env`（已被 gitignore，不会泄露）**
 ```bash
-# 把下面的 <项目路径> 替换为你实际的 paperhelper 目录
-echo 'export PATH="<项目路径>/target/debug:$PATH"' >> ~/.bashrc
-source ~/.bashrc
+cat > .env <<'EOF'
+PAPERHELPER_API_KEY=sk-xxxxxxxx
+PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
+PAPERHELPER_MODEL=deepseek-v4-pro
+PAPERHELPER_CONTEXT_LENGTH=64000
+EOF
 ```
 
-不加 PATH 也可用 `cargo run -p paperhelper` 启动。
-
-### 4. 配置大模型
-
-首次启动会提示配置，三种方式任选其一（优先级：命令行 > .env > config.toml）：
-
-**交互式配置**（推荐）：
+**方式 3：CLI 交互式**
 ```bash
 paperhelper
 > config set llm.api_key sk-xxxxxxxx
@@ -82,17 +86,42 @@ paperhelper
 > DeepSeek：`https://api.deepseek.com/v1/chat/completions`
 > OpenAI：`https://api.openai.com/v1/chat/completions`
 
-或写 `.env`（已被 gitignore，不会泄露）：
+### 4. 启动 Web 界面（推荐）
+
 ```bash
-cat > .env <<'EOF'
-PAPERHELPER_API_KEY=sk-xxxxxxxx
-PAPERHELPER_API_ENDPOINT=https://api.deepseek.com/v1/chat/completions
-PAPERHELPER_MODEL=deepseek-v4-pro
-PAPERHELPER_CONTEXT_LENGTH=64000
-EOF
+paperhelper web              # 默认 http://127.0.0.1:8080
+paperhelper web --port 9000  # 指定端口
 ```
 
-### 5. 开始使用
+浏览器打开后即可使用。在运行服务的终端按 `Ctrl-C` 停止服务。
+
+## Web 界面详解
+
+**顶栏**：`＋ 导入` · `导出 ▾`（Markdown / 思维导图 / HTML，浏览器下载）· `撤销` · `帮助` · `配置` · `刷新`，并显示当前模型。
+
+**笔记区**（主区「笔记」标签）：
+- **选中提问**：在笔记里选中一段文字 → 浮出「提问」→ 小窗口内输入问题（可切 ask / check）→ 回车发送；回答流式显示，并与所选文字**高亮绑定**，点击高亮可重新打开小窗口。
+- **章节提问**：右键标题（h1=全文，h2/h3=小节）→「对本章节提问」；已有批注时另有「打开 / 删除」。
+- **批注弹窗**：节点左键跳转、右键删除 / 总结；`sum` 后的节点显示为「总结」并可展开查看原对话。
+- **右键高亮**：删除整条批注。
+
+**主区标签**：固定「笔记」「控制台」；点击侧栏的论文 / 概念会新增并列小标签页（概念详情、论文笔记 + 对应会话）。
+
+**侧栏**：
+- **用量**：会话总开销、跨会话累计、当前节点上下文 token（均为 API 返回的精确值）。
+- **笔记结构**：笔记大纲，点击定位到笔记对应位置；有批注的块标 `●`。
+- **会话历史**：顶部「＋ 新会话」；点条目加载；右键置顶 / 重命名 / 删除。
+- **已读论文 / 已学概念**：点击查看详情；右键置顶 / 删除。
+
+**导入**：点「＋ 导入」选择文件，或直接把 PDF / TXT 拖进窗口；上传后自动执行 ingest（并询问笔记文件名），无需手输命令。
+
+实现方式：`paperhelper web` 启动内嵌的 axum 服务，把业务输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。
+
+## 命令行界面（CLI）
+
+功能与 Web 等价，适合脚本化或服务器环境。
+
+### 启动与恢复
 
 ```bash
 paperhelper                 # 新会话
@@ -100,39 +129,15 @@ paperhelper -l              # 列出所有已保存会话（编号+标题）
 paperhelper -s 20260909_020452   # 按编号恢复（支持唯一前缀，如 -s 20260909_02）
 ```
 
-会话编号是**首次保存时的时间戳**，此后不变（每次 exit 覆盖保存同一编号）；标题仅作展示。
+会话编号是**首次保存时的时间戳**，此后不变（每次 exit 覆盖保存同一编号）。
 
-**Shell 补全（可选，推荐）**：`-s` 后 Tab 补全时间戳：
-
+**Shell 补全（可选）**：`-s` 后 Tab 补全时间戳：
 ```bash
 paperhelper --completions >> ~/.bashrc   # 安装 bash 补全
 source ~/.bashrc
-# 之后：paperhelper -s 2026<Tab> 自动补全时间戳
 ```
 
-## Web 界面（浏览器）
-
-除 CLI 外还提供浏览器界面，功能与 CLI 一致（核心逻辑仍是同一套 Rust 代码）：
-
-```bash
-paperhelper web              # 默认 http://127.0.0.1:8080
-paperhelper web --port 9000  # 指定端口
-```
-
-浏览器打开后：
-
-- **主区**：固定「笔记」「控制台」标签；点击概念/论文会新增并列小标签页（概念详情、论文笔记+对应会话）
-- **底部命令输入**：全键盘 `/命令 参数…`，输入 `/` 弹出命令候选（↑↓ 选择、Tab/Enter 补全）；不以 `/` 开头则当作 `ask` 提问
-- **导入论文**：点「＋ 导入」按钮选择文件，或直接把 PDF/TXT 拖进窗口；上传后自动执行 ingest（无需手输命令）
-- **顶栏**：模型名；侧栏「用量」区显示会话总开销、跨会话累计、当前节点上下文 token（精确值）
-- **停止按钮**：打断正在执行的任务（对应 CLI 的 Ctrl-C）
-- **配置弹窗**：修改 API Endpoint / Key / 模型 / 上下文长度 / 思考模式 / 单价 / 预算，即改即存
-- **左栏**：对话轨迹（点击跳转，可删除节点/撤销）、会话历史（列表展示，右键可置顶/重命名/删除）、已读论文、已学概念（点击查看详情）
-- **批注**：在笔记里选中一段文字 → 浮出「提问」按钮 → 小窗口内提问（可切 ask/check）；问答只在该窗口显示（不内联进正文），点击高亮文字可重新打开；窗口内节点左键跳转、右键删除/总结
-
-实现方式：`paperhelper web` 启动内嵌的 axum 服务，把 CLI 的输出抽象为 SSE 事件流（`src/output.rs` 的 `Emitter`），前端用原生 JS 消费。仅监听 `127.0.0.1`，不对外暴露。在运行服务的终端按 `Ctrl-C` 即可停止服务（CLI 模式的 Ctrl-C 仍是打断当前任务）。
-
-## 使用流程
+### 使用流程
 
 ```
 > ingest samples/某论文.pdf       # 导入论文，生成笔记
@@ -143,24 +148,13 @@ paperhelper web --port 9000  # 指定端口
 > blocks                         # 看笔记结构和编号
    1   § 一、要解决的问题
    1.1   § 背景
-   2   § 二、前人方案及其不足
-   3   § 三、本文方案及其优点
-   3.1   § 核心思想
    3.2   § 变体一：BERTScore
-   3.3   § 变体二：MQAG
    ...
 
 > ask 3.2 BERTScore的公式里max_k是什么意思   # 按编号追问，解释插入 3.2 节
 > ask 3.2 它和余弦相似度有什么区别            # 对上一个回答再追问，自动嵌套
 > check 3.2 我觉得这就是余弦相似度，对吗      # 核对想法，不写入笔记
-> goto 1                                     # 跳回根节点，开启新追问线
 > sum                                        # 折叠当前追问子树为「总结」
-> tree                                       # 看对话树
-[1] 导入《论文》
-    └── [2] BERTScore
-        └── [3] 余弦相似度区别
-            └── [4] [核对] 余弦相似度 *
-> concepts                                   # 看学过的概念
 > stats                                      # 看 token 用量和成本
 > exit                                       # 退出，自动保存
 ✓ 会话已保存：BERTScore与余弦相似度讨论
@@ -171,62 +165,42 @@ paperhelper web --port 9000  # 指定端口
 
 ```bash
 > ingest samples/论文.pdf           # 默认：PyMuPDF 提取文本
-> ingest --text samples/论文.txt     # 直接读取文本文件（跳过PDF解析）
+> ingest --text samples/论文.txt     # 直接读取文本文件（跳过 PDF 解析）
 > ingest --ocr samples/扫描件.pdf    # OCR 识别（需安装 tesseract）
 ```
 
 - `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果
-- `--ocr`：适合扫描版 PDF（无文本层）
-  - tesseract 是**可选依赖**：执行 `--ocr` 时才检测，未安装会给出对应系统的安装指引，不影响其他功能
-  - 已装 tesseract 但缺中文语言包（chi_sim）时，自动降级为仅英文识别并提示安装 `tesseract-ocr-chi-sim`
+- `--ocr`：适合扫描版 PDF（无文本层）；未装 tesseract 会给出安装指引，不影响其他功能
 
-### 推荐工作流：双开窗口 + HTML 笔记
+### REPL 操作与补全
 
-命令行看长笔记不方便，推荐双开：
+- `↑↓` 切换历史命令，`←→` 移动光标，`Ctrl-C` 打断当前任务
+- Tab 补全：命令名；`ingest/save/load/export` 补全文件路径；`goto` 补全节点编号；`ask/check` 补全笔记编号；`config set` 补全键名与常用值
 
-1. **左窗口**：终端运行 `paperhelper`，对话提问
-2. **右窗口**：浏览器打开导出的 `.html` 笔记（或 Markdown 阅读器打开 `.md`）
-
-每次 `ask` 后笔记自动同步更新，右窗口刷新即可看到新插入的追问解释。
-
-**HTML 笔记（推荐）**：ingest 时文件名输 `xxx.html`（或 `export html note.html`），生成单文件 HTML：
-
-- 浏览器打开即得完整排版，**LaTeX 公式由 KaTeX 渲染**（终端/纯 Markdown 阅读器做不到）
-- 左侧对话树面板（当前节点高亮、显示 token 用量），右侧笔记正文
-- 浏览器 `Ctrl+F` 全文搜索
-- 加载 marked/KaTeX 走 CDN；离线时自动降级为纯文本显示
-
-## 命令一览
+## 命令一览（CLI）
 
 | 命令 | 说明 |
 |------|------|
-| `ingest <pdf>` | 导入 PDF，生成结构化笔记（四段架构），自动导出 Markdown |
+| `ingest <pdf>` | 导入 PDF，生成结构化笔记（四段架构），自动导出 |
 | `ingest --text <txt>` | 直接读取文本文件（跳过 PDF 解析） |
 | `ingest --ocr <pdf>` | OCR 识别扫描件（需 tesseract） |
 | `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
 | `check <编号> <想法>` | 与 ask 类似但不写入笔记，用于核对理解 |
-| `sum` | 把当前对话节点子树（含自己）的追问折叠（`<details>` 可展开）并替换为「**总结**：…」，插入笔记对应追问处 |
-| `del [--yes]` | 删除当前对话节点及其子树（同时移除笔记中对应解释）。不带 `--yes` 只警告，根节点不可删 |
-| `undo` | 撤销上一次 `del`（内存多级，重启后失效） |
+| `sum [n]` | 把节点 n（默认当前）的子树折叠（`<details>` 可展开）并替换为「总结」 |
+| `del [n] [--yes]` | 删除节点 n（默认当前）及其子树（同时移除笔记中对应解释）；根节点不可删 |
+| `undo` | 撤销上一次删除（内存多级，重启后失效） |
 | `blocks` | 列出笔记结构（带层级编号） |
-| `note` | 打印完整笔记 Markdown 到终端 |
+| `note` | 打印完整笔记 Markdown |
 | `tree` | 以树形展示对话轨迹（带 `[n]` 编号，`*` 标记当前位置） |
 | `goto <n>` | 跳到对话树节点 n，根路径成为上下文 |
 | `stats` | 查看本次/累计 token 用量与成本 |
 | `budget <n>` | 设置 token 预算（0=不限），到上限自动中断 |
-| `export md\|mindmap\|html [file]` | 导出笔记为 Markdown / 思维导图（markmap 兼容）/ 自包含 HTML（KaTeX 公式渲染）。自动补后缀（md→.md、mindmap→.mm、html→.html，已有后缀则不加）；省略文件名时用 ingest 时设置的笔记名 |
-| `papers` | 列出已读论文（跨会话累积） |
-| `concepts` | 列出已学概念（跨论文关联，LLM 自动提取概念名） |
-| `save [file]` | 手动保存会话 |
-| `load <file>` | 加载会话 |
+| `export md\|mindmap\|html [file]` | 导出笔记；自动补后缀，省略文件名时用 ingest 时的笔记名 |
+| `papers` / `concepts` | 列出已读论文 / 已学概念 |
+| `save [file]` / `load <file>` | 保存 / 加载会话 |
 | `new` | 新建会话 |
-| `config show` | 查看配置 |
-| `config set <k> <v>` | 设置配置项 |
+| `config show` / `config set <k> <v>` | 查看 / 设置配置 |
 | `exit` | 退出（自动保存会话，告知恢复方式） |
-
-**REPL 操作**：`↑↓` 切换历史命令，`←→` 移动光标，`Ctrl-C` 打断当前任务。
-
-**Tab 补全**：命令名；`ingest/save/load/export` 补全文件路径；`goto` 补全节点编号；`ask/check` 补全笔记编号；`config set` 补全键名与常用值（模型/端点来自 presets）。
 
 ## 配置项
 
@@ -236,24 +210,25 @@ paperhelper web --port 9000  # 指定端口
 | `llm.api_endpoint` | 完整端点 URL | OpenAI |
 | `llm.model` | 模型名 | gpt-4o-mini |
 | `llm.context_length` | 上下文长度（token） | 8192 |
-| `llm.thinking_mode` | 思考模式 | false |
+| `llm.thinking_mode` | 思考模式（给推理模型发 `reasoning_effort`） | false |
 | `llm.pdf_input` | 声明模型支持 PDF 直传（file 模式，暂未实现均走文本） | false |
 | `pricing.input_price_per_1m` | 输入单价 | 0.15 |
 | `pricing.output_price_per_1m` | 输出单价 | 0.60 |
 | `budget.token_budget` | token 预算（0=不限） | 0 |
 
-配置存储在 `.paperhelper/config.toml`（已被 gitignore）。
+配置存储在 `.paperhelper/config.toml`（已被 gitignore）。Web 端可直接在「配置」弹窗里修改。
 
 ## 数据目录
 
 ```
 .paperhelper/
 ├── config.toml          # 配置文件
-├── knowledge.json        # 跨论文知识库（论文+概念+累计用量）
-├── prompts/              # 提示词模板（可编辑）
-│   ├── ask.txt           # ask/check 的 system prompt
-│   └── note.txt          # 笔记生成模板（{raw_text} 为论文占位符）
-└── sessions/             # 会话存档（文件名 = 会话编号 = 首次保存时间戳）
+├── knowledge.json       # 跨论文知识库（论文+概念+累计用量）
+├── prompts/             # 提示词模板（可编辑）
+│   ├── ask.txt          # ask/check 的 system prompt
+│   └── note.txt         # 笔记生成模板（{raw_text} 为论文占位符）
+├── uploads/             # Web 端上传的论文文件
+└── sessions/            # 会话存档（文件名 = 会话编号 = 首次保存时间戳）
     ├── 20260909_021633.json
     └── 20260909_033219.json
 ```
@@ -275,18 +250,19 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 
 - **Rust 主控**：PDF 解析、笔记树、对话树、编号、定位、导出、统计——全部 Rust 确定性逻辑
 - **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名、生成总结
-- **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，sum 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
-- **流式输出 + 进度条**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
-- **CLI/Web 双前端**：业务逻辑输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
+- **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，`sum` 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
+- **文本锚点批注**：批注记录 `block_id + 选中文字`，渲染时按文本引用定位并高亮，点击可重开弹窗
+- **流式输出 + 进度**：LLM 输出实时渲染，耗时任务显示进度，`Ctrl-C` 可打断
+- **Web / CLI 双前端**：业务输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
 - **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断
 - **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
 
 ## 开发
 
 ```bash
-cargo build                             # 构建
-cargo test                              # 25 个单元测试
-cargo build --release                   # 发布构建
+cargo build                 # 构建
+cargo test                  # 32 个单元测试
+cargo build --release       # 发布构建
 ```
 
-二进制产物：`./target/debug/paperhelper`
+二进制产物：`./target/debug/paperhelper`（或 `./target/release/paperhelper`）。
