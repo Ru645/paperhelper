@@ -11,6 +11,18 @@
   <div class="brand">PaperHelper <span class="sub">论文学习助手</span></div>
   <div class="model" id="model"></div>
   <div class="actions">
+    <button id="btn-upload" class="ghost" title="导入论文文件（PDF/TXT）">＋ 导入</button>
+    <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
+    <div class="dropdown">
+      <button id="btn-export" class="ghost">导出 ▾</button>
+      <div id="export-menu" class="dropdown-menu hidden">
+        <div data-fmt="md">Markdown（.md）</div>
+        <div data-fmt="mm">思维导图（.mm）</div>
+        <div data-fmt="html">HTML（.html）</div>
+      </div>
+    </div>
+    <button id="btn-undo" class="ghost" disabled title="撤销上一次删除">撤销</button>
+    <button id="btn-help" class="ghost">帮助</button>
     <button id="btn-config" class="ghost">配置</button>
     <button id="btn-refresh" class="ghost">刷新</button>
   </div>
@@ -21,6 +33,10 @@
     <section>
       <h3>用量</h3>
       <div id="usage" class="usage"></div>
+    </section>
+    <section>
+      <h3>笔记结构</h3>
+      <ul id="outline" class="outline"><li class="muted">（还没有笔记）</li></ul>
     </section>
     <section>
       <h3>会话历史</h3>
@@ -52,16 +68,6 @@
         <pre id="console"></pre>
       </div>
     </div>
-
-    <form id="cmd-form" class="cmdbar">
-      <button type="button" id="btn-upload" class="mini ghost" title="导入论文文件（PDF/TXT）">＋ 导入</button>
-      <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
-      <div class="cmd-wrap">
-        <input id="cmd-input" type="text" placeholder="输入 / 选择命令，或直接输入问题提问…" autocomplete="off" autofocus>
-        <ul id="cmd-suggest" class="suggest hidden"></ul>
-      </div>
-      <button type="submit" id="btn-send" class="primary">发送</button>
-    </form>
   </main>
 </div>
 
@@ -104,6 +110,23 @@
       <button id="btn-config-save" class="primary">保存</button>
     </div>
     <p id="cfg-status" class="status"></p>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>使用帮助</h2>
+    <ul class="help-list">
+      <li><b>导入</b>：点「＋ 导入」选择 PDF/TXT，或直接把文件拖进窗口。</li>
+      <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。</li>
+      <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
+      <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
+      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。</li>
+      <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
+      <li><b>撤销</b>：删除后点「撤销」恢复。</li>
+      <li><b>配置</b>：点「配置」修改 API 端点/密钥/模型/价格/预算。</li>
+    </ul>
+    <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
   </div>
 </div>
 

@@ -1047,3 +1047,36 @@ fn sanitize_upload_name(s: &str) -> String {
         cleaned.chars().take(120).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// 一致性检查：`app.js` 里 `$("id")` 引用的元素，必须都在 `index.html` 里存在。
+    /// 防止「新 app.js + 旧 index.html」这类版本错配导致初始化抛错、按钮全部失效。
+    #[test]
+    fn web_asset_element_ids_match() {
+        let app_js = include_str!("../web/app.js");
+        let index_html = include_str!("../web/index.html");
+        let mut missing: Vec<String> = Vec::new();
+        let mut rest = app_js;
+        while let Some(pos) = rest.find("$(\"") {
+            let after = &rest[pos + 3..];
+            let Some(end) = after.find("\")") else { break };
+            let id = &after[..end];
+            // 只校验形如标识符的 id（跳过含空格/运算符的表达式）
+            let is_ident = !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if is_ident && !index_html.contains(&format!("id=\"{id}\"")) {
+                if !missing.iter().any(|m| m == id) {
+                    missing.push(id.to_string());
+                }
+            }
+            rest = &after[end + 2..];
+        }
+        assert!(
+            missing.is_empty(),
+            "app.js 引用了 index.html 中不存在的元素 id（版本错配）: {missing:?}"
+        );
+    }
+}
