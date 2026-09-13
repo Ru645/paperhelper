@@ -32,10 +32,12 @@ body {
   border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
-.brand { font-weight: 700; color: var(--blue); }
+.brand { font-weight: 700; color: var(--blue); flex-shrink: 0; }
 .brand .sub { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 4px; }
-.model { flex: 1; font-size: 13px; color: #444; }
+.model { flex: 1; min-width: 0; font-size: 13px; color: #444; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .model b { color: #111; }
+.actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.actions button { white-space: nowrap; flex-shrink: 0; }
 
 /* ===== 布局 ===== */
 .layout { flex: 1; display: flex; min-height: 0; }
