@@ -5,6 +5,7 @@ session.json
 .paperhelper/
 samples/
 *.log*.md
+AGENTS.md
 
 # 大作业提交材料（本地生成，不提交）
 submission/
