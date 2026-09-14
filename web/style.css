@@ -366,7 +366,13 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
   box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column;
 }
 .ann-popup.hidden { display: none; }
-.ann-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.ann-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  cursor: move; user-select: none; touch-action: none; /* 头部可拖动 */
+}
+.ann-head button, .ann-head input { cursor: pointer; }
+.ann-popup.dragging { box-shadow: 0 14px 50px rgba(0,0,0,.32); }
 .ann-quote {
   font-size: 12px; color: #555; background: #fff7cc; padding: 2px 6px; border-radius: 4px;
   max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

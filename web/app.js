@@ -1120,6 +1120,55 @@ function positionPopup(x, y) {
   el.style.top = Math.min(window.innerHeight - h - 12, Math.max(12, y)) + "px";
 }
 
+/// 让批注弹窗可拖动：按住头部（按钮/输入框除外）即可移动，并钳制在视口内。
+/// 位置不持久化——每次打开仍由 positionPopup 定位到选区 / 高亮附近。
+function setupAnnDrag() {
+  const popup = $("ann-popup");
+  const head = popup.querySelector(".ann-head");
+  if (!head) return;
+  const MIN_VISIBLE_X = 60; // 横向至少露出这么多，避免拖出屏幕找不回
+  const HEAD_H = 44;        // 纵向至少露出头部
+  let drag = null;
+
+  const onMove = (e) => {
+    if (!drag) return;
+    const left = Math.min(
+      window.innerWidth - MIN_VISIBLE_X,
+      Math.max(MIN_VISIBLE_X - drag.w, e.clientX - drag.dx)
+    );
+    const top = Math.min(window.innerHeight - HEAD_H, Math.max(0, e.clientY - drag.dy));
+    popup.style.left = left + "px";
+    popup.style.top = top + "px";
+  };
+  const onUp = () => {
+    if (!drag) return;
+    drag = null;
+    popup.classList.remove("dragging");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+  };
+
+  head.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button, input, textarea")) return; // 按钮/输入框不触发拖动
+    const r = popup.getBoundingClientRect();
+    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width };
+    popup.classList.add("dragging");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    e.preventDefault(); // 防止拖动时选中文字 / 丢焦点
+  });
+
+  // 窗口尺寸变化后把可见的弹窗拉回视口内
+  window.addEventListener("resize", () => {
+    if (popup.classList.contains("hidden")) return;
+    const r = popup.getBoundingClientRect();
+    popup.style.left = Math.min(window.innerWidth - MIN_VISIBLE_X, Math.max(MIN_VISIBLE_X - r.width, r.left)) + "px";
+    popup.style.top = Math.min(window.innerHeight - HEAD_H, Math.max(0, r.top)) + "px";
+  });
+}
+
 async function openAnnotationCreate(blockId, quote) {
   currentAnnotation = { id: null, block_id: blockId, quote };
   annSelectedNode = null;
@@ -1994,6 +2043,7 @@ function setupSidebar() {
 
 document.addEventListener("DOMContentLoaded", () => {
   setupSidebar();
+  setupAnnDrag();
 
   // 中止：进度条旁的停止按钮 / 批注弹窗停止按钮（等同 Ctrl-C）
   $("btn-stop").onclick = stopCurrent;
