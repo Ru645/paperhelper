@@ -206,6 +206,12 @@ function stopProgress() {
   if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
 }
 
+/// 显示/隐藏某个迷你不定长进度条（弹窗内：配置测试 / 批注提问 / AI 生成）。
+function showBar(id, on) {
+  const el = $(id);
+  if (el) el.classList.toggle("hidden", !on);
+}
+
 function setRunning(v) {
   running = v;
   if (!v) setProgress("");
@@ -1006,12 +1012,14 @@ async function generateEdit() {
   $("edit-text").value = "";
   $("btn-edit-gen").disabled = true;
   $("btn-edit-stop").classList.remove("hidden");
+  showBar("edit-ai-bar", true);
   const ctrl = new AbortController();
   editAbort = ctrl;
   let acc = "";
   try {
     await postSse("/api/note/ai", { block_id: editBlockId, instruction, mode }, ({ name, text }) => {
       if (name === "token") {
+        if (!acc) showBar("edit-ai-bar", false); // 有内容流出即收起进度条
         acc += text;
         $("edit-text").value = acc;
         $("edit-text").scrollTop = $("edit-text").scrollHeight;
@@ -1042,6 +1050,7 @@ async function generateEdit() {
     }
   }
   editAbort = null;
+  showBar("edit-ai-bar", false);
   $("btn-edit-gen").disabled = false;
   $("btn-edit-stop").classList.add("hidden");
 }
@@ -1291,6 +1300,7 @@ async function sendAnnotation() {
   const controller = new AbortController();
   annAbort = controller;
   $("ann-stop").classList.remove("hidden");
+  showBar("ann-bar", true);
   try {
     await postSse(url, body, ({ name, text }) => {
       if (name === "error") {
@@ -1302,6 +1312,7 @@ async function sendAnnotation() {
         appendConsole("⏹ 已中止", "warn");
         ansEl.textContent = "（已中止）";
       } else if (name === "token") {
+        if (!streamed) showBar("ann-bar", false); // 有内容流出即收起进度条
         streamed += text;
         ansEl.textContent = streamed;
         $("ann-thread").scrollTop = $("ann-thread").scrollHeight;
@@ -1325,6 +1336,7 @@ async function sendAnnotation() {
     }
   }
   if (annAbort === controller) annAbort = null;
+  showBar("ann-bar", false);
   $("ann-stop").classList.add("hidden");
   $("ann-send").disabled = false;
   $("ann-progress").textContent = "";
@@ -1802,6 +1814,9 @@ async function openConfig() {
     $("cfg-status").textContent = "";
     $("cfg-status").className = "status";
     $("cfg-test-result").classList.add("hidden");
+    showBar("cfg-test-bar", false);
+    $("btn-config-test-stop").classList.add("hidden");
+    $("btn-config-test").disabled = false;
     $("config-modal").classList.remove("hidden");
   } catch (e) {
     alert("读取配置失败: " + e);
@@ -1841,12 +1856,19 @@ async function saveConfig() {
   }
 }
 
-/// 测试当前表单里的 LLM 配置（保存前也可测），展示耗时/状态/原始响应。
+let cfgTestAbort = null;
+
+/// 测试当前表单里的 LLM 配置（保存前也可测），展示耗时/状态/原始响应；可中途停止。
 async function testConfig() {
   const result = $("cfg-test-result");
   result.classList.remove("hidden");
   result.className = "test-result";
   result.textContent = "测试中…";
+  showBar("cfg-test-bar", true);
+  $("btn-config-test").disabled = true;
+  $("btn-config-test-stop").classList.remove("hidden");
+  const ctrl = new AbortController();
+  cfgTestAbort = ctrl;
   try {
     const res = await fetch("/api/config/test", {
       method: "POST",
@@ -1856,6 +1878,7 @@ async function testConfig() {
         model: $("cfg-model").value.trim(),
         api_key: $("cfg-key").value.trim(),
       }),
+      signal: ctrl.signal,
     });
     const r = await res.json();
     result.innerHTML = "";
@@ -1864,6 +1887,9 @@ async function testConfig() {
       result.textContent =
         `✓ 连接成功 · HTTP ${r.status} · ${r.latency_ms}ms · 模型 ${r.model}` +
         ` · 回复「${r.reply}」· tokens ${r.input_tokens}/${r.output_tokens}`;
+    } else if (r.raw === "已中止") {
+      result.className = "test-result";
+      result.textContent = "⏹ 已中止";
     } else {
       result.className = "test-result err";
       const head = document.createElement("div");
@@ -1882,8 +1908,24 @@ async function testConfig() {
       }
     }
   } catch (e) {
-    result.className = "test-result err";
-    result.textContent = "❌ 测试请求失败: " + e.message;
+    if (e && e.name === "AbortError") {
+      result.className = "test-result";
+      result.textContent = "⏹ 已中止";
+    } else {
+      result.className = "test-result err";
+      result.textContent = "❌ 测试请求失败: " + e.message;
+    }
+  }
+  cfgTestAbort = null;
+  showBar("cfg-test-bar", false);
+  $("btn-config-test").disabled = false;
+  $("btn-config-test-stop").classList.add("hidden");
+}
+
+function stopConfigTest() {
+  fetch("/api/interrupt", { method: "POST" }).catch(() => {});
+  if (cfgTestAbort) {
+    try { cfgTestAbort.abort(); } catch (e) { /* 忽略 */ }
   }
 }
 
@@ -2024,6 +2066,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config").onclick = openConfig;
   $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
   $("btn-config-test").onclick = testConfig;
+  $("btn-config-test-stop").onclick = stopConfigTest;
   $("btn-config-save").onclick = saveConfig;
 
   // 导入弹窗：文件名 + 笔记风格

@@ -107,6 +107,7 @@
     <button id="ann-stop" class="mini ghost hidden" title="中止当前提问">停止</button>
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>
+  <div id="ann-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
   <div class="ann-thread" id="ann-thread"></div>
   <div class="ann-input">
     <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
@@ -150,6 +151,7 @@
       <button id="btn-edit-gen" class="mini primary">生成</button>
       <button id="btn-edit-stop" class="mini ghost hidden">停止</button>
     </div>
+    <div id="edit-ai-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
     <textarea id="edit-text" rows="14" placeholder="支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节"></textarea>
     <div class="edit-tools">
       <button id="btn-edit-insert" class="mini ghost">插入到该块后</button>
@@ -177,8 +179,10 @@
     <div class="modal-actions">
       <button id="btn-config-cancel" class="ghost">取消</button>
       <button id="btn-config-test" class="ghost">测试连接</button>
+      <button id="btn-config-test-stop" class="ghost hidden">停止</button>
       <button id="btn-config-save" class="primary">保存</button>
     </div>
+    <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
     <div id="cfg-test-result" class="test-result hidden"></div>
     <p id="cfg-status" class="status"></p>
   </div>

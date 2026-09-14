@@ -170,6 +170,14 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
   100% { transform: translateX(320%); }
 }
 
+/* 弹窗内的迷你不定长进度条（配置测试 / 批注提问 / AI 生成） */
+.mini-bar { height: 3px; background: var(--blue-light); overflow: hidden; border-radius: 2px; margin: 6px 0; }
+.mini-bar.hidden { display: none; }
+.mini-bar-fill {
+  height: 100%; width: 35%; background: var(--blue);
+  animation: indeterminate 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
 /* 运行中的「停止」按钮（进度条旁） */
 .stop-btn {
   border: 1px solid var(--danger); color: var(--danger); background: #fff;
