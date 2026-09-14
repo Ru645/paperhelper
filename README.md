@@ -12,6 +12,8 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 - **笔记内就地提问**：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内问答；答案与所选文字绑定，点击高亮即可重新展开
 - **章节提问**：右键笔记标题（h1=全文，h2/h3=小节）→「对本章节提问」
 - **递归嵌套批注**：对追问的回答再追问，批注层层嵌套；`sum` 把子树折叠成「总结」并可展开
+- **多种笔记风格**：导入时可选「四段式 / 逐段翻译（忠实原文）/ 自由笔记（结构自定）」；翻译为单次整篇，输出被截断会明确提示
+- **编辑与 AI 改写**：悬停笔记块点「✎ 编辑」即可改文字；也可让 AI 重写 / 补充某段，或手动插入内容、删除整块（普通编辑不换块 id，追问与批注不受影响）
 - **导入 PDF → 结构化笔记**：LLM 按固定四段架构（问题 / 前人方案 / 本文方案 / 前景）生成详细 Markdown，含公式、表格、数值结果
 - **跨论文知识库**：自动积累读过的论文与学过的概念，追问时自动关联已学知识
 - **导出**：一键下载 Markdown / 思维导图（markmap）/ 自包含 HTML（KaTeX 公式渲染，含只读批注弹窗）
@@ -48,8 +50,15 @@ paperhelper web --port 9000  # 指定端口
 - **笔记结构**：笔记大纲，点击定位到笔记对应位置；有批注的块标 `●`。
 - **会话历史**：顶部「＋ 新会话」；点条目加载；右键置顶 / 重命名 / 删除。
 - **已读论文 / 已学概念**：点击查看详情；右键置顶 / 删除。
+- **批量操作**：三个列表均支持 **Ctrl(⌘) 点选、Shift 连选**，右键即可批量置顶 / 删除；标题旁显示「已选 N」，`Esc` 取消选择。
 
-**导入**：新建会话（或还没有笔记）时，「笔记」页中央显示「＋ 导入论文」按钮，点击选择文件；也可直接把 PDF / TXT 拖进窗口。上传后自动执行导入（并询问笔记文件名），无需手输命令。上传时显示百分比；解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。
+**导入**：新建会话（或还没有笔记）时，「笔记」页中央显示「＋ 导入论文」按钮，点击选择文件；也可直接把 PDF / TXT 拖进窗口。上传前弹出**导入窗口**：填笔记文件名、选**笔记风格**（四段式 / 逐段翻译 / 自由笔记）。上传时显示百分比；解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。
+
+**编辑笔记**：鼠标悬停任意标题 / 段落 → 右上角浮出「✎ 编辑」→ 弹窗内可：
+- **手动改文字**：直接改（支持 Markdown 与 `$公式$`），点「应用」保存；
+- **AI 重写 / AI 补充**：填一句要求 →「生成」→ 结果**流式写入编辑框**（可「停止」）→ 可再修改 → 点「应用」才写回（重写）或「插入」（补充）；
+- **插入到该块后**：把编辑框内容按 Markdown 解析成多个块插入；
+- **删除该块**：连同子树、追问与相关批注一起删除（二次确认）。
 
 **运行中与中止**：长任务（导入 / 提问 / 批注 / 总结）进行时，标签栏右侧显示进度与「⏹ 停止」按钮，点击立即中止（后端打断 + 断开本地流）；批注弹窗右上角也有「停止」。
 
@@ -104,13 +113,17 @@ source ~/.bashrc
 ### 导入选项
 
 ```bash
-> ingest samples/论文.pdf           # 默认：PyMuPDF 提取文本
-> ingest --text samples/论文.txt     # 直接读取文本文件（跳过 PDF 解析）
-> ingest --ocr samples/扫描件.pdf    # OCR 识别（需安装 tesseract）
+> ingest samples/论文.pdf                       # 默认：PyMuPDF 提取文本 + 四段式笔记
+> ingest --style translate samples/论文.pdf    # 逐段翻译风格（忠实原文）
+> ingest --style free samples/论文.pdf         # 自由笔记（不加结构约束）
+> ingest --text samples/论文.txt                # 直接读取文本文件（跳过 PDF 解析）
+> ingest --ocr samples/扫描件.pdf               # OCR 识别（需安装 tesseract）
 ```
 
+- `--style four|translate|free`：笔记生成风格（可与其他选项任意顺序组合），对应提示词 `note.txt`/`translate.txt`/`free.txt`
 - `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果
 - `--ocr`：适合扫描版 PDF（无文本层）；未装 tesseract 会给出安装指引，不影响其他功能
+- 翻译为**单次整篇**生成；若模型输出达到上限被截断，会提示「⚠️ 笔记可能被截断」
 
 ### REPL 操作与补全
 
@@ -121,7 +134,7 @@ source ~/.bashrc
 
 | 命令 | 说明 |
 |------|------|
-| `ingest <pdf>` | 导入 PDF，生成结构化笔记（四段架构），自动导出 |
+| `ingest [--style four\|translate\|free] <pdf>` | 导入 PDF 生成笔记（可选风格），自动导出 |
 | `ingest --text <txt>` | 直接读取文本文件（跳过 PDF 解析） |
 | `ingest --ocr <pdf>` | OCR 识别扫描件（需 tesseract） |
 | `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
@@ -245,7 +258,10 @@ paperhelper                  # CLI REPL
 ├── knowledge.json       # 跨论文知识库（论文+概念+累计用量）
 ├── prompts/             # 提示词模板（可编辑）
 │   ├── ask.txt          # ask/check 的 system prompt
-│   └── note.txt         # 笔记生成模板（{raw_text} 为论文占位符）
+│   ├── note.txt         # 四段式笔记模板（{raw_text} 为论文占位符）
+│   ├── translate.txt    # 逐段翻译模板
+│   ├── free.txt         # 自由笔记模板
+│   └── rewrite.txt      # AI 改写/补充模板（{paper}/{note}/{target}/{instruction}/{task}）
 ├── uploads/             # Web 端上传的论文文件
 ├── logs/                # 运行日志（超过 5MB 轮转为 paperhelper.log.1）
 │   └── paperhelper.log
@@ -269,7 +285,7 @@ paperhelper                  # CLI REPL
 
 ## 自定义提示词与补全预设
 
-- **提示词**：直接编辑 `.paperhelper/prompts/ask.txt` 和 `note.txt`。`note.txt` 中 `{raw_text}` 会被替换为论文全文。改完重启生效；删除文件则恢复内置默认。
+- **提示词**：直接编辑 `.paperhelper/prompts/` 下的模板：`ask.txt`（回答风格）、`note.txt` / `translate.txt` / `free.txt`（三种笔记风格，`{raw_text}` 会被替换为论文全文）、`rewrite.txt`（AI 改写/补充）。改完重启生效；删除文件则恢复内置默认。
 - **补全预设**：`config.toml` 的 `[presets]` 节可增删 `config set llm.model` / `llm.api_endpoint` 的 Tab 补全候选：
 
 ```toml
@@ -286,6 +302,7 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **LLM 只产自然语言**：生成笔记、回答追问、提取概念名、给会话取名、生成总结
 - **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，`sum` 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **文本锚点批注**：批注记录 `block_id + 选中文字`，渲染时按文本引用定位并高亮，点击可重开弹窗
+- **可编辑笔记树**：块级编辑（改文字 / 整节重写 / 插入 / 删除）尽量保持块 id 稳定；`parse_markdown_blocks` 把 Markdown 解析成块序列（`#` 也当 Section），结构变化后统一重排编号
 - **流式输出 + 进度**：LLM 输出实时渲染，耗时任务显示进度条与实时字数/耗时
 - **可中止**：`interrupt` 全局信号 + `tokio::select!`——LLM 的发送/读取、重试等待、PDF/OCR 子进程（`kill_on_drop`）都能被 `Ctrl-C` / Web「停止」立即打断
 - **Web / CLI 双前端**：业务输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）

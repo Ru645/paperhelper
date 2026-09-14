@@ -41,15 +41,15 @@
         <ul id="outline" class="outline"><li class="muted">（还没有笔记）</li></ul>
       </section>
       <section data-panel="sessions">
-        <h3>会话历史</h3>
+        <h3>会话历史 <span class="sel-count" id="sel-count-sessions"></span></h3>
         <ul id="sessions" class="session-list"><li class="muted">（无）</li></ul>
       </section>
       <section data-panel="papers">
-        <h3>已读论文</h3>
+        <h3>已读论文 <span class="sel-count" id="sel-count-papers"></span></h3>
         <ul id="papers" class="plain"><li class="muted">（无）</li></ul>
       </section>
       <section data-panel="concepts">
-        <h3>已学概念</h3>
+        <h3>已学概念 <span class="sel-count" id="sel-count-concepts"></span></h3>
         <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
       </section>
     </div>
@@ -95,6 +95,9 @@
 <!-- 选中文字后浮出的“提问”按钮 -->
 <button id="sel-btn" class="sel-btn hidden">提问</button>
 
+<!-- 悬停笔记块时浮出的“编辑”按钮 -->
+<button id="blk-edit-btn" class="blk-edit-btn hidden" title="编辑该块">✎ 编辑</button>
+
 <!-- 批注弹窗（引用 + 对话线程 + 输入） -->
 <div id="ann-popup" class="ann-popup hidden">
   <div class="ann-head">
@@ -109,6 +112,54 @@
     <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
     <input id="ann-q" type="text" placeholder="针对选中文字提问，回车发送…" autocomplete="off">
     <button id="ann-send" class="mini primary">发送</button>
+  </div>
+</div>
+
+<!-- 导入论文：文件名 + 笔记风格 -->
+<div id="import-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>导入论文</h2>
+    <p id="import-file" class="muted"></p>
+    <label>笔记文件名<input id="import-name" type="text" placeholder="笔记_xxx.md"></label>
+    <label>笔记风格
+      <select id="import-style">
+        <option value="four">四段式（问题 / 前人方案 / 本文方案 / 前景）</option>
+        <option value="translate">逐段翻译（忠实原文、几乎照搬；长文可能被截断）</option>
+        <option value="free">自由笔记（不加结构约束，由模型自行组织）</option>
+      </select>
+    </label>
+    <div class="modal-actions">
+      <button id="btn-import-cancel" class="ghost">取消</button>
+      <button id="btn-import-ok" class="primary">导入</button>
+    </div>
+  </div>
+</div>
+
+<!-- 笔记块编辑：手动 / AI 重写 / AI 补充 -->
+<div id="edit-modal" class="modal hidden">
+  <div class="modal-box edit-box">
+    <h2 id="edit-title">编辑笔记块</h2>
+    <p id="edit-hint" class="muted"></p>
+    <div class="edit-tabs">
+      <button class="edit-tab active" data-mode="manual">手动编辑</button>
+      <button class="edit-tab" data-mode="rewrite">AI 重写</button>
+      <button class="edit-tab" data-mode="append">AI 补充</button>
+    </div>
+    <div id="edit-ai-row" class="edit-ai-row hidden">
+      <input id="edit-instruction" type="text" placeholder="告诉 AI 怎么改，如：补充这个方法的直觉解释 / 重写得更有条理" autocomplete="off">
+      <button id="btn-edit-gen" class="mini primary">生成</button>
+      <button id="btn-edit-stop" class="mini ghost hidden">停止</button>
+    </div>
+    <textarea id="edit-text" rows="14" placeholder="支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节"></textarea>
+    <div class="edit-tools">
+      <button id="btn-edit-insert" class="mini ghost">插入到该块后</button>
+      <button id="btn-edit-delete" class="mini ghost danger">删除该块</button>
+    </div>
+    <div class="modal-actions">
+      <button id="btn-edit-cancel" class="ghost">取消</button>
+      <button id="btn-edit-apply" class="primary">应用</button>
+    </div>
+    <p id="edit-status" class="status"></p>
   </div>
 </div>
 
@@ -138,6 +189,8 @@
     <h2>使用帮助</h2>
     <ul class="help-list">
       <li><b>导入</b>：在还没有笔记的「笔记」页点「＋ 导入论文」，或直接把 PDF/TXT 拖进窗口。</li>
+      <li><b>多种风格</b>：导入时可选择「四段式 / 逐段翻译 / 自由笔记」；提示词可在 <code>.paperhelper/prompts/</code> 里改。</li>
+      <li><b>编辑笔记</b>：鼠标悬停在笔记的标题/段落上，点右上角「✎ 编辑」→ 手动改文字，或让 AI 重写 / 补充；也可把内容插入到该块后、删除整块。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
@@ -145,6 +198,7 @@
       <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>
       <li><b>配置</b>：点「配置」修改 API 端点/密钥/模型/价格/预算。</li>
+      <li><b>列表多选</b>：侧栏的会话 / 论文 / 概念列表，Ctrl(⌘) 点选、Shift 连选，右键可批量置顶 / 删除；Esc 取消选择。</li>
     </ul>
     <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
   </div>

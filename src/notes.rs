@@ -13,6 +13,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 笔记标题在「块编辑」接口里的哨兵 id（Web 端用 `blk-__title__` 定位标题）。
+pub const TITLE_ID: &str = "__title__";
+
 /// 笔记块的类型：章节 / 段落 / 公式。
 /// Formula 在解析阶段被并入 Paragraph，通常只在导出渲染细节中使用。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +129,74 @@ impl Note {
             None
         }
         walk(&mut self.blocks, id)
+    }
+
+    /// 修改块文本；`TITLE_ID` 表示修改标题。返回是否找到目标。
+    pub fn set_text(&mut self, id: &str, text: &str) -> bool {
+        if id == TITLE_ID {
+            self.title = text.to_string();
+            return true;
+        }
+        match self.find_block_mut(id) {
+            Some(b) => {
+                b.text = text.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 在目标块之后插入若干块（同父级）。返回是否找到目标。
+    pub fn insert_blocks_after(&mut self, target_id: &str, blocks: Vec<Block>) -> bool {
+        fn walk(blocks: &mut Vec<Block>, target_id: &str, new_blocks: &[Block]) -> bool {
+            if let Some(pos) = blocks.iter().position(|b| b.id == target_id) {
+                for (k, b) in new_blocks.iter().enumerate() {
+                    blocks.insert(pos + 1 + k, b.clone());
+                }
+                return true;
+            }
+            for b in blocks.iter_mut() {
+                if walk(&mut b.children, target_id, new_blocks) {
+                    return true;
+                }
+            }
+            false
+        }
+        walk(&mut self.blocks, target_id, &blocks)
+    }
+
+    /// 用新块替换某 Section 的全部 children（整节重写）。
+    /// 段落块会先提升为 Section（重写段落直接改文本，见 `set_text`）。
+    pub fn replace_children(&mut self, section_id: &str, blocks: Vec<Block>) -> bool {
+        match self.find_block_mut(section_id) {
+            Some(b) if b.kind == BlockKind::Section => {
+                b.children = blocks;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 删除块及其子树（含追问）。返回是否删除。
+    pub fn remove_block(&mut self, id: &str) -> bool {
+        fn walk(blocks: &mut Vec<Block>, id: &str) -> bool {
+            if let Some(pos) = blocks.iter().position(|b| b.id == id) {
+                blocks.remove(pos);
+                return true;
+            }
+            for b in blocks.iter_mut() {
+                if walk(&mut b.children, id) {
+                    return true;
+                }
+            }
+            false
+        }
+        walk(&mut self.blocks, id)
+    }
+
+    /// 结构变化（插入/删除/重写）后重新分配章节编号。
+    pub fn renumber(&mut self) {
+        assign_numbers(self);
     }
 
     /// 用关键词重叠度定位最相关的块（Rust 确定性逻辑）。
@@ -405,16 +476,54 @@ fn is_cjk(c: char) -> bool {
 /// 约定：`#`=标题；`##`/`###`…=按层级嵌套的 Section；`$$…$$`=Formula；
 /// 其余非空行=Paragraph（连续行合并为一段），挂到最近的 Section 下。
 pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
+    let (mut title, mut roots) = parse_blocks_core(md, true);
+
+    if title.is_empty() {
+        title = "未命名论文".to_string();
+    }
+    // 兜底：完全没解析出内容时，用原文做一个段落
+    if roots.is_empty() && !raw_text.is_empty() {
+        let t: String = raw_text.chars().take(2000).collect();
+        roots.push(Block {
+            id: uid(),
+            kind: BlockKind::Paragraph,
+            text: t,
+            number: String::new(),
+            children: Vec::new(),
+            explanations: Vec::new(),
+        });
+    }
+
+    let mut note = Note {
+        paper_id: String::new(),
+        title,
+        blocks: roots,
+        raw_text: raw_text.to_string(),
+    };
+    assign_numbers(&mut note);
+    note
+}
+
+/// 解析一段 Markdown 为块序列（供「插入内容 / 整节重写」使用）。
+/// 与 `parse_markdown_note` 不同：`#` 也视为顶层 Section，而非被当成标题吞掉。
+pub fn parse_markdown_blocks(md: &str) -> Vec<Block> {
+    let (_title, roots) = parse_blocks_core(md, false);
+    roots
+}
+
+/// 解析核心：返回 (标题, 顶层块)。`h1_as_title=true` 时 `#` 作标题（ingest 用）；
+/// false 时 `#`/`##`/`###` 分别对应深度 0/1/2（插入/重写用）。
+fn parse_blocks_core(md: &str, h1_as_title: bool) -> (String, Vec<Block>) {
     let md = strip_fences(md);
     let lines: Vec<&str> = md.lines().collect();
 
     let mut title = String::new();
     let mut roots: Vec<Block> = Vec::new();
-    // stack[i] 是当前打开的 depth=i 的 Section。
-    let mut stack: Vec<Block> = Vec::new();
+    // 当前打开的各层 Section：(块, 标题层级)。层级用于判断新标题挂到哪一层。
+    let mut stack: Vec<(Block, usize)> = Vec::new();
     let mut para_buf = String::new();
 
-    let flush_para = |buf: &mut String, roots: &mut Vec<Block>, stack: &mut Vec<Block>| {
+    let flush_para = |buf: &mut String, roots: &mut Vec<Block>, stack: &mut Vec<(Block, usize)>| {
         if !buf.trim().is_empty() {
             let block = Block {
                 id: uid(),
@@ -424,7 +533,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 children: Vec::new(),
                 explanations: Vec::new(),
             };
-            if let Some(sec) = stack.last_mut() {
+            if let Some((sec, _)) = stack.last_mut() {
                 sec.children.push(block);
             } else {
                 roots.push(block);
@@ -455,7 +564,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
             let text = strip_leading_number(raw);
             flush_para(&mut para_buf, &mut roots, &mut stack);
 
-            if level == 1 {
+            if level == 1 && h1_as_title {
                 if title.is_empty() {
                     title = text;
                 }
@@ -463,24 +572,30 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 continue;
             }
 
-            // 关闭 depth >= (level-2) 的 Section
-            let target_depth = level - 2;
-            while stack.len() > target_depth {
-                let sec = stack.pop().unwrap();
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(sec);
+            // 关闭所有层级 >= 当前标题的 Section（同层或更深的都收束为兄弟/上提）
+            while let Some((_, l)) = stack.last() {
+                if *l >= level {
+                    let (sec, _) = stack.pop().unwrap();
+                    if let Some((parent, _)) = stack.last_mut() {
+                        parent.children.push(sec);
+                    } else {
+                        roots.push(sec);
+                    }
                 } else {
-                    roots.push(sec);
+                    break;
                 }
             }
-            stack.push(Block {
-                id: uid(),
-                kind: BlockKind::Section,
-                text,
-                number: String::new(),
-                children: Vec::new(),
-                explanations: Vec::new(),
-            });
+            stack.push((
+                Block {
+                    id: uid(),
+                    kind: BlockKind::Section,
+                    text,
+                    number: String::new(),
+                    children: Vec::new(),
+                    explanations: Vec::new(),
+                },
+                level,
+            ));
             i += 1;
             continue;
         }
@@ -523,7 +638,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
                 para_buf.push_str(&formula_text);
             } else {
                 // 并入最近一个段落块（跳过被空行隔开的情况）
-                let target: Option<&mut Block> = if let Some(sec) = stack.last_mut() {
+                let target: Option<&mut Block> = if let Some((sec, _)) = stack.last_mut() {
                     sec.children.last_mut()
                 } else {
                     roots.last_mut()
@@ -555,39 +670,15 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
     flush_para(&mut para_buf, &mut roots, &mut stack);
 
     // 关闭剩余打开的 Section
-    while let Some(sec) = stack.pop() {
-        if let Some(parent) = stack.last_mut() {
+    while let Some((sec, _)) = stack.pop() {
+        if let Some((parent, _)) = stack.last_mut() {
             parent.children.push(sec);
         } else {
             roots.push(sec);
         }
     }
 
-    if title.is_empty() {
-        title = "未命名论文".to_string();
-    }
-
-    // 兜底：完全没解析出内容时，用原文做一个段落
-    if roots.is_empty() && !raw_text.is_empty() {
-        let t: String = raw_text.chars().take(2000).collect();
-        roots.push(Block {
-            id: uid(),
-            kind: BlockKind::Paragraph,
-            text: t,
-            number: String::new(),
-            children: Vec::new(),
-            explanations: Vec::new(),
-        });
-    }
-
-    let mut note = Note {
-        paper_id: String::new(),
-        title,
-        blocks: roots,
-        raw_text: raw_text.to_string(),
-    };
-    assign_numbers(&mut note);
-    note
+    (title, roots)
 }
 
 /// 给每个 Section 块按层级分配编号（如 "3.2"），写进 block.number。
@@ -1071,5 +1162,86 @@ mod tests {
         assert!(html.contains("expl-e1"), "HTML 应含解释锚点: ");
         let md_out = crate::export::to_markdown(&note);
         assert!(!md_out.contains("expl-e1"), "Markdown 导出不应含锚点");
+    }
+
+    #[test]
+    fn set_text_updates_block_and_title() {
+        let md = "# T\n## A\nold text\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let para = note.locate("old").unwrap().id.clone();
+        assert!(note.set_text(&para, "new text"));
+        assert_eq!(note.locate("new").unwrap().text, "new text");
+        assert!(note.set_text(TITLE_ID, "NewTitle"));
+        assert_eq!(note.title, "NewTitle");
+        assert!(!note.set_text("no-such-id", "x"));
+    }
+
+    #[test]
+    fn parse_markdown_blocks_treats_h1_as_section() {
+        let blocks = parse_markdown_blocks("# A\n## B\ntext\n");
+        assert_eq!(blocks.len(), 1, "h1 应成为顶层 Section");
+        assert_eq!(blocks[0].text, "A");
+        assert_eq!(blocks[0].kind, BlockKind::Section);
+        assert_eq!(blocks[0].children.len(), 1);
+        assert_eq!(blocks[0].children[0].text, "B");
+    }
+
+    #[test]
+    fn parse_markdown_blocks_same_level_siblings() {
+        // 内容以 ### 开头（没有 ## 父级）时，同层标题应互为兄弟而非嵌套
+        let blocks = parse_markdown_blocks("### A\n文本A\n### B\n文本B\n");
+        assert_eq!(blocks.len(), 2, "同层标题应为兄弟");
+        assert_eq!(blocks[0].text, "A");
+        assert_eq!(blocks[1].text, "B");
+    }
+
+    #[test]
+    fn insert_blocks_after_places_siblings() {
+        let md = "# T\n## A\none\n## B\ntwo\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let a = note.locate("one").unwrap().id.clone();
+        // 注意：段落与 section 同属 roots，插入到段落之后
+        let new_blocks = parse_markdown_blocks("### New\nfresh\n");
+        assert!(note.insert_blocks_after(&a, new_blocks));
+        let flat = note.flatten();
+        let idx_a = flat.iter().position(|(b, _)| b.id == a).unwrap();
+        assert_eq!(flat[idx_a + 1].0.text, "New");
+        assert!(flat[idx_a + 2].0.text.contains("fresh"));
+        assert!(!note.insert_blocks_after("nope", vec![]));
+    }
+
+    #[test]
+    fn replace_children_swaps_section_body_and_renumbers() {
+        let md = "# T\n## A\nold\n## B\ntwo\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let a = note.find_section_by_number("1").unwrap().id.clone();
+        let new_children = parse_markdown_blocks("### 子节\n新的内容\n");
+        assert!(note.replace_children(&a, new_children));
+        let a_block = note.find_block(&a).unwrap();
+        assert_eq!(a_block.children.len(), 1);
+        assert_eq!(a_block.children[0].text, "子节");
+        assert!(a_block.children[0]
+            .children
+            .iter()
+            .any(|c| c.text.contains("新的内容")));
+        // 段落块不能替换 children
+        let para = note.locate("two").unwrap().id.clone();
+        assert!(!note.replace_children(&para, vec![]));
+        note.renumber();
+        assert_eq!(note.find_section_by_number("1.1").unwrap().text, "子节");
+    }
+
+    #[test]
+    fn remove_block_removes_subtree() {
+        let md = "# T\n## A\n### A1\naaaa\n### A2\nbbbb\n## B\ncccc\n";
+        let mut note = parse_markdown_note(md, "raw");
+        let a = note.find_section_by_number("1").unwrap().id.clone();
+        assert!(note.remove_block(&a));
+        assert!(note.find_block(&a).is_none());
+        assert!(note.locate("aaaa").is_none(), "子树应一并删除");
+        assert!(note.locate("cccc").is_some(), "兄弟节点保留");
+        assert!(!note.remove_block("nope"));
+        note.renumber();
+        assert_eq!(note.find_section_by_number("1").unwrap().text, "B");
     }
 }

@@ -565,9 +565,10 @@ impl App {
     fn cmd_help(&self) -> Result<()> {
         let h = "\
 PaperHelper 命令：
-  ingest <pdf>            解析 PDF 并生成结构化笔记
+  ingest <pdf>            解析 PDF 并生成结构化笔记（--style four|translate|free 选风格）
   ingest --text <txt>     直接读取文本文件（跳过PDF解析）
   ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
+                          例: ingest --style translate paper.pdf  （逐段翻译风格）
   ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
@@ -864,19 +865,24 @@ PaperHelper 命令：
     /// 全程记录 token，超预算/被打断即中止且不写会话。
     async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
         let rest = rest.trim();
+        // 先剥离 --style（与 --text/--ocr 任意顺序）
+        let (style_raw, rest) = take_style_arg(rest)?;
+        let style = if style_raw.is_empty() { "four".to_string() } else { style_raw };
+        let (prompt_file, prompt_default) = crate::prompts::note_style_prompt(&style)?;
+        let rest = rest.as_str();
         // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
         let (mode, file_path) = if let Some(r) = rest.strip_prefix("--text ") {
             ("text", normalize_path_arg(r))
         } else if let Some(r) = rest.strip_prefix("--ocr ") {
             ("ocr", normalize_path_arg(r))
         } else if rest == "--text" || rest == "--ocr" {
-            bail!("用法: ingest --text <txt路径>  或  ingest --ocr <pdf路径>  或  ingest <pdf路径>");
+            bail!("用法: ingest [--style four|translate|free] [--text|--ocr] <路径>");
         } else {
             ("pdf", normalize_path_arg(rest))
         };
 
         if file_path.is_empty() {
-            bail!("用法: ingest <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
+            bail!("用法: ingest [--style four|translate|free] <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
         let p = Path::new(&file_path);
         if !p.exists() {
@@ -938,12 +944,13 @@ PaperHelper 命令：
         if !budget_ok {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
         }
-        // 提示词模板：.paperhelper/prompts/note.txt（用户可编辑），{raw_text} 为占位符
+        // 提示词模板：按风格选（.paperhelper/prompts/<file>，用户可编辑），{raw_text} 为占位符
         let template = crate::prompts::load_prompt(
             &crate::prompts::prompts_dir(),
-            "note.txt",
-            crate::prompts::DEFAULT_NOTE_PROMPT,
+            prompt_file,
+            prompt_default,
         );
+        crate::logging::info(format!("生成笔记：风格={style}，提示词={prompt_file}"));
         let prompt = template.replace("{raw_text}", &raw_text);
         let msgs = vec![
             Message { role: "system".into(), content: "你是论文笔记生成助手，只输出 Markdown。".into() },
@@ -970,6 +977,15 @@ PaperHelper 命令：
         }
         self.emitter.stdout("");
         let res = res?;
+
+        if res.truncated() {
+            outerr!(
+                self,
+                "{} 模型输出达到上限（finish_reason=length），笔记可能被截断。\
+                 可换更长输出上限的模型，或改用更短的论文/文本（翻译风格尤其容易触发）。",
+                "⚠️ ".yellow()
+            );
+        }
 
         // 3. 统计与预算检查
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -1288,6 +1304,166 @@ PaperHelper 命令：
             }
         }
         Ok(())
+    }
+
+    // ===== 笔记编辑（Web）：改文字 / 整节重写 / 插入 / 删除 =====
+
+    /// 修改块的文字（`notes::TITLE_ID` 表示标题）。
+    pub fn edit_block(&mut self, block_id: &str, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("内容不能为空");
+        }
+        {
+            let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
+            if !note.set_text(block_id, text) {
+                bail!("找不到要编辑的块（笔记可能已变化）");
+            }
+        }
+        self.after_note_change();
+        Ok(())
+    }
+
+    /// 整节重写：段落 → 直接替换文本；章节 → 用 Markdown 解析出的新块替换其 children。
+    /// 内容里的 `#`/`##`/`###` 分别对应第 0/1/2 层小节。
+    pub fn rewrite_block(&mut self, block_id: &str, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("内容不能为空");
+        }
+        {
+            let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
+            let is_section = note
+                .find_block(block_id)
+                .map(|b| b.kind == notes::BlockKind::Section)
+                .unwrap_or(false);
+            if is_section {
+                let blocks = notes::parse_markdown_blocks(text);
+                if blocks.is_empty() {
+                    bail!("内容解析不出任何块");
+                }
+                if !note.replace_children(block_id, blocks) {
+                    bail!("找不到要重写的章节");
+                }
+                note.renumber();
+            } else if !note.set_text(block_id, text) {
+                bail!("找不到要重写的块（笔记可能已变化）");
+            }
+        }
+        self.after_note_change();
+        Ok(())
+    }
+
+    /// 在目标块之后插入 Markdown 解析出的块（可一次插入多个）。
+    pub fn insert_after(&mut self, after_block_id: &str, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("内容不能为空");
+        }
+        let blocks = notes::parse_markdown_blocks(text);
+        if blocks.is_empty() {
+            bail!("内容解析不出任何块");
+        }
+        {
+            let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
+            if !note.insert_blocks_after(after_block_id, blocks) {
+                bail!("找不到插入位置（笔记可能已变化）");
+            }
+            note.renumber();
+        }
+        self.after_note_change();
+        Ok(())
+    }
+
+    /// 删除块及其子树（含其上的追问）；同时移除指向这些块的批注。返回删除的块数。
+    pub fn remove_note_block(&mut self, block_id: &str) -> Result<usize> {
+        if block_id == notes::TITLE_ID {
+            bail!("标题不能删除");
+        }
+        let ids = {
+            let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+            let Some(b) = note.find_block(block_id) else {
+                bail!("找不到要删除的块");
+            };
+            let mut ids = Vec::new();
+            collect_block_ids(b, &mut ids);
+            ids
+        };
+        {
+            let note = self.session.notes.as_mut().unwrap();
+            if !note.remove_block(block_id) {
+                bail!("删除失败（笔记可能已变化）");
+            }
+            note.renumber();
+        }
+        let removed_ann = self
+            .session
+            .annotations
+            .iter()
+            .filter(|a| ids.contains(&a.block_id))
+            .count();
+        if removed_ann > 0 {
+            self.session.annotations.retain(|a| !ids.contains(&a.block_id));
+        }
+        self.after_note_change();
+        Ok(ids.len())
+    }
+
+    /// 变更笔记后的统一收尾：同步导出到 export_path + 保存会话（失败只记日志，不影响主操作）。
+    fn after_note_change(&mut self) {
+        if let Some(p) = self.export_path.clone() {
+            if !p.is_empty() {
+                if let Some(note) = &self.session.notes {
+                    let content =
+                        export::render_for(&p, note, &self.session.conversation, &self.session.annotations);
+                    if let Err(e) = std::fs::write(&p, content) {
+                        crate::logging::error(format!("同步导出失败 {p}: {e:#}"));
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.auto_persist() {
+            crate::logging::error(format!("保存会话失败: {e:#}"));
+        }
+    }
+
+    /// 构造「AI 改写 / 补充」的消息（只生成、不改笔记；由 Web 端流式返回给用户确认）。
+    /// `mode`：`"rewrite"`（重写该片段）或 `"append"`（补充到该片段之后）。
+    pub fn note_ai_messages(&self, block_id: &str, instruction: &str, mode: &str) -> Result<Vec<Message>> {
+        if !matches!(mode, "rewrite" | "append") {
+            bail!("mode 只能是 rewrite 或 append");
+        }
+        let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+        let target = if block_id == notes::TITLE_ID {
+            format!("（整篇笔记标题）{}", note.title)
+        } else {
+            let b = note.find_block(block_id).ok_or_else(|| anyhow!("找不到要处理的块"))?;
+            let kind = match b.kind {
+                notes::BlockKind::Section => format!(
+                    "章节 {}",
+                    if b.number.is_empty() { "（未编号）".to_string() } else { b.number.clone() }
+                ),
+                _ => "段落".to_string(),
+            };
+            format!("（{kind}）\n{}", b.text)
+        };
+        let task = if mode == "append" {
+            "请生成要**补充**到该片段之后的新内容；不要重复已有内容，可直接给出新的段落或 `##`/`###` 小节。"
+        } else {
+            "请**重写**该片段（整段替换）；保留原意，使表述更清晰、更完整，必要时可拆成多段。"
+        };
+        let template = crate::prompts::load_prompt(
+            &crate::prompts::prompts_dir(),
+            "rewrite.txt",
+            crate::prompts::DEFAULT_REWRITE_PROMPT,
+        );
+        let prompt = template
+            .replace("{paper}", &note.raw_text)
+            .replace("{note}", &note.to_markdown())
+            .replace("{target}", &target)
+            .replace("{instruction}", instruction)
+            .replace("{task}", task);
+        Ok(vec![Message { role: "user".into(), content: prompt }])
     }
 
     /// 新建批注（Web）：在 block_id 处针对选中文字提问，作为独立线程的根节点。
@@ -1625,7 +1801,7 @@ PaperHelper 命令：
     }
 
     /// 记录一次 LLM 调用的 token 与成本（会话 + 全局）。
-    fn record_usage(&mut self, input: u64, output: u64) {
+    pub(crate) fn record_usage(&mut self, input: u64, output: u64) {
         let in_price = self.config.pricing.input_price_per_1m;
         let out_price = self.config.pricing.output_price_per_1m;
         let cost = input as f64 * in_price / 1_000_000.0 + output as f64 * out_price / 1_000_000.0;
@@ -1759,6 +1935,42 @@ fn split_cmd(line: &str) -> (&str, &str) {
     (cmd, rest)
 }
 
+/// 取出 `--style <值>`（也支持 `--style=值`），返回 (值, 去掉该选项后的剩余参数)。
+/// 允许 `--style` 与 `--text`/`--ocr` 任意顺序；路径含空格请用引号包裹。
+fn take_style_arg(rest: &str) -> Result<(String, String)> {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let mut style = String::new();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "--style" {
+            if i + 1 >= toks.len() {
+                bail!("--style 缺少取值（可选：four / translate / free）");
+            }
+            style = toks[i + 1].to_string();
+            i += 2;
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("--style=") {
+            style = v.to_string();
+            i += 1;
+            continue;
+        }
+        out.push(t);
+        i += 1;
+    }
+    Ok((style, out.join(" ")))
+}
+
+/// 收集块及其全部子块的 id（删除块后清理相关批注用）。
+fn collect_block_ids(b: &notes::Block, out: &mut Vec<String>) {
+    out.push(b.id.clone());
+    for c in &b.children {
+        collect_block_ids(c, out);
+    }
+}
+
 fn short(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
@@ -1849,9 +2061,23 @@ pub fn mask_key(k: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_concept, normalize_path_arg, CommandCompleter};
+    use super::{extract_concept, normalize_path_arg, take_style_arg, CommandCompleter};
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn take_style_arg_variants() {
+        let (s, r) = take_style_arg("--style translate \"a b.pdf\"").unwrap();
+        assert_eq!(s, "translate");
+        assert_eq!(r, "\"a b.pdf\"");
+        let (s, r) = take_style_arg("--text --style=free x.txt").unwrap();
+        assert_eq!(s, "free");
+        assert_eq!(r, "--text x.txt");
+        let (s, r) = take_style_arg("x.pdf").unwrap();
+        assert!(s.is_empty());
+        assert_eq!(r, "x.pdf");
+        assert!(take_style_arg("--style").is_err(), "缺取值应报错");
+    }
 
     #[test]
     fn extract_concept_from_answer() {

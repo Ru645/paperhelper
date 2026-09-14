@@ -5,7 +5,7 @@
 //! 会把内置默认写盘供编辑。`ask.txt` 约定 LLM 用 `[[概念: 名字]]` 行回报
 //! 核心概念，是知识库自动提取概念的接口协议。
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::fs;
 use std::path::Path;
 
@@ -26,6 +26,9 @@ pub fn ensure_prompt_files() -> Result<()> {
     let defaults: &[(&str, &str)] = &[
         ("ask.txt", DEFAULT_ASK_PROMPT),
         ("note.txt", DEFAULT_NOTE_PROMPT),
+        ("translate.txt", DEFAULT_TRANSLATE_PROMPT),
+        ("free.txt", DEFAULT_FREE_PROMPT),
+        ("rewrite.txt", DEFAULT_REWRITE_PROMPT),
     ];
     for (name, content) in defaults {
         let p = dir.join(name);
@@ -68,3 +71,57 @@ pub const DEFAULT_NOTE_PROMPT: &str = r#"请阅读以下论文全文，生成一
 
 论文全文：
 {raw_text}"#;
+
+/// 逐段翻译模板：忠实翻译、保留原文结构（单次整篇；输出被截断时会提示用户）。
+pub const DEFAULT_TRANSLATE_PROMPT: &str = r#"请把以下论文**忠实翻译**成中文，生成一份「原文照搬式」的笔记 Markdown。
+
+要求：
+- 第一行输出 `# 论文标题`（标题翻译成中文）。
+- 尽量忠实：逐段翻译，保留原文的章节结构、段落顺序与层级。原文的章节标题用 `##`/`###` 表示，不要合并、省略或重排。
+- 公式保持原样（行内 `$...$`、行间 `$$...$$`）；模型名、数据集名、指标名等专有名词保留英文。
+- 不要总结、不要发挥、不要添加原文没有的内容，也不要输出额外的说明文字。
+- 直接输出完整 Markdown。
+
+论文全文：
+{raw_text}"#;
+
+/// 自由笔记模板：不加结构约束，让模型自行组织。
+pub const DEFAULT_FREE_PROMPT: &str = r#"请阅读以下论文全文，生成一份你认为最有帮助的学习笔记 Markdown。结构、详略、排版都由你决定；若论文有清晰章节，建议沿用，以便对照原文。
+
+论文全文：
+{raw_text}"#;
+
+/// AI 改写 / 补充模板。占位符：{paper} {note} {target} {instruction} {task}
+pub const DEFAULT_REWRITE_PROMPT: &str = r#"你是一位论文笔记编辑助手。用户会给你论文全文、当前笔记，以及要处理的笔记片段，请按用户要求完成编辑。
+
+要求：
+- 只输出 Markdown 正文，不要解释、不要前言、不要用代码块围栏包裹。
+- 数学公式用 `$...$` / `$$...$$`；小节标题用 `##`/`###`（不要用 `#`，`#` 是整篇笔记标题）。
+- 与当前笔记的风格、术语、详略保持一致。
+
+【论文全文】
+{paper}
+
+【当前笔记】
+{note}
+
+【待处理的片段】
+{target}
+
+【用户要求】
+{instruction}
+
+【任务】
+{task}
+
+直接输出结果 Markdown："#;
+
+/// 笔记风格 → (提示词文件名, 内置默认)。空串按 `four` 处理。
+pub fn note_style_prompt(style: &str) -> Result<(&'static str, &'static str)> {
+    match style {
+        "" | "four" => Ok(("note.txt", DEFAULT_NOTE_PROMPT)),
+        "translate" => Ok(("translate.txt", DEFAULT_TRANSLATE_PROMPT)),
+        "free" => Ok(("free.txt", DEFAULT_FREE_PROMPT)),
+        other => bail!("未知的笔记风格 `{other}`（可选：four / translate / free）"),
+    }
+}

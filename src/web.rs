@@ -33,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::App;
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, llm, logging, paths, session};
+use crate::{export, llm, logging, notes, paths, session};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -47,6 +47,12 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/interrupt", post(api_interrupt))
         .route("/api/state", get(api_state))
         .route("/api/note", get(api_note))
+        .route("/api/note/block", get(api_note_block))
+        .route("/api/note/edit", post(api_note_edit))
+        .route("/api/note/rewrite", post(api_note_rewrite))
+        .route("/api/note/add", post(api_note_add))
+        .route("/api/note/delete", post(api_note_delete))
+        .route("/api/note/ai", post(api_note_ai))
         .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/config/test", post(api_config_test))
@@ -397,6 +403,178 @@ fn hidden_expl_ids(sess: &session::Session) -> std::collections::HashSet<String>
         }
     }
     set
+}
+
+// ===== 笔记编辑（改文字 / 整节重写 / 插入 / 删除 / AI 生成） =====
+
+fn note_err(e: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, format!("{e:#}"))
+}
+
+#[derive(Deserialize)]
+struct BlockQuery {
+    id: String,
+}
+
+/// 取单个块的完整文本（供编辑弹窗；`__title__` 返回标题）。
+async fn api_note_block(
+    State(app): State<SharedApp>,
+    Query(q): Query<BlockQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let a = app.lock().await;
+    let note = a
+        .session
+        .notes
+        .as_ref()
+        .ok_or((StatusCode::NOT_FOUND, "还没有笔记".to_string()))?;
+    if q.id == notes::TITLE_ID {
+        return Ok(Json(json!({
+            "id": notes::TITLE_ID,
+            "kind": "section",
+            "number": "",
+            "text": note.title,
+            "explanations": 0,
+            "children": 0,
+        })));
+    }
+    let b = note
+        .find_block(&q.id)
+        .ok_or((StatusCode::NOT_FOUND, "找不到该块（笔记可能已变化）".to_string()))?;
+    Ok(Json(json!({
+        "id": b.id,
+        "kind": format!("{:?}", b.kind).to_lowercase(),
+        "number": b.number,
+        "text": b.text,
+        "explanations": b.explanations.len(),
+        "children": b.children.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct BlockEditReq {
+    block_id: String,
+    text: String,
+}
+
+/// 改块文字（`__title__` 改标题）。
+async fn api_note_edit(
+    State(app): State<SharedApp>,
+    Json(req): Json<BlockEditReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    a.edit_block(&req.block_id, &req.text).map_err(note_err)?;
+    logging::info(format!("编辑笔记块 {}", req.block_id));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 整节重写：段落替换文本、章节替换 children。
+async fn api_note_rewrite(
+    State(app): State<SharedApp>,
+    Json(req): Json<BlockEditReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    a.rewrite_block(&req.block_id, &req.text).map_err(note_err)?;
+    logging::info(format!("重写笔记块 {}", req.block_id));
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct BlockAddReq {
+    after_block_id: String,
+    text: String,
+}
+
+/// 在某块后插入 Markdown 解析出的块。
+async fn api_note_add(
+    State(app): State<SharedApp>,
+    Json(req): Json<BlockAddReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    a.insert_after(&req.after_block_id, &req.text).map_err(note_err)?;
+    logging::info(format!("在 {} 后插入笔记内容", req.after_block_id));
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct BlockDeleteReq {
+    block_id: String,
+}
+
+/// 删除块及子树（含追问与相关批注）。
+async fn api_note_delete(
+    State(app): State<SharedApp>,
+    Json(req): Json<BlockDeleteReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    let n = a.remove_note_block(&req.block_id).map_err(note_err)?;
+    logging::info(format!("删除笔记块 {}（含子树共 {n} 块）", req.block_id));
+    Ok(Json(json!({ "ok": true, "removed_blocks": n })))
+}
+
+#[derive(Deserialize)]
+struct NoteAiReq {
+    block_id: String,
+    instruction: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// AI 改写/补充（SSE 流式、可停止）：只生成内容，不改笔记；
+/// 用户确认后由前端调用 rewrite / add 落地。
+async fn api_note_ai(
+    State(app): State<SharedApp>,
+    Json(req): Json<NoteAiReq>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut guard = app2.lock().await;
+        guard.emitter = Emitter::channel(tx);
+        let mode = req.mode.clone().unwrap_or_else(|| "rewrite".to_string());
+        let what = format!("AI {mode} {}", req.block_id);
+        let t0 = std::time::Instant::now();
+        let res = run_note_ai(&mut guard, &req.block_id, &req.instruction, &mode).await;
+        emit_result(&guard.emitter, res, &what, t0);
+        guard.emitter = Emitter::terminal();
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 调 LLM 流式生成改写/补充内容（不改笔记）；结果经 emitter 的 token 事件流出。
+async fn run_note_ai(a: &mut App, block_id: &str, instruction: &str, mode: &str) -> Result<()> {
+    let msgs = a.note_ai_messages(block_id, instruction, mode)?;
+    interrupt::reset();
+    let emitter = a.emitter.clone();
+    let approx = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
+    let ctx = a.config.llm.context_length;
+    if ctx > 0 && approx > ctx {
+        emitter.stderr(format!(
+            "⚠️ 提示上下文约 {approx} token，超过配置的 {ctx}，可能报错；可精简论文或调大 llm.context_length"
+        ));
+    }
+    let client = a.client.clone();
+    let cfg = a.config.llm.clone();
+    emitter.progress("AI 生成中…");
+    let mut first = true;
+    let res = llm::chat(&client, &cfg, &msgs, false, cfg.thinking_mode, &mut |t| {
+        if first {
+            emitter.progress_done();
+            first = false;
+        }
+        emitter.token(t);
+    })
+    .await;
+    if first {
+        emitter.progress_done();
+    }
+    let res = res?;
+    emitter.stdout("");
+    if res.truncated() {
+        emitter.stderr("⚠️ 输出达到上限（finish_reason=length），内容可能被截断".to_string());
+    }
+    a.record_usage(res.input_tokens, res.output_tokens);
+    Ok(())
 }
 
 // ===== 导出下载 =====

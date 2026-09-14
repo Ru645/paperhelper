@@ -51,6 +51,15 @@ pub struct LlmResult {
     pub output_tokens: u64,
     /// true 表示 usage 缺失、token 数由字符数估算（无 includes_usage 的本地模型）。
     pub estimated: bool,
+    /// 流末的 finish_reason（如 "stop"/"length"）；`length` 表示输出达到上限被截断。
+    pub finish_reason: Option<String>,
+}
+
+impl LlmResult {
+    /// 输出是否因达到上限被截断。
+    pub fn truncated(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 #[derive(Deserialize)]
@@ -64,6 +73,8 @@ struct Chunk {
 #[derive(Deserialize)]
 struct Choice {
     delta: Option<Delta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +298,7 @@ pub async fn chat(
 
     let mut content = String::new();
     let mut usage: Option<Usage> = None;
+    let mut finish_reason: Option<String> = None;
     let mut buf = String::new();
     let mut stream = resp.bytes_stream();
     loop {
@@ -322,6 +334,9 @@ pub async fn chat(
                     usage = Some(u);
                 }
                 for ch in chunk.choices {
+                    if let Some(fr) = ch.finish_reason {
+                        finish_reason = Some(fr);
+                    }
                     if let Some(d) = ch.delta {
                         if let Some(t) = d.content {
                             if !t.is_empty() {
@@ -364,6 +379,7 @@ pub async fn chat(
         input_tokens: in_tok,
         output_tokens: out_tok,
         estimated,
+        finish_reason,
     })
 }
 

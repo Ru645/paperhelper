@@ -11,12 +11,108 @@ let streamSpan = null;      // 当前流式 token 的容器
 let lastState = null;       // 最近一次 /api/state 快照
 let currentAbort = null;    // 当前 /api/run 的 AbortController
 let annAbort = null;        // 当前批注请求的 AbortController
+let importResolve = null;   // 导入弹窗的 Promise resolve
+let editBlockId = null;     // 正在编辑的块 id
+let editMode = "manual";    // manual | rewrite | append
+let editAbort = null;       // AI 生成时的 AbortController
 const dynamicTabs = new Map(); // key -> { btn, pane }
 // 批注（选中文字提问）
 let annotationsCache = [];
 let currentAnnotation = null; // { id, block_id, quote }
 let annSelectedNode = null;   // 弹窗内当前选中的节点（追问挂到它下面）
 let annMode = "ask";          // ask | check
+
+// ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
+const SEL_SEP = "\u0001";
+const selection = { sessions: new Set(), papers: new Set(), concepts: new Set() };
+const selAnchor = { sessions: null, papers: null, concepts: null };
+let lastSessions = [];
+let lastPapers = [];
+let lastConcepts = [];
+
+function paperKey(p) { return p.id; }
+function conceptKey(c) { return c.name + SEL_SEP + (c.paper_id || ""); }
+
+/// 某列表当前渲染顺序对应的 key 数组（Shift 连选用）。
+function listKeys(kind) {
+  if (kind === "sessions") return lastSessions.map((s) => s.id);
+  if (kind === "papers") return lastPapers.map(paperKey);
+  return lastConcepts.map(conceptKey);
+}
+
+/// 某列表的条目数组。
+function listItems(kind) {
+  return kind === "sessions" ? lastSessions : kind === "papers" ? lastPapers : lastConcepts;
+}
+
+function keyOf(kind, item) {
+  return kind === "sessions" ? item.id : kind === "papers" ? paperKey(item) : conceptKey(item);
+}
+
+/// 刷新选中样式与「已选 N」角标。
+function paintSelection(kind) {
+  const ul = $(kind);
+  if (!ul) return;
+  const sel = selection[kind];
+  for (const li of ul.children) {
+    const k = li.dataset ? li.dataset.key : null;
+    if (k != null) li.classList.toggle("selected", sel.has(k));
+  }
+  const badge = $(`sel-count-${kind}`);
+  if (badge) badge.textContent = sel.size ? `已选 ${sel.size} · Esc 取消` : "";
+}
+
+function clearSelection(kind) {
+  selection[kind].clear();
+  selAnchor[kind] = null;
+  paintSelection(kind);
+}
+
+function clearAllSelections() {
+  for (const k of Object.keys(selection)) clearSelection(k);
+}
+
+/// 列表重渲染后清掉已不存在的选中项。
+function pruneSelection(kind, validKeys) {
+  const valid = new Set(validKeys);
+  const sel = selection[kind];
+  for (const k of [...sel]) if (!valid.has(k)) sel.delete(k);
+  if (selAnchor[kind] != null && !valid.has(selAnchor[kind])) selAnchor[kind] = null;
+}
+
+/// 列表项点击：Shift 连选 / Ctrl(⌘) 点选 / 普通点击执行默认动作。
+function listClick(kind, e, key, defaultFn) {
+  const sel = selection[kind];
+  if (e.shiftKey && selAnchor[kind] != null) {
+    const keys = listKeys(kind);
+    const a = keys.indexOf(selAnchor[kind]);
+    const b = keys.indexOf(key);
+    if (a >= 0 && b >= 0) {
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      sel.clear();
+      for (let i = lo; i <= hi; i++) sel.add(keys[i]);
+      paintSelection(kind);
+    }
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) {
+    if (sel.has(key)) sel.delete(key);
+    else sel.add(key);
+    selAnchor[kind] = key;
+    paintSelection(kind);
+    return;
+  }
+  clearSelection(kind);
+  selAnchor[kind] = key;
+  defaultFn();
+}
+
+/// 右键时：若点在多选集合内，返回选中的条目数组；否则返回 null。
+function selectedItems(kind, clickedKey) {
+  const sel = selection[kind];
+  if (sel.size <= 1 || !sel.has(clickedKey)) return null;
+  return listItems(kind).filter((x) => sel.has(keyOf(kind, x)));
+}
 
 // ===== 通用工具 =====
 
@@ -327,46 +423,62 @@ function renderUsage(st) {
 
 function renderPapers(st) {
   const ul = $("papers");
-  if (!st.papers || st.papers.length === 0) {
+  const list = st.papers || [];
+  lastPapers = list;
+  if (list.length === 0) {
     ul.innerHTML = '<li class="muted">（无）</li>';
+    pruneSelection("papers", []);
+    paintSelection("papers");
     return;
   }
   ul.innerHTML = "";
-  for (const p of st.papers) {
+  pruneSelection("papers", list.map(paperKey));
+  for (const p of list) {
     const li = document.createElement("li");
     li.className = "clickable";
+    li.dataset.key = paperKey(p);
+    if (selection.papers.has(paperKey(p))) li.classList.add("selected");
     const pin = p.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
     li.innerHTML = `${pin}《${esc(p.title)}》`;
-    li.title = "点击查看笔记与对应会话 · 右键更多";
-    li.onclick = () => openPaperTab(p);
+    li.title = "点击查看笔记与对应会话 · Ctrl/⌘ 点选、Shift 连选 · 右键更多";
+    li.onclick = (e) => listClick("papers", e, paperKey(p), () => openPaperTab(p));
     li.oncontextmenu = (e) => {
       e.preventDefault();
       showPaperMenu(e.clientX, e.clientY, p);
     };
     ul.appendChild(li);
   }
+  paintSelection("papers");
 }
 
 function renderConcepts(st) {
   const ul = $("concepts");
-  if (!st.concepts || st.concepts.length === 0) {
+  const list = st.concepts || [];
+  lastConcepts = list;
+  if (list.length === 0) {
     ul.innerHTML = '<li class="muted">（无）</li>';
+    pruneSelection("concepts", []);
+    paintSelection("concepts");
     return;
   }
   ul.innerHTML = "";
-  for (const c of st.concepts) {
+  pruneSelection("concepts", list.map(conceptKey));
+  for (const c of list) {
     const li = document.createElement("li");
     li.className = "clickable";
+    li.dataset.key = conceptKey(c);
+    if (selection.concepts.has(conceptKey(c))) li.classList.add("selected");
     const pin = c.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
     li.innerHTML = `${pin}${esc(c.name)}`;
-    li.title = "点击查看概念详情 · 右键更多";
-    li.onclick = () => openConceptTab(c.name);
+    li.title = "点击查看概念详情 · Ctrl/⌘ 点选、Shift 连选 · 右键更多";
+    li.onclick = (e) => listClick("concepts", e, conceptKey(c), () => openConceptTab(c.name));
     li.oncontextmenu = (e) => {
       e.preventDefault();
       showConceptMenu(e.clientX, e.clientY, c);
     };
     ul.appendChild(li);
   }
+  paintSelection("concepts");
 }
 
 let pendingAnchor = null;
@@ -604,6 +716,8 @@ function onNoteLoaded() {
   if (!doc.__annBound) {
     doc.__annBound = true;
     doc.addEventListener("mouseup", () => setTimeout(showSelButton, 0));
+    doc.addEventListener("mouseover", (e) => showBlkEditBtn(e.target));
+    doc.addEventListener("mouseleave", () => $("blk-edit-btn").classList.add("hidden"));
     doc.addEventListener("click", (e) => {
       hideCtxMenu();
       const mark = e.target && e.target.closest ? e.target.closest("mark.ann-mark") : null;
@@ -627,7 +741,10 @@ function onNoteLoaded() {
         showHeadingMenu(doc, heading, fr.left + e.clientX, fr.top + e.clientY);
       }
     });
-    doc.addEventListener("scroll", hideSelButton, true);
+    doc.addEventListener("scroll", () => {
+      hideSelButton();
+      $("blk-edit-btn").classList.add("hidden");
+    }, true);
   }
   applyHighlights();
 }
@@ -775,6 +892,203 @@ function showSelButton() {
     hideSelButton();
     openAnnotationCreate(blockId, text);
   };
+}
+
+// ---- 笔记块编辑（悬浮 ✎ → 弹窗：手动 / AI 重写 / AI 补充）----
+
+/// 找到某块的展示元素：段落锚点在 <p> 内（与文字同段）；章节锚点常被单独包在
+/// 空 <p> 里，此时取它的下一个元素（真正的标题）。
+function blockElementFor(doc, id) {
+  const anchor = doc.getElementById("blk-" + id);
+  if (!anchor) return null;
+  const parent = anchor.parentElement;
+  if (!parent) return null;
+  if (parent.tagName === "P" && !parent.textContent.trim()) {
+    return parent.nextElementSibling || parent;
+  }
+  return parent;
+}
+
+/// 悬停到某块上时，把「✎ 编辑」按钮浮到该块右上角。
+function showBlkEditBtn(target) {
+  const doc = noteFrame.contentDocument;
+  if (!doc || !target) return;
+  const btn = $("blk-edit-btn");
+  const note = doc.getElementById("note");
+  if (!note || !note.contains(target)) { btn.classList.add("hidden"); return; }
+  const id = blockIdForNode(doc, target);
+  if (!id) { btn.classList.add("hidden"); return; }
+  const el = blockElementFor(doc, id);
+  if (!el) { btn.classList.add("hidden"); return; }
+  const r = el.getBoundingClientRect();
+  const fr = noteFrame.getBoundingClientRect();
+  const top = fr.top + r.top;
+  if (top < fr.top - 8 || top > fr.bottom - 8) { btn.classList.add("hidden"); return; }
+  btn.classList.remove("hidden");
+  btn.style.left = Math.max(8, Math.min(window.innerWidth - 90, fr.left + r.right - 72)) + "px";
+  btn.style.top = Math.max(6, top + 2) + "px";
+  btn.dataset.blockId = id;
+  btn.onmousedown = (e) => e.preventDefault();
+  btn.onclick = () => openEditModal(id);
+}
+
+function setEditTab(mode) {
+  editMode = mode;
+  document.querySelectorAll(".edit-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.mode === mode)
+  );
+  $("edit-ai-row").classList.toggle("hidden", mode === "manual");
+  $("btn-edit-apply").textContent = mode === "append" ? "插入" : "应用";
+}
+
+async function openEditModal(id) {
+  editBlockId = id;
+  setEditTab("manual");
+  $("edit-title").textContent = "编辑笔记块";
+  $("edit-hint").textContent = "加载中…";
+  $("edit-text").value = "";
+  $("edit-status").textContent = "";
+  $("edit-status").className = "status";
+  $("edit-modal").classList.remove("hidden");
+  try {
+    const res = await fetch("/api/note/block?id=" + encodeURIComponent(id));
+    if (!res.ok) throw new Error(await res.text());
+    const b = await res.json();
+    $("edit-text").value = b.text || "";
+    const isTitle = id === "__title__";
+    const kind = isTitle ? "标题" : b.kind === "section" ? `章节 ${b.number || ""}`.trim() : "段落";
+    $("edit-title").textContent = "编辑" + kind;
+    const parts = [];
+    if (b.explanations) parts.push(`${b.explanations} 条追问`);
+    if (b.children) parts.push(`${b.children} 个子块`);
+    $("edit-hint").textContent = parts.length
+      ? `该块含 ${parts.join(" / ")}：改文字不影响它们；整节重写会替换子块（其批注需重做）。`
+      : "支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节。";
+    $("btn-edit-delete").classList.toggle("hidden", isTitle);
+    $("edit-text").focus();
+  } catch (e) {
+    $("edit-status").textContent = "❌ " + e.message;
+    $("edit-status").className = "status err";
+  }
+}
+
+function closeEditModal() {
+  if (editAbort) {
+    try { editAbort.abort(); } catch (e) { /* 忽略 */ }
+    editAbort = null;
+  }
+  $("edit-modal").classList.add("hidden");
+  $("blk-edit-btn").classList.add("hidden");
+}
+
+async function generateEdit() {
+  if (!editBlockId) return;
+  const instruction = $("edit-instruction").value.trim();
+  const st = $("edit-status");
+  if (!instruction) {
+    st.textContent = "请先填写要求，如「补充直觉解释」";
+    st.className = "status err";
+    return;
+  }
+  const mode = editMode === "append" ? "append" : "rewrite";
+  st.textContent = "AI 生成中…";
+  st.className = "status";
+  $("edit-text").value = "";
+  $("btn-edit-gen").disabled = true;
+  $("btn-edit-stop").classList.remove("hidden");
+  const ctrl = new AbortController();
+  editAbort = ctrl;
+  let acc = "";
+  try {
+    await postSse("/api/note/ai", { block_id: editBlockId, instruction, mode }, ({ name, text }) => {
+      if (name === "token") {
+        acc += text;
+        $("edit-text").value = acc;
+        $("edit-text").scrollTop = $("edit-text").scrollHeight;
+      } else if (name === "progress") {
+        st.textContent = text;
+      } else if (name === "stderr") {
+        appendConsole(text, "warn");
+      } else if (name === "error") {
+        const { summary } = parseError(text);
+        st.textContent = "❌ " + summary;
+        st.className = "status err";
+      } else if (name === "aborted") {
+        st.textContent = "⏹ 已中止";
+        st.className = "status";
+      }
+    }, { signal: ctrl.signal });
+    if (acc && !st.classList.contains("err")) {
+      st.textContent = "✓ 已生成（可修改后点" + (mode === "append" ? "「插入」" : "「应用」") + "）";
+      st.className = "status ok";
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      st.textContent = "⏹ 已中止";
+      st.className = "status";
+    } else {
+      st.textContent = "❌ " + e.message;
+      st.className = "status err";
+    }
+  }
+  editAbort = null;
+  $("btn-edit-gen").disabled = false;
+  $("btn-edit-stop").classList.add("hidden");
+}
+
+function stopEditGen() {
+  fetch("/api/interrupt", { method: "POST" }).catch(() => {});
+  if (editAbort) {
+    try { editAbort.abort(); } catch (e) { /* 忽略 */ }
+  }
+}
+
+/// `forceInsert=true` 或处于「AI 补充」页签时插入到该块后，否则按当前页签保存。
+async function applyEdit(forceInsert) {
+  if (!editBlockId) return;
+  const text = $("edit-text").value.trim();
+  const st = $("edit-status");
+  if (!text) {
+    st.textContent = "内容不能为空";
+    st.className = "status err";
+    return;
+  }
+  let url = "/api/note/edit";
+  let body = { block_id: editBlockId, text };
+  if (forceInsert || editMode === "append") {
+    url = "/api/note/add";
+    body = { after_block_id: editBlockId, text };
+  } else if (editMode === "rewrite") {
+    url = "/api/note/rewrite";
+  }
+  st.textContent = "保存中…";
+  st.className = "status";
+  try {
+    await postJson(url, body);
+    st.textContent = "✓ 已保存";
+    st.className = "status ok";
+    closeEditModal();
+    await refreshState();
+    reloadNote(null, true);
+  } catch (e) {
+    st.textContent = "❌ " + e.message;
+    st.className = "status err";
+  }
+}
+
+async function deleteEditBlock() {
+  if (!editBlockId || editBlockId === "__title__") return;
+  const hint = $("edit-hint").textContent || "";
+  if (!confirm("删除该块及其子树？子块与追问会一并删除，相关批注也会移除。\n" + hint)) return;
+  try {
+    await postJson("/api/note/delete", { block_id: editBlockId });
+    closeEditModal();
+    await refreshState();
+    reloadNote(null, true);
+  } catch (e) {
+    $("edit-status").textContent = "❌ " + e.message;
+    $("edit-status").className = "status err";
+  }
 }
 
 // ---- 弹窗 ----
@@ -1060,6 +1374,7 @@ async function refreshSessions() {
 }
 
 function renderSessions(list) {
+  lastSessions = list;
   const ul = $("sessions");
   ul.innerHTML = "";
   // 永远置顶的“新会话”
@@ -1075,23 +1390,29 @@ function renderSessions(list) {
     empty.className = "muted";
     empty.textContent = "（无历史会话）";
     ul.appendChild(empty);
+    pruneSelection("sessions", []);
+    paintSelection("sessions");
     return;
   }
+  pruneSelection("sessions", list.map((s) => s.id));
   const activeId = lastState && lastState.session_id ? lastState.session_id : null;
   for (const s of list) {
     const li = document.createElement("li");
     li.dataset.id = s.id;
+    li.dataset.key = s.id;
     if (s.id === activeId) li.classList.add("active");
+    if (selection.sessions.has(s.id)) li.classList.add("selected");
     const pin = s.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
     li.innerHTML = `${pin}<span class="s-name">${esc(s.name)}</span><span class="s-time">${esc(fmtTime(s.updated_at))}</span>`;
-    li.title = "点击加载 · 右键更多";
-    li.onclick = () => loadSession(s.id);
+    li.title = "点击加载 · Ctrl/⌘ 点选、Shift 连选 · 右键更多";
+    li.onclick = (e) => listClick("sessions", e, s.id, () => loadSession(s.id));
     li.oncontextmenu = (e) => {
       e.preventDefault();
       showSessionMenu(e.clientX, e.clientY, s);
     };
     ul.appendChild(li);
   }
+  paintSelection("sessions");
 }
 
 async function loadSession(id, opts = {}) {
@@ -1127,6 +1448,19 @@ function showMenu(x, y, items) {
 }
 
 function showSessionMenu(x, y, s) {
+  const bulk = selectedItems("sessions", s.id);
+  if (bulk) {
+    const allPinned = bulk.every((it) => it.pinned);
+    showMenu(x, y, [
+      {
+        label: `${allPinned ? "取消置顶" : "置顶"}选中 ${bulk.length} 项`,
+        fn: () => pinSessionsBulk(bulk, !allPinned),
+      },
+      { label: `删除选中 ${bulk.length} 项…`, danger: true, fn: () => deleteSessionsBulk(bulk) },
+    ]);
+    return;
+  }
+  clearSelection("sessions");
   showMenu(x, y, [
     { label: s.pinned ? "取消置顶" : "置顶会话", fn: () => pinSession(s.id, !s.pinned) },
     { label: "重命名", fn: () => renameSession(s) },
@@ -1135,6 +1469,19 @@ function showSessionMenu(x, y, s) {
 }
 
 function showPaperMenu(x, y, p) {
+  const bulk = selectedItems("papers", paperKey(p));
+  if (bulk) {
+    const allPinned = bulk.every((it) => it.pinned);
+    showMenu(x, y, [
+      {
+        label: `${allPinned ? "取消置顶" : "置顶"}选中 ${bulk.length} 项`,
+        fn: () => pinPapersBulk(bulk, !allPinned),
+      },
+      { label: `删除选中 ${bulk.length} 项…`, danger: true, fn: () => deletePapersBulk(bulk) },
+    ]);
+    return;
+  }
+  clearSelection("papers");
   showMenu(x, y, [
     { label: p.pinned ? "取消置顶" : "置顶论文", fn: () => pinPaper(p, !p.pinned) },
     { label: "删除论文", danger: true, fn: () => deletePaper(p) },
@@ -1142,6 +1489,19 @@ function showPaperMenu(x, y, p) {
 }
 
 function showConceptMenu(x, y, c) {
+  const bulk = selectedItems("concepts", conceptKey(c));
+  if (bulk) {
+    const allPinned = bulk.every((it) => it.pinned);
+    showMenu(x, y, [
+      {
+        label: `${allPinned ? "取消置顶" : "置顶"}选中 ${bulk.length} 项`,
+        fn: () => pinConceptsBulk(bulk, !allPinned),
+      },
+      { label: `删除选中 ${bulk.length} 项…`, danger: true, fn: () => deleteConceptsBulk(bulk) },
+    ]);
+    return;
+  }
+  clearSelection("concepts");
   showMenu(x, y, [
     { label: c.pinned ? "取消置顶" : "置顶概念", fn: () => pinConcept(c, !c.pinned) },
     { label: "删除概念", danger: true, fn: () => deleteConcept(c) },
@@ -1224,6 +1584,66 @@ async function deleteSession(s) {
   }
 }
 
+// ===== 批量置顶 / 删除（多选后右键）=====
+
+async function pinSessionsBulk(items, pinned) {
+  for (const s of items) {
+    try { await postJson("/api/sessions/pin", { id: s.id, pinned }); }
+    catch (e) { appendConsole("❌ 置顶失败: " + e.message, "err"); }
+  }
+  clearSelection("sessions");
+  refreshSessions();
+}
+
+async function deleteSessionsBulk(items) {
+  if (!confirm(`删除选中的 ${items.length} 个会话？此操作不可恢复。`)) return;
+  for (const s of items) {
+    try { await postJson("/api/sessions/delete", { id: s.id }); }
+    catch (e) { appendConsole("❌ 删除失败: " + e.message, "err"); }
+  }
+  clearSelection("sessions");
+  await refreshState();
+  reloadNote();
+}
+
+async function pinPapersBulk(items, pinned) {
+  for (const p of items) {
+    try { await postJson("/api/kb/paper/pin", { id: p.id, pinned }); }
+    catch (e) { appendConsole("❌ 置顶失败: " + e.message, "err"); }
+  }
+  clearSelection("papers");
+  refreshState();
+}
+
+async function deletePapersBulk(items) {
+  if (!confirm(`从知识库移除选中的 ${items.length} 篇论文？\n（不影响对应会话与笔记）`)) return;
+  for (const p of items) {
+    try { await postJson("/api/kb/paper/delete", { id: p.id }); }
+    catch (e) { appendConsole("❌ 删除失败: " + e.message, "err"); }
+  }
+  clearSelection("papers");
+  refreshState();
+}
+
+async function pinConceptsBulk(items, pinned) {
+  for (const c of items) {
+    try { await postJson("/api/kb/concept/pin", { name: c.name, paper_id: c.paper_id, pinned }); }
+    catch (e) { appendConsole("❌ 置顶失败: " + e.message, "err"); }
+  }
+  clearSelection("concepts");
+  refreshState();
+}
+
+async function deleteConceptsBulk(items) {
+  if (!confirm(`从知识库移除选中的 ${items.length} 个概念？`)) return;
+  for (const c of items) {
+    try { await postJson("/api/kb/concept/delete", { name: c.name, paper_id: c.paper_id }); }
+    catch (e) { appendConsole("❌ 删除失败: " + e.message, "err"); }
+  }
+  clearSelection("concepts");
+  refreshState();
+}
+
 // ===== 顶栏操作：导出 / 撤销 / 帮助 =====
 
 function downloadExport(fmt) {
@@ -1303,24 +1723,44 @@ function uploadFile(file, onProgress) {
   });
 }
 
+/// 弹出导入弹窗，返回 {name, style} 或 null（取消）。
+function promptImport(file, defaultName) {
+  return new Promise((resolve) => {
+    importResolve = resolve;
+    $("import-file").textContent = "文件：" + file.name;
+    $("import-name").value = defaultName;
+    $("import-style").value = "four";
+    $("import-modal").classList.remove("hidden");
+    $("import-name").focus();
+    $("import-name").select();
+  });
+}
+
+function closeImportModal(result) {
+  $("import-modal").classList.add("hidden");
+  if (importResolve) {
+    const r = importResolve;
+    importResolve = null;
+    r(result);
+  }
+}
+
 async function importFile(file) {
   if (!file) return;
   if (running) { alert("有任务正在运行，请稍后再导入。"); return; }
-  // 先询问笔记文件名（默认 笔记_<文件stem>.md）
   const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 20);
-  const defaultName = "笔记_" + stem + ".md";
-  const input = prompt("笔记文件名（可写 .md 或 .html）", defaultName);
-  if (input === null) return; // 取消
-  const exportName = input.trim() || defaultName;
+  const opts = await promptImport(file, "笔记_" + stem + ".md");
+  if (!opts) return; // 取消
+  const exportName = opts.name.trim() || ("笔记_" + stem + ".md");
   setProgress("上传中…");
   switchTab("console");
-  appendConsole("> 导入文件: " + file.name);
+  appendConsole("> 导入文件: " + file.name + "（风格：" + opts.style + "）");
   try {
     const j = await uploadFile(file, (p) => setUploadPct(p));
     setProgress("");
     // .txt/.md 走 --text（跳过 PDF 解析），其余按 PDF 处理
     const isText = /\.(txt|md|markdown)$/i.test(file.name);
-    const cmd = (isText ? "ingest --text " : "ingest ") + shellQuote(j.path);
+    const cmd = `ingest ${isText ? "--text " : ""}--style ${opts.style} ` + shellQuote(j.path);
     await runCommand(cmd, { export: exportName });
   } catch (e) {
     appendConsole("❌ 上传失败: " + e.message, "err");
@@ -1575,8 +2015,27 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config-test").onclick = testConfig;
   $("btn-config-save").onclick = saveConfig;
 
+  // 导入弹窗：文件名 + 笔记风格
+  $("btn-import-cancel").onclick = () => closeImportModal(null);
+  $("btn-import-ok").onclick = () =>
+    closeImportModal({ name: $("import-name").value.trim(), style: $("import-style").value });
+  $("import-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); $("btn-import-ok").click(); }
+  });
+
+  // 笔记编辑弹窗：手动 / AI 重写 / AI 补充
+  document.querySelectorAll(".edit-tab").forEach((t) => (t.onclick = () => setEditTab(t.dataset.mode)));
+  $("btn-edit-cancel").onclick = closeEditModal;
+  $("btn-edit-gen").onclick = generateEdit;
+  $("btn-edit-stop").onclick = stopEditGen;
+  $("btn-edit-apply").onclick = () => applyEdit(false);
+  $("btn-edit-insert").onclick = () => applyEdit(true);
+  $("btn-edit-delete").onclick = deleteEditBlock;
+
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideCtxMenu(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }
+  });
 
   refreshState();
   setInterval(() => { if (!running) refreshState(); }, 15000);
