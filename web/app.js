@@ -491,6 +491,7 @@ function renderConcepts(st) {
 
 let pendingAnchor = null;
 let pendingScrollTop = null;
+let pendingAnnOpen = null; // { id, block }：笔记加载完后自动打开某条批注
 
 // iframe 重载完成后，若有待定锚点则滚动定位；若需保持滚动位置则恢复（等 marked/KaTeX 执行）
 noteFrame.addEventListener("load", () => {
@@ -656,7 +657,7 @@ async function openConceptTab(name) {
     const defHtml = renderMathMarkdown(c.definition || "（无）");
     const ansHtml = renderMathMarkdown(c.answer || "（无）");
     const loadBtn = c.session_id
-      ? `<button class="mini primary" data-load="${esc(c.session_id)}" data-anchor="${esc(c.explanation_id || "")}">加载该会话</button>`
+      ? `<button class="mini primary" data-load="${esc(c.session_id)}" data-anchor="${esc(c.explanation_id || "")}" data-ann="${esc(c.annotation_id || "")}" data-block="${esc(c.block_id || "")}">加载该会话</button>`
       : "";
     pane.innerHTML = `<div class="detail">
       <h2>概念：${esc(c.name)}</h2>
@@ -669,7 +670,12 @@ async function openConceptTab(name) {
       </dl>
     </div>`;
     pane.querySelectorAll("[data-load]").forEach(
-      (b) => (b.onclick = () => loadSession(b.dataset.load, { anchor: b.dataset.anchor || null }))
+      (b) => (b.onclick = () =>
+        loadSession(b.dataset.load, {
+          anchor: b.dataset.anchor || null,
+          ann: b.dataset.ann || null,
+          block: b.dataset.block || null,
+        }))
     );
   } catch (e) {
     pane.innerHTML = `<div class="detail err">加载失败: ${esc(e)}</div>`;
@@ -755,6 +761,13 @@ function onNoteLoaded() {
     }, true);
   }
   applyHighlights();
+  // 概念页「加载该会话」指向批注时：滚到块并自动打开批注弹窗
+  if (pendingAnnOpen) {
+    const p = pendingAnnOpen;
+    pendingAnnOpen = null;
+    if (p.block) scrollNoteToBlock(p.block);
+    openAnnotationView(p.id, { scroll: true });
+  }
 }
 
 /// 右键标题：对该章节（h1=全文）提问 / 打开或删除已有批注。
@@ -825,38 +838,64 @@ function highlightAnnotation(doc, note, ann) {
 }
 
 /// 在 range 内查找 quote 文本并包成 <mark>（跨文本节点时切分包裹）。
+/// 清洗引用文本：去掉 KaTeX 隐藏 MathML 的数学斜体（U+1D400–U+1D7FF），
+/// 折叠空白并去首尾。用于存储、展示与匹配，保证与「可见文本」一致。
+function cleanQuote(s) {
+  return String(s == null ? "" : s)
+    .replace(/[\u{1D400}-\u{1D7FF}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/// 在块范围内高亮 quote：**逐文本节点**包裹 <mark>，只切分文本节点、
+/// 不移动/切分任何元素，因此不会破坏 KaTeX 的 span 结构。
+/// 匹配时跳过隐藏的 `.katex-mathml`，并把空白视为 `\s*`，
+/// 以兼容换行与 KaTeX 两套渲染层（旧批注的 quote 里带 `\n`/数学斜体也能命中）。
 function wrapQuote(doc, range, quote, annId) {
-  if (!quote) return;
+  const q = cleanQuote(quote);
+  if (!q) return;
   const walker = doc.createTreeWalker(range.commonAncestorContainer, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => (range.intersectsNode(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+    acceptNode: (n) => {
+      if (!range.intersectsNode(n)) return NodeFilter.FILTER_REJECT;
+      const el = n.parentElement;
+      if (el && el.closest && el.closest(".katex-mathml")) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
   });
-  const nodes = [];
-  while (walker.nextNode()) nodes.push(walker.currentNode);
-  const full = nodes.map((n) => n.nodeValue).join("");
-  const idx = full.indexOf(quote);
-  if (idx < 0) return;
-  let acc = 0, startNode = null, startOffset = 0, endNode = null, endOffset = 0;
-  for (const n of nodes) {
-    const len = n.nodeValue.length;
-    if (!startNode && idx < acc + len) { startNode = n; startOffset = idx - acc; }
-    if (!endNode && idx + quote.length <= acc + len) { endNode = n; endOffset = idx + quote.length - acc; break; }
-    acc += len;
+  const items = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    items.push({ node, len: node.nodeValue.length });
   }
-  if (!startNode || !endNode) return;
-  const r = doc.createRange();
-  r.setStart(startNode, startOffset);
-  r.setEnd(endNode, endOffset);
-  const mark = doc.createElement("mark");
-  mark.className = "ann-mark";
-  mark.dataset.annId = annId;
-  try {
-    r.surroundContents(mark);
-  } catch (e) {
-    try {
-      const frag = r.extractContents();
-      mark.appendChild(frag);
-      r.insertNode(mark);
-    } catch (e2) { /* 放弃该高亮 */ }
+  if (!items.length) return;
+  const full = items.map((it) => it.node.nodeValue).join("");
+  // 宽松匹配：空白 -> \s*，其余字符正则转义
+  const pattern = q
+    .split(" ")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("\\s*");
+  if (!pattern) return;
+  const m = new RegExp(pattern).exec(full);
+  if (!m) return;
+  const start = m.index;
+  const end = m.index + m[0].length;
+  let acc = 0;
+  for (const { node, len } of items) {
+    const a = Math.max(start, acc);
+    const b = Math.min(end, acc + len);
+    if (a < b) {
+      let n = node;
+      const s = a - acc;
+      const e = b - acc;
+      if (s > 0) n = n.splitText(s);
+      if (e - s < n.nodeValue.length) n.splitText(e - s);
+      const mark = doc.createElement("mark");
+      mark.className = "ann-mark";
+      mark.dataset.annId = annId;
+      n.parentNode.insertBefore(mark, n);
+      mark.appendChild(n);
+    }
+    acc += len;
   }
 }
 
@@ -884,7 +923,7 @@ function showSelButton() {
   if (!doc) return;
   const sel = doc.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return hideSelButton();
-  const text = sel.toString().trim();
+  const text = cleanQuote(sel.toString());
   if (!text) return hideSelButton();
   const range = sel.getRangeAt(0);
   const blockId = blockIdForNode(doc, range.startContainer);
@@ -1185,23 +1224,26 @@ async function openAnnotationCreate(blockId, quote) {
   $("ann-q").focus();
 }
 
-async function openAnnotationView(annId) {
+async function openAnnotationView(annId, opts = {}) {
   await refreshAnnotations();
   const ann = annotationsCache.find((a) => a.id === annId);
   if (!ann) return;
   currentAnnotation = { id: ann.id, block_id: ann.block_id, quote: ann.quote };
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
   await loadMathLibs();
-  $("ann-quote").textContent = ann.quote;
+  $("ann-quote").textContent = cleanQuote(ann.quote);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
   const doc = noteFrame.contentDocument;
   const mark = doc && doc.querySelector(`mark.ann-mark[data-ann-id="${annId}"]`);
+  if (mark && opts.scroll) mark.scrollIntoView({ block: "center" });
   if (mark) {
     const r = mark.getBoundingClientRect();
     const fr = noteFrame.getBoundingClientRect();
     positionPopup(fr.left + r.left, fr.top + r.bottom + 10);
   } else {
+    // 高亮失配（如笔记被改过）时，至少滚动到所在块
+    if (opts.scroll && ann.block_id) scrollNoteToBlock(ann.block_id);
     positionPopup(window.innerWidth / 2 - 190, 120);
   }
   $("ann-q").focus();
@@ -1496,6 +1538,8 @@ async function loadSession(id, opts = {}) {
   if (res.ok) {
     await refreshState();
     switchTab("note");
+    // 批注定位：笔记加载完后自动打开该批注（正文里没有 expl- 锚点）
+    if (opts.ann) pendingAnnOpen = { id: opts.ann, block: opts.block || null };
     // 概念加载传锚点（定位到该问答）；论文/列表加载传 null（回到笔记开头）
     reloadNote(opts.anchor || null);
   } else {

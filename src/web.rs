@@ -926,8 +926,14 @@ async fn api_concept(
         }
     });
     let hit = session::find_concept_qa(&q.name, paper_id.as_deref());
-    let (sid, sname, supd, question, answer, expl_id) = match hit {
-        Some((m, qu, an, eid)) => (m.session_id, m.session_name, m.updated_at, qu, an, eid),
+    let (sid, sname, supd, question, answer, expl_id, annotation_id, block_id) = match hit {
+        Some((m, qu, an, eid, ann)) => {
+            let (aid, bid) = match ann {
+                Some((a, b)) => (Some(a), b),
+                None => (None, String::new()),
+            };
+            (m.session_id, m.session_name, m.updated_at, qu, an, eid, aid, bid)
+        }
         None => (
             String::new(),
             String::new(),
@@ -935,6 +941,8 @@ async fn api_concept(
             String::new(),
             String::new(),
             None,
+            None,
+            String::new(),
         ),
     };
     Json(json!({
@@ -947,6 +955,8 @@ async fn api_concept(
         "question": question,
         "answer": answer,
         "explanation_id": expl_id,
+        "annotation_id": annotation_id,
+        "block_id": block_id,
     }))
 }
 

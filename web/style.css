@@ -397,6 +397,8 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 /* 笔记内高亮 */
 mark.ann-mark { background: #fff3a3; cursor: pointer; padding: 0 1px; border-radius: 2px; }
 mark.ann-mark:hover { background: #ffe066; }
+/* 公式内的高亮可能分成多段：去掉段间空隙，避免公式看起来被拆开 */
+.katex mark.ann-mark { padding: 0; border-radius: 0; }
 
 /* ===== 文件导入 ===== */
 .cmdbar #btn-upload { flex-shrink: 0; }

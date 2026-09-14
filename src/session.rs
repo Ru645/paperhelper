@@ -134,6 +134,10 @@ pub fn read_meta(path: &Path) -> Option<SessionMeta> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NodeLite {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
     label: String,
     #[serde(default)]
     question: String,
@@ -141,6 +145,17 @@ struct NodeLite {
     answer: String,
     #[serde(default)]
     explanation_id: Option<String>,
+}
+
+/// 批注的轻量视图（只取定位所需字段）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AnnLite {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    block_id: String,
+    #[serde(default)]
+    root_node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -169,6 +184,8 @@ struct SessionScan {
     notes: Option<NoteLite>,
     #[serde(default)]
     conversation: ConvLite,
+    #[serde(default)]
+    annotations: Vec<AnnLite>,
 }
 
 impl SessionScan {
@@ -179,6 +196,29 @@ impl SessionScan {
             updated_at: self.updated_at.clone(),
             current_paper_id: self.current_paper_id.clone(),
         }
+    }
+
+    /// 若该对话节点属于某条批注线程（沿 parent 上溯到根，与批注 root_node_id 比对），
+    /// 返回 `(批注 id, 所属块 id)`。
+    fn annotation_of(&self, node: &NodeLite) -> Option<(String, String)> {
+        let mut root = node.id.clone();
+        let mut cur = node.parent.clone();
+        let mut hops = 0;
+        while let Some(pid) = cur {
+            let Some(p) = self.conversation.nodes.iter().find(|n| n.id == pid) else {
+                break;
+            };
+            root = p.id.clone();
+            cur = p.parent.clone();
+            hops += 1;
+            if hops > 1000 {
+                break;
+            }
+        }
+        self.annotations
+            .iter()
+            .find(|a| !a.id.is_empty() && a.root_node_id == root)
+            .map(|a| (a.id.clone(), a.block_id.clone()))
     }
 }
 
@@ -220,13 +260,15 @@ pub fn find_session_by_paper(paper_id: &str, title: &str) -> Option<(String, Ses
 
 /// 找某个概念（ask 节点 `label == name`）的问答及所在会话。
 /// 优先匹配概念来源论文 `prefer_paper`，否则取 `updated_at` 最新者。
-/// 返回 `(元信息, question, answer, explanation_id)`。
+/// 返回 `(元信息, question, answer, explanation_id, annotation)`；
+/// `annotation` 为 `Some((批注 id, 块 id))` 表示该问答属于批注线程（正文无 `expl-` 锚点）。
 pub fn find_concept_qa(
     name: &str,
     prefer_paper: Option<&str>,
-) -> Option<(SessionMeta, String, String, Option<String>)> {
-    let mut fallback: Option<(SessionMeta, String, String, Option<String>)> = None;
-    let mut preferred: Option<(SessionMeta, String, String, Option<String>)> = None;
+) -> Option<(SessionMeta, String, String, Option<String>, Option<(String, String)>)> {
+    type Hit = (SessionMeta, String, String, Option<String>, Option<(String, String)>);
+    let mut fallback: Option<Hit> = None;
+    let mut preferred: Option<Hit> = None;
     for id in paths::list_sessions() {
         let Some(sc) = scan(&paths::session_path(&id)) else {
             continue;
@@ -235,11 +277,12 @@ pub fn find_concept_qa(
             if n.label != name {
                 continue;
             }
-            let hit = (
+            let hit: Hit = (
                 sc.meta(),
                 n.question.clone(),
                 n.answer.clone(),
                 n.explanation_id.clone(),
+                sc.annotation_of(n),
             );
             let is_pref = prefer_paper.is_some() && sc.current_paper_id.as_deref() == prefer_paper;
             if is_pref {
