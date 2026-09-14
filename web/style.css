@@ -350,7 +350,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
   border-radius: 6px; background: #fff; color: var(--fg);
 }
 .edit-tools { display: flex; gap: 8px; margin-top: 8px; }
-.edit-tools button.danger { color: var(--danger); border-color: var(--danger); }
+.edit-tools button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 
 .ann-popup {
   position: fixed; z-index: 65; width: 380px; max-height: 72vh;

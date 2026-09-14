@@ -321,6 +321,19 @@ impl App {
         !self.undo_stack.is_empty()
     }
 
+    /// 记录一次可撤销的会话快照（笔记 / 对话 / 批注），供 `undo` 恢复。
+    /// 所有会改动笔记或对话的操作在动手前都应调用；栈深上限 20。
+    fn push_undo(&mut self) {
+        self.undo_stack.push(UndoSnapshot {
+            notes: self.session.notes.clone(),
+            conversation: self.session.conversation.clone(),
+            annotations: self.session.annotations.clone(),
+        });
+        if self.undo_stack.len() > 20 {
+            self.undo_stack.remove(0);
+        }
+    }
+
     /// 主循环：打印横幅与配置引导 → 初始化 rustyline 编辑器（history、
     /// Ctrl-C 绑定、补全 helper）→ 逐行 `run_command` → 退出前 `autosave_on_exit`。
     /// Ctrl-C 语义：当前无任务时取消输入行；有 LLM 任务时置打断标志中止流式。
@@ -576,7 +589,7 @@ PaperHelper 命令：
                           例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
   sum                      把当前节点子树的追问折叠并替换为「总结：…」（可点击展开）
   del [--yes]              删除当前节点及其子树（需 --yes 确认；根节点不可删）
-  undo                     撤销上一次 del
+  undo                     撤销上一次编辑/删除（内存多级，最多 20 步）
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
   tree                     以文件树展示对话轨迹（带 [n] 编号）
@@ -1315,39 +1328,69 @@ PaperHelper 命令：
             bail!("内容不能为空");
         }
         {
-            let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
-            if !note.set_text(block_id, text) {
+            let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+            if block_id != notes::TITLE_ID && note.find_block(block_id).is_none() {
                 bail!("找不到要编辑的块（笔记可能已变化）");
             }
+        }
+        self.push_undo();
+        {
+            let note = self.session.notes.as_mut().unwrap();
+            note.set_text(block_id, text);
         }
         self.after_note_change();
         Ok(())
     }
 
     /// 整节重写：段落 → 直接替换文本；章节 → 用 Markdown 解析出的新块替换其 children。
-    /// 内容里的 `#`/`##`/`###` 分别对应第 0/1/2 层小节。
+    /// 若内容以小节标题开头（编辑弹窗会带上原标题），则同时更新该节标题。
     pub fn rewrite_block(&mut self, block_id: &str, text: &str) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
             bail!("内容不能为空");
         }
-        {
-            let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
-            let is_section = note
-                .find_block(block_id)
-                .map(|b| b.kind == notes::BlockKind::Section)
-                .unwrap_or(false);
-            if is_section {
-                let blocks = notes::parse_markdown_blocks(text);
-                if blocks.is_empty() {
-                    bail!("内容解析不出任何块");
-                }
-                if !note.replace_children(block_id, blocks) {
-                    bail!("找不到要重写的章节");
-                }
-                note.renumber();
-            } else if !note.set_text(block_id, text) {
+        let is_section = {
+            let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+            let Some(b) = note.find_block(block_id) else {
                 bail!("找不到要重写的块（笔记可能已变化）");
+            };
+            b.kind == notes::BlockKind::Section
+        };
+        let parsed = if is_section {
+            let blocks = notes::parse_markdown_blocks(text);
+            if blocks.is_empty() {
+                bail!("内容解析不出任何块");
+            }
+            Some(blocks)
+        } else {
+            None
+        };
+        self.push_undo();
+        {
+            let note = self.session.notes.as_mut().unwrap();
+            if let Some(mut blocks) = parsed {
+                // 首块是 Section（用户重写了标题行）→ 用它更新本节标题，正文取其子块
+                let (new_title, children) = if blocks
+                    .first()
+                    .map(|b| b.kind == notes::BlockKind::Section)
+                    .unwrap_or(false)
+                {
+                    let first = blocks.remove(0);
+                    (Some(first.text), first.children)
+                } else {
+                    (None, blocks)
+                };
+                if let Some(t) = new_title {
+                    if !t.trim().is_empty() {
+                        if let Some(sec) = note.find_block_mut(block_id) {
+                            sec.text = t;
+                        }
+                    }
+                }
+                note.replace_children(block_id, children);
+                note.renumber();
+            } else {
+                note.set_text(block_id, text);
             }
         }
         self.after_note_change();
@@ -1364,6 +1407,7 @@ PaperHelper 命令：
         if blocks.is_empty() {
             bail!("内容解析不出任何块");
         }
+        self.push_undo();
         {
             let note = self.session.notes.as_mut().ok_or_else(|| anyhow!("还没有笔记"))?;
             if !note.insert_blocks_after(after_block_id, blocks) {
@@ -1389,6 +1433,7 @@ PaperHelper 命令：
             collect_block_ids(b, &mut ids);
             ids
         };
+        self.push_undo();
         {
             let note = self.session.notes.as_mut().unwrap();
             if !note.remove_block(block_id) {
@@ -1434,21 +1479,24 @@ PaperHelper 命令：
             bail!("mode 只能是 rewrite 或 append");
         }
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+        let is_section = block_id != notes::TITLE_ID
+            && note
+                .find_block(block_id)
+                .map(|b| b.kind == notes::BlockKind::Section)
+                .unwrap_or(false);
         let target = if block_id == notes::TITLE_ID {
             format!("（整篇笔记标题）{}", note.title)
         } else {
-            let b = note.find_block(block_id).ok_or_else(|| anyhow!("找不到要处理的块"))?;
-            let kind = match b.kind {
-                notes::BlockKind::Section => format!(
-                    "章节 {}",
-                    if b.number.is_empty() { "（未编号）".to_string() } else { b.number.clone() }
-                ),
-                _ => "段落".to_string(),
-            };
-            format!("（{kind}）\n{}", b.text)
+            let kind = if is_section { "章节" } else { "段落" };
+            let content = note
+                .block_markdown(block_id)
+                .ok_or_else(|| anyhow!("找不到要处理的块"))?;
+            format!("（{kind}）\n{content}")
         };
         let task = if mode == "append" {
             "请生成要**补充**到该片段之后的新内容；不要重复已有内容，可直接给出新的段落或 `##`/`###` 小节。"
+        } else if is_section {
+            "请**重写**该章节：可重写标题（用 `##` 开头，`###` 表示其下小节）与全部正文；保持结构清晰、内容更完整。"
         } else {
             "请**重写**该片段（整段替换）；保留原意，使表述更清晰、更完整，必要时可拆成多段。"
         };
@@ -1564,14 +1612,7 @@ PaperHelper 命令：
             bail!("找不到该批注");
         };
         let root = self.session.annotations[idx].root_node_id.clone();
-        self.undo_stack.push(UndoSnapshot {
-            notes: self.session.notes.clone(),
-            conversation: self.session.conversation.clone(),
-            annotations: self.session.annotations.clone(),
-        });
-        if self.undo_stack.len() > 20 {
-            self.undo_stack.remove(0);
-        }
+        self.push_undo();
         let subtree = self.collect_subtree(&root);
         let expl_ids: Vec<String> = subtree
             .iter()
@@ -1721,14 +1762,7 @@ PaperHelper 命令：
             return Ok(());
         }
         // 入撤销栈（限 20 条）
-        self.undo_stack.push(UndoSnapshot {
-            notes: self.session.notes.clone(),
-            conversation: self.session.conversation.clone(),
-            annotations: self.session.annotations.clone(),
-        });
-        if self.undo_stack.len() > 20 {
-            self.undo_stack.remove(0);
-        }
+        self.push_undo();
         // 同步移除笔记中对应的解释（含嵌套子树）
         let expl_ids: Vec<String> = subtree
             .iter()
@@ -1750,12 +1784,13 @@ PaperHelper 命令：
         let snap = self
             .undo_stack
             .pop()
-            .ok_or_else(|| anyhow!("没有可撤销的删除操作"))?;
+            .ok_or_else(|| anyhow!("没有可撤销的操作"))?;
         self.session.notes = snap.notes;
         self.session.conversation = snap.conversation;
         self.session.annotations = snap.annotations;
         self.update_completions();
-        outln!(self, "✓ 已撤销上一次删除");
+        self.after_note_change(); // 同步导出 + 保存会话
+        outln!(self, "✓ 已撤销上一次操作（笔记/对话已恢复）");
         Ok(())
     }
 

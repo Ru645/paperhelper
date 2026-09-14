@@ -146,6 +146,34 @@ impl Note {
         }
     }
 
+    /// 渲染某块（含子树）为 Markdown，供编辑弹窗展示（**不含自动编号**）。
+    /// Section 从 `##` 起、子树逐层 `###`…；段落/公式输出正文。`TITLE_ID` 返回标题 + 全文。
+    pub fn block_markdown(&self, id: &str) -> Option<String> {
+        fn render_block(b: &Block, level: usize, s: &mut String) {
+            match b.kind {
+                BlockKind::Section => {
+                    s.push_str(&format!("{} {}\n\n", "#".repeat(level.min(6)), b.text));
+                    for c in &b.children {
+                        render_block(c, level + 1, s);
+                    }
+                }
+                BlockKind::Paragraph => s.push_str(&format!("{}\n\n", b.text)),
+                BlockKind::Formula => s.push_str(&format!("$$\n{}\n$$\n\n", b.text)),
+            }
+        }
+        if id == TITLE_ID {
+            let mut s = format!("# {}\n\n", self.title);
+            for b in &self.blocks {
+                render_block(b, 2, &mut s);
+            }
+            return Some(s.trim_end().to_string());
+        }
+        let b = self.find_block(id)?;
+        let mut s = String::new();
+        render_block(b, 2, &mut s);
+        Some(s.trim_end().to_string())
+    }
+
     /// 在目标块之后插入若干块（同父级）。返回是否找到目标。
     pub fn insert_blocks_after(&mut self, target_id: &str, blocks: Vec<Block>) -> bool {
         fn walk(blocks: &mut Vec<Block>, target_id: &str, new_blocks: &[Block]) -> bool {
@@ -1174,6 +1202,25 @@ mod tests {
         assert!(note.set_text(TITLE_ID, "NewTitle"));
         assert_eq!(note.title, "NewTitle");
         assert!(!note.set_text("no-such-id", "x"));
+    }
+
+    #[test]
+    fn block_markdown_renders_subtree_and_reparses() {
+        let md = "# T\n## A\n正文A\n### A1\n正文A1\n## B\n正文B\n";
+        let note = parse_markdown_note(md, "raw");
+        let a = note.find_section_by_number("1").unwrap().id.clone();
+        let s = note.block_markdown(&a).unwrap();
+        assert!(s.starts_with("## A"), "{s}");
+        assert!(s.contains("正文A"));
+        assert!(s.contains("### A1"));
+        assert!(s.contains("正文A1"));
+        assert!(!s.contains("正文B"), "不应包含其他章节");
+        // 渲染结果应能被重新解析回结构（供整节重写）
+        let blocks = parse_markdown_blocks(&s);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "A");
+        assert_eq!(blocks[0].children.len(), 2);
+        assert!(note.block_markdown("nope").is_none());
     }
 
     #[test]

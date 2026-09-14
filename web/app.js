@@ -13,6 +13,7 @@ let currentAbort = null;    // 当前 /api/run 的 AbortController
 let annAbort = null;        // 当前批注请求的 AbortController
 let importResolve = null;   // 导入弹窗的 Promise resolve
 let editBlockId = null;     // 正在编辑的块 id
+let editBlockKind = "paragraph"; // 正在编辑的块类型：paragraph | section | title
 let editMode = "manual";    // manual | rewrite | append
 let editAbort = null;       // AI 生成时的 AbortController
 const dynamicTabs = new Map(); // key -> { btn, pane }
@@ -372,6 +373,7 @@ async function refreshState() {
   try {
     const st = await (await fetch("/api/state")).json();
     lastState = st;
+    $("btn-undo").disabled = !st.can_undo;
     renderModel(st);
     renderUsage(st);
     renderPapers(st);
@@ -954,16 +956,24 @@ async function openEditModal(id) {
     const res = await fetch("/api/note/block?id=" + encodeURIComponent(id));
     if (!res.ok) throw new Error(await res.text());
     const b = await res.json();
-    $("edit-text").value = b.text || "";
     const isTitle = id === "__title__";
+    editBlockKind = isTitle ? "title" : b.kind;
+    // 章节：编辑框展示「标题 + 全部子块」；段落/标题：只有自身文字
+    $("edit-text").value = editBlockKind === "section" && b.markdown ? b.markdown : (b.text || "");
     const kind = isTitle ? "标题" : b.kind === "section" ? `章节 ${b.number || ""}`.trim() : "段落";
     $("edit-title").textContent = "编辑" + kind;
     const parts = [];
     if (b.explanations) parts.push(`${b.explanations} 条追问`);
     if (b.children) parts.push(`${b.children} 个子块`);
-    $("edit-hint").textContent = parts.length
-      ? `该块含 ${parts.join(" / ")}：改文字不影响它们；整节重写会替换子块（其批注需重做）。`
-      : "支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节。";
+    if (editBlockKind === "section") {
+      $("edit-hint").textContent = parts.length
+        ? `编辑框含本节标题与全部内容（${parts.join(" / ")}）：应用后会整体重写本节，子块的批注需重做。`
+        : "编辑框含本节标题与内容；应用后会整体重写本节。";
+    } else {
+      $("edit-hint").textContent = parts.length
+        ? `该块含 ${parts.join(" / ")}：改文字不影响它们。`
+        : "支持 Markdown；数学公式用 $...$ 或 $$...$$。";
+    }
     $("btn-edit-delete").classList.toggle("hidden", isTitle);
     $("edit-text").focus();
   } catch (e) {
@@ -1058,7 +1068,8 @@ async function applyEdit(forceInsert) {
   if (forceInsert || editMode === "append") {
     url = "/api/note/add";
     body = { after_block_id: editBlockId, text };
-  } else if (editMode === "rewrite") {
+  } else if (editMode === "rewrite" || editBlockKind === "section") {
+    // 章节的手动编辑 = 整体重写（编辑框里是「标题 + 全部子块」）
     url = "/api/note/rewrite";
   }
   st.textContent = "保存中…";

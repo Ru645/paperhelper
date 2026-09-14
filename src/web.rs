@@ -433,6 +433,7 @@ async fn api_note_block(
             "kind": "section",
             "number": "",
             "text": note.title,
+            "markdown": note.title,
             "explanations": 0,
             "children": 0,
         })));
@@ -445,6 +446,7 @@ async fn api_note_block(
         "kind": format!("{:?}", b.kind).to_lowercase(),
         "number": b.number,
         "text": b.text,
+        "markdown": note.block_markdown(&b.id),
         "explanations": b.explanations.len(),
         "children": b.children.len(),
     })))
