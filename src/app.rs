@@ -59,7 +59,8 @@ fn sys_ask() -> String {
 
 const COMMANDS: &[&str] = &[
     "ingest", "ask", "check", "sum", "del", "undo", "blocks", "note", "tree", "goto", "stats",
-    "budget", "save", "load", "export", "papers", "concepts", "config", "new", "help", "exit",
+    "budget", "save", "load", "export", "papers", "concepts", "styles", "config", "new", "help",
+    "exit",
 ];
 
 /// `del`/批注删除的撤销快照：保存可恢复的笔记、对话树与批注，不含 stats
@@ -299,10 +300,11 @@ pub struct App {
 }
 
 impl App {
-    /// 组装 App：写出默认提示词模板、初始化空会话与补全列表。
+    /// 组装 App：写出默认提示词/风格模板、初始化空会话与补全列表。
     pub fn new(config: Config, kb: KnowledgeBase, client: reqwest::Client) -> Self {
-        // 首次启动写出默认提示词模板，供用户在 .paperhelper/prompts/ 编辑
+        // 首次启动写出默认提示词模板（ask/rewrite）与风格目录（styles/）
         let _ = crate::prompts::ensure_prompt_files();
+        let _ = crate::prompts::ensure_styles();
         Self {
             config,
             kb,
@@ -544,6 +546,7 @@ impl App {
             "stats" => self.cmd_stats().await,
             "papers" => self.cmd_papers().await,
             "concepts" => self.cmd_concepts().await,
+            "styles" => self.cmd_styles(rest).await,
             "new" => {
                 self.session = Session::default();
                 self.export_path = None;
@@ -578,10 +581,15 @@ impl App {
     fn cmd_help(&self) -> Result<()> {
         let h = "\
 PaperHelper 命令：
-  ingest <pdf>            解析 PDF 并生成结构化笔记（--style four|translate|free 选风格）
+  ingest <pdf>            解析 PDF 并按风格生成笔记（--style <风格id>，默认 four）
+  ingest --note <文件>    直接导入笔记/讲义（不调 LLM；--kind paper|note|lecture）
   ingest --text <txt>     直接读取文本文件（跳过PDF解析）
   ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
-                          例: ingest --style translate paper.pdf  （逐段翻译风格）
+  ingest --extra 「要求」   本次额外要求（拼到所选风格提示词之后）
+                          例: ingest --style translate paper.pdf   （逐段翻译）
+                              ingest --note lecture.md             （直接导入讲义）
+                              ingest --style lecture lecture.pdf   （LLM 整理成讲义提纲）
+  styles                  列出笔记风格（styles show <id> 看提示词；Web「管理风格」可编辑）
   ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
@@ -790,7 +798,35 @@ PaperHelper 命令：
             return Ok(());
         }
         for p in &self.kb.papers {
-            outln!(self, "- [{}] 《{}》（{}）", &p.id[..6.min(p.id.len())], p.title, p.path);
+            let kind = match p.kind.as_str() {
+                "lecture" => "讲义",
+                "note" => "笔记",
+                _ => "论文",
+            };
+            outln!(self, "- [{}] 《{}》[{}]（{}）", &p.id[..6.min(p.id.len())], p.title, kind, p.path);
+        }
+        Ok(())
+    }
+
+    /// styles [show <id>]：列出可用笔记风格（或打印某个风格的提示词）。
+    async fn cmd_styles(&self, rest: &str) -> Result<()> {
+        let rest = rest.trim();
+        if let Some(id) = rest.strip_prefix("show ") {
+            let (meta, prompt) = crate::prompts::style_prompt(id.trim())?;
+            outln!(self, "# {}（{}） scope={}\n{}", meta.id, meta.label, meta.scope, prompt);
+            return Ok(());
+        }
+        let styles = crate::prompts::list_styles()?;
+        for s in styles {
+            outln!(
+                self,
+                "- {}（{}）[{}]{}: {}",
+                s.id,
+                s.label,
+                s.scope,
+                if s.builtin { " 内置" } else { " 自定义" },
+                s.desc
+            );
         }
         Ok(())
     }
@@ -878,28 +914,39 @@ PaperHelper 命令：
     /// 全程记录 token，超预算/被打断即中止且不写会话。
     async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
         let rest = rest.trim();
-        // 先剥离 --style（与 --text/--ocr 任意顺序）
+        // 先剥离选项（--style / --extra / --kind / --note，与 --text/--ocr 任意顺序）
         let (style_raw, rest) = take_style_arg(rest)?;
         let style = if style_raw.is_empty() { "four".to_string() } else { style_raw };
-        let (prompt_file, prompt_default) = crate::prompts::note_style_prompt(&style)?;
-        let rest = rest.as_str();
+        let (extra, rest) = take_value_arg(&rest, "extra");
+        let (kind_raw, rest) = take_value_arg(&rest, "kind");
+        let (direct_import, rest) = take_bool_arg(&rest, "note");
+        let rest = rest.trim();
         // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
         let (mode, file_path) = if let Some(r) = rest.strip_prefix("--text ") {
             ("text", normalize_path_arg(r))
         } else if let Some(r) = rest.strip_prefix("--ocr ") {
             ("ocr", normalize_path_arg(r))
         } else if rest == "--text" || rest == "--ocr" {
-            bail!("用法: ingest [--style four|translate|free] [--text|--ocr] <路径>");
+            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] [--text|--ocr] <路径>");
         } else {
             ("pdf", normalize_path_arg(rest))
         };
 
         if file_path.is_empty() {
-            bail!("用法: ingest [--style four|translate|free] <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
+            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
         let p = Path::new(&file_path);
         if !p.exists() {
             bail!("文件不存在: {file_path}");
+        }
+        // --note：直接导入笔记/讲义（不调 LLM，0 token）
+        if direct_import {
+            let kind = match kind_raw.trim() {
+                "paper" => "paper",
+                "lecture" => "lecture",
+                _ => "note",
+            };
+            return self.import_note(&file_path, mode, kind).await;
         }
         interrupt::reset();
 
@@ -930,43 +977,37 @@ PaperHelper 命令：
 
         // 2. 确定笔记导出文件名。
         //    终端：交互式询问；Web：用预先设置的 export_path，否则用默认名。
-        let stem = Path::new(&file_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("note");
-        let title_guess: String = stem.chars().take(20).collect();
-        let default_name = format!("笔记_{title_guess}.md");
-        let export_file = if self.emitter.is_terminal() {
-            print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
-            io::stdout().flush()?;
-            let mut name = String::new();
-            io::stdin().lock().read_line(&mut name)?;
-            let name = name.trim();
-            if name.is_empty() {
-                default_name.clone()
-            } else {
-                sanitize_filename(&normalize_path_arg(name))
-            }
-        } else {
-            let name = self.export_path.clone().unwrap_or_else(|| default_name.clone());
-            sanitize_filename(&name)
-        };
+        let export_file = self.ask_export_name(&file_path)?;
 
         // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
         let budget_ok = self.check_budget()?;
         if !budget_ok {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
         }
-        // 提示词模板：按风格选（.paperhelper/prompts/<file>，用户可编辑），{raw_text} 为占位符
-        let template = crate::prompts::load_prompt(
-            &crate::prompts::prompts_dir(),
-            prompt_file,
-            prompt_default,
-        );
-        crate::logging::info(format!("生成笔记：风格={style}，提示词={prompt_file}"));
-        let prompt = template.replace("{raw_text}", &raw_text);
+        // 提示词模板：按风格查注册表（styles.toml + styles/<id>.txt），{raw_text} 为占位符
+        let (meta, template) = crate::prompts::style_prompt(&style)?;
+        crate::logging::info(format!(
+            "生成笔记：风格={}（{}），scope={}",
+            meta.id, meta.label, meta.scope
+        ));
+        let kind = match kind_raw.trim() {
+            "paper" => "paper",
+            "note" => "note",
+            "lecture" => "lecture",
+            _ => {
+                if meta.scope == "note" {
+                    "lecture"
+                } else {
+                    "paper"
+                }
+            }
+        };
+        let mut prompt = template.replace("{raw_text}", &raw_text);
+        if !extra.trim().is_empty() {
+            prompt.push_str(&format!("\n\n【本次额外要求】\n{}", extra.trim()));
+        }
         let msgs = vec![
-            Message { role: "system".into(), content: "你是论文笔记生成助手，只输出 Markdown。".into() },
+            Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
             Message { role: "user".into(), content: prompt },
         ];
         let raw_clone = raw_text.clone();
@@ -1004,14 +1045,79 @@ PaperHelper 命令：
         self.record_usage(res.input_tokens, res.output_tokens);
 
         // 4. 解析 Markdown 为笔记树
-        let note = notes::parse_markdown_note(&res.content, &raw_clone);
+        let mut note = notes::parse_markdown_note(&res.content, &raw_clone);
+        note.material_kind = kind.to_string();
         let title = note.title.clone();
         let nblocks = note.count_blocks();
         outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
 
-        // 5. 注册到知识库
+        // 5. 注册到知识库 + 会话根 + 导出
+        self.register_note(note, &file_path, &export_file, res.input_tokens, res.output_tokens)
+            .with_context(|| format!("导入《{title}》"))?;
+        self.update_completions();
+        Ok(())
+    }
+
+    /// 直接导入笔记/讲义（不调 LLM，0 token）：抽取文本 → 解析成笔记树 → 登记知识库。
+    /// `mode`：text（md/txt）/ ocr / pdf；`kind`：paper / note / lecture。
+    async fn import_note(&mut self, file_path: &str, mode: &str, kind: &str) -> Result<()> {
+        let progress_msg = match mode {
+            "text" => "读取文本文件…",
+            "ocr" => "OCR 识别中（可能较慢，可 Ctrl-C/停止 打断）…",
+            _ => "解析 PDF…",
+        };
+        self.emitter.progress(progress_msg);
+        let raw_text = match mode {
+            "text" => tokio::fs::read_to_string(file_path)
+                .await
+                .with_context(|| format!("读取文本文件失败: {file_path}"))?,
+            "ocr" => pdf::ocr_extract(Path::new(file_path)).await?,
+            _ => pdf::extract_pages(Path::new(file_path)).await?.join("\n\n"),
+        };
+        self.emitter.progress_done();
+        if raw_text.trim().is_empty() {
+            bail!("文本内容为空（可能是扫描件，试试 ingest --note --ocr <pdf>）");
+        }
+        let export_file = self.ask_export_name(file_path)?;
+        let stem = Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("note");
+        let title_guess: String = stem.chars().take(20).collect();
+        let mut note = notes::parse_import_note(&raw_text, &title_guess);
+        note.material_kind = kind.to_string();
+        let title = note.title.clone();
+        let nblocks = note.count_blocks();
+        let kind_label = match kind {
+            "lecture" => "讲义",
+            "paper" => "资料",
+            _ => "笔记",
+        };
+        outln!(self, "{} 已导入: 《{}》({} 个结构块，不调 LLM)", "✓".green().bold(), title, nblocks);
+        self.register_note(note, file_path, &export_file, 0, 0)
+            .with_context(|| format!("导入{kind_label}《{title}》"))?;
+        self.update_completions();
+        Ok(())
+    }
+
+    /// 登记笔记到知识库与会话（ingest / import_note 共用）：
+    /// 写 KB Paper（kind 取自 note.material_kind）、重建会话根节点、写导出文件。
+    fn register_note(
+        &mut self,
+        mut note: notes::Note,
+        file_path: &str,
+        export_file: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
         let paper_id = uuid::Uuid::new_v4().to_string();
-        let mut note = note;
+        let title = note.title.clone();
+        let nblocks = note.count_blocks();
+        let kind = if note.material_kind.is_empty() {
+            "paper".to_string()
+        } else {
+            note.material_kind.clone()
+        };
         note.paper_id = paper_id.clone();
         self.session.notes = Some(note);
         self.session.current_paper_id = Some(paper_id.clone());
@@ -1020,42 +1126,66 @@ PaperHelper 命令：
             title: title.clone(),
             path: file_path.to_string(),
             read_at: Utc::now().to_rfc3339(),
+            kind: kind.clone(),
             pinned: false,
         });
         self.kb.save()?;
-
-        // 6. 创建对话树的 0 号根节点（代表"论文已导入、尚未追问"状态）
+        let cost = input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
+            + output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0;
+        // 重建对话树，0 号根节点代表「已导入、尚未追问」状态
         let root_id = uuid::Uuid::new_v4().to_string();
         self.session.conversation = Conversation::default();
         self.session.conversation.add_exchange(ConvNode {
             id: root_id.clone(),
             parent: None,
-            question: format!("（导入论文《{}》，生成笔记，{} 个结构块）", title, nblocks),
+            question: format!("（已导入《{}》，{} 个结构块）", title, nblocks),
             answer: String::new(),
             block_id: None,
             explanation_id: None,
-            input_tokens: res.input_tokens,
-            output_tokens: res.output_tokens,
-            cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
-                + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
+            input_tokens,
+            output_tokens,
+            cost,
             created_at: Utc::now().to_rfc3339(),
             label: format!("导入《{}》", title),
         });
         self.session.conversation.current = Some(root_id);
-
-        // 7. 导出 markdown 笔记（文件名在第 2 步已询问）
-        if let Some(parent) = Path::new(&export_file).parent() {
+        // 导出 markdown 笔记
+        if let Some(parent) = Path::new(export_file).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 bail!("导出目录不存在: {}（请先创建目录，或改用当前目录下的文件名）", parent.display());
             }
         }
-        self.export_path = Some(export_file.clone());
+        self.export_path = Some(export_file.to_string());
         if let Some(note) = &self.session.notes {
-            std::fs::write(&export_file, export::render_for(&export_file, note, &self.session.conversation, &self.session.annotations))?;
+            std::fs::write(export_file, export::render_for(export_file, note, &self.session.conversation, &self.session.annotations))?;
             outln!(self, "{} 笔记已导出到 {}", "✓".green().bold(), export_file);
         }
-        self.update_completions();
         Ok(())
+    }
+
+    /// 确定笔记导出文件名：终端交互询问；Web 用预设 export_path，否则用文件名的默认名。
+    fn ask_export_name(&mut self, file_path: &str) -> Result<String> {
+        let stem = Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("note");
+        let title_guess: String = stem.chars().take(20).collect();
+        let default_name = format!("笔记_{title_guess}.md");
+        if self.emitter.is_terminal() {
+            print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
+            io::stdout().flush()?;
+            let mut name = String::new();
+            io::stdin().lock().read_line(&mut name)?;
+            let name = name.trim();
+            if name.is_empty() {
+                Ok(default_name)
+            } else {
+                Ok(sanitize_filename(&normalize_path_arg(name)))
+            }
+        } else {
+            let name = self.export_path.clone().unwrap_or(default_name);
+            Ok(sanitize_filename(&name))
+        }
     }
 
     /// ask 主流程（追问 → 写笔记）：
@@ -1971,11 +2101,15 @@ PaperHelper 命令：
             outerr!(self, "{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
         }
 
-        let mut msgs = vec![
-            Message { role: "system".into(), content: sys_ask() },
-            Message { role: "user".into(), content: format!("【论文全文】\n{raw_text}") },
-            Message { role: "assistant".into(), content: format!("【已生成笔记】\n{notes_md}") },
-        ];
+        // 论文/资料原文；直接导入的笔记 raw_text 为空 → 省略该段（只发笔记本身）
+        let mut msgs = vec![Message { role: "system".into(), content: sys_ask() }];
+        if !raw_text.trim().is_empty() {
+            msgs.push(Message { role: "user".into(), content: format!("【原文材料】\n{raw_text}") });
+        }
+        msgs.push(Message {
+            role: "assistant".into(),
+            content: format!("【已生成笔记】\n{notes_md}"),
+        });
         for (q, a) in &kept_pairs {
             msgs.push(Message { role: "user".into(), content: q.clone() });
             msgs.push(Message { role: "assistant".into(), content: a.clone() });
@@ -2033,17 +2167,17 @@ fn split_cmd(line: &str) -> (&str, &str) {
 /// 取出 `--style <值>`（也支持 `--style=值`），返回 (值, 去掉该选项后的剩余参数)。
 /// 允许 `--style` 与 `--text`/`--ocr` 任意顺序；路径含空格请用引号包裹。
 fn take_style_arg(rest: &str) -> Result<(String, String)> {
-    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let toks = split_args_quoted(rest);
     let mut style = String::new();
-    let mut out: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
-        let t = toks[i];
+        let t = toks[i].as_str();
         if t == "--style" {
             if i + 1 >= toks.len() {
-                bail!("--style 缺少取值（可选：four / translate / free）");
+                bail!("--style 缺少取值（可用 `styles` 查看全部风格）");
             }
-            style = toks[i + 1].to_string();
+            style = toks[i + 1].clone();
             i += 2;
             continue;
         }
@@ -2052,10 +2186,99 @@ fn take_style_arg(rest: &str) -> Result<(String, String)> {
             i += 1;
             continue;
         }
-        out.push(t);
+        out.push(toks[i].clone());
         i += 1;
     }
     Ok((style, out.join(" ")))
+}
+
+/// 按 shell 风格切分参数：支持双/单引号（引号内保留空格），
+/// 引号与转义序列原样保留，交给 `normalize_path_arg` 统一还原。
+fn split_args_quoted(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' && q == '"' {
+                    cur.push(c);
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                    }
+                } else if c == q {
+                    cur.push(c);
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    cur.push(c);
+                } else if c.is_whitespace() {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 取出 `--<name> <值>` / `--<name>=<值>`（值按 shell 风格还原引号/转义），返回 (值, 剩余)。
+fn take_value_arg(rest: &str, name: &str) -> (String, String) {
+    let toks = split_args_quoted(rest);
+    let mut val = String::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i].as_str();
+        let flag = format!("--{name}");
+        if t == flag {
+            if i + 1 < toks.len() {
+                val = normalize_path_arg(&toks[i + 1]);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(v) = t.strip_prefix(&format!("--{name}=")) {
+            val = normalize_path_arg(v);
+            i += 1;
+            continue;
+        }
+        out.push(toks[i].clone());
+        i += 1;
+    }
+    (val, out.join(" "))
+}
+
+/// 取出布尔开关 `--<name>`，返回 (是否存在, 剩余)。
+fn take_bool_arg(rest: &str, name: &str) -> (bool, String) {
+    let toks = split_args_quoted(rest);
+    let mut found = false;
+    let out: Vec<String> = toks
+        .into_iter()
+        .filter(|t| {
+            if *t == format!("--{name}") {
+                found = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (found, out.join(" "))
 }
 
 /// 收集块及其全部子块的 id（删除块后清理相关批注用）。
@@ -2156,7 +2379,10 @@ pub fn mask_key(k: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_concept, normalize_path_arg, take_style_arg, CommandCompleter};
+    use super::{
+        extract_concept, normalize_path_arg, take_bool_arg, take_style_arg, take_value_arg,
+        CommandCompleter,
+    };
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
 
@@ -2172,6 +2398,32 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(r, "x.pdf");
         assert!(take_style_arg("--style").is_err(), "缺取值应报错");
+    }
+
+    #[test]
+    fn take_value_and_bool_args() {
+        let (v, r) = take_value_arg("--extra 补充直觉 --text a.pdf", "extra");
+        assert_eq!(v, "补充直觉");
+        assert_eq!(r, "--text a.pdf");
+        let (v, r) = take_value_arg("--kind=lecture x.md", "kind");
+        assert_eq!(v, "lecture");
+        assert_eq!(r, "x.md");
+        let (v, r) = take_value_arg("x.md", "extra");
+        assert!(v.is_empty());
+        assert_eq!(r, "x.md");
+        let (b, r) = take_bool_arg("--note --text x.md", "note");
+        assert!(b);
+        assert_eq!(r, "--text x.md");
+        let (b, r) = take_bool_arg("--text x.md", "note");
+        assert!(!b);
+        assert_eq!(r, "--text x.md");
+        // 带空格的引号值（「本次额外要求」常见）
+        let (v, r) = take_value_arg("--extra \"只翻译 不要总结\" --text x.md", "extra");
+        assert_eq!(v, "只翻译 不要总结");
+        assert_eq!(r, "--text x.md");
+        let (b, r) = take_bool_arg("--note --extra \"a b\" x.md", "note");
+        assert!(b);
+        assert_eq!(r, "--extra \"a b\" x.md");
     }
 
     #[test]

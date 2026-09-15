@@ -321,6 +321,43 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .test-result { font-size: 13px; color: #444; margin-top: 10px; max-height: 220px; overflow-y: auto; }
 .test-result.hidden { display: none; }
 .test-result.ok { color: var(--ok); }
+
+/* 导入弹窗：模式切换 + 动态风格 + 临时额外要求 */
+.import-box, .styles-box { width: 560px; }
+.mode-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.mode-tab {
+  border: 1px solid var(--line); background: #fff; border-radius: 6px;
+  padding: 5px 12px; font-size: 13px; cursor: pointer; color: #555;
+}
+.mode-tab.active { background: var(--blue-light); color: var(--blue); border-color: var(--blue); font-weight: 600; }
+.style-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.style-row select { flex: 1; min-width: 0; }
+.hint { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.modal-box textarea {
+  width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 13px;
+  line-height: 1.6; background: #fff; color: var(--fg); resize: vertical;
+}
+#import-extra { min-height: 54px; }
+.import-extra-actions { display: flex; justify-content: flex-end; margin: -4px 0 8px; }
+.import-extra-actions.hidden, #import-extra-wrap.hidden { display: none; }
+
+/* 风格管理：左列表 + 右编辑 */
+.styles-layout { display: flex; gap: 14px; align-items: stretch; }
+.styles-list {
+  width: 170px; max-height: 46vh; overflow-y: auto; border: 1px solid var(--line);
+  border-radius: 8px; padding: 4px;
+}
+.style-item {
+  padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.style-item:hover { background: var(--blue-light); }
+.style-item.active { background: var(--blue-light); color: var(--blue); font-weight: 600; }
+.style-item .s-meta { font-size: 11px; color: var(--muted); font-weight: 400; }
+.styles-edit { flex: 1; min-width: 0; }
+.styles-edit label { margin-bottom: 8px; }
+.styles-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .test-result.err { color: var(--danger); }
 .test-result summary { cursor: pointer; color: var(--blue); font-size: 12px; }
 
@@ -501,3 +538,10 @@ ul.outline li.para { color: #888; font-size: 12px; }
 /* ===== 帮助 ===== */
 .help-list { margin: 8px 0 0 18px; }
 .help-list li { font-size: 13px; line-height: 1.9; }
+
+/* 材料类型小标记（论文/笔记/讲义） */
+.badge {
+  display: inline-block; padding: 0 5px; margin-left: 2px; font-size: 10px;
+  color: var(--blue); background: var(--blue-light); border-radius: 8px;
+  vertical-align: 1px;
+}

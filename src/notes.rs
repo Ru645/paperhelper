@@ -82,6 +82,10 @@ pub struct Note {
     /// 论文全文纯文本（ingest 时抽取，ask 时作为上下文重发）。
     #[serde(default)]
     pub raw_text: String,
+    /// 材料类型：paper（论文，默认）/ note（自己的笔记）/ lecture（课程讲义）。
+    /// 用于界面标注与 ask 上下文策略；直接导入的笔记 raw_text 为空。
+    #[serde(default)]
+    pub material_kind: String,
 }
 
 impl Note {
@@ -527,9 +531,65 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         title,
         blocks: roots,
         raw_text: raw_text.to_string(),
+        material_kind: String::new(),
     };
     assign_numbers(&mut note);
     note
+}
+
+/// 直接导入笔记/讲义时的解析：有 `#` 标题按现有规则建 Section 树；
+/// 无标题则按空行切成多个 Paragraph（保证大纲/锚点/批注可用）。
+/// 与 `parse_markdown_note` 不同：不剥开头的 ``` 围栏（保留代码块），raw_text 置空。
+pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
+    let has_heading = md.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('#') && t.strip_prefix('#').is_some_and(|r| r.starts_with(' ') || r.starts_with('\t'))
+    });
+    let (title, mut roots) = if has_heading {
+        parse_blocks_core_inner(md, true)
+    } else {
+        (String::new(), split_into_paragraphs(md))
+    };
+    if roots.is_empty() && !md.trim().is_empty() {
+        roots.push(Block {
+            id: uid(),
+            kind: BlockKind::Paragraph,
+            text: md.trim().to_string(),
+            number: String::new(),
+            children: Vec::new(),
+            explanations: Vec::new(),
+        });
+    }
+    let title = if title.trim().is_empty() { fallback_title.to_string() } else { title };
+    let mut note = Note {
+        paper_id: String::new(),
+        title,
+        blocks: roots,
+        raw_text: String::new(),
+        material_kind: String::new(),
+    };
+    assign_numbers(&mut note);
+    note
+}
+
+/// 无标题文本：按空行切分为多个段落块。
+fn split_into_paragraphs(md: &str) -> Vec<Block> {
+    let mut out = Vec::new();
+    for chunk in md.split("\n\n") {
+        let t = chunk.trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(Block {
+            id: uid(),
+            kind: BlockKind::Paragraph,
+            text: t.to_string(),
+            number: String::new(),
+            children: Vec::new(),
+            explanations: Vec::new(),
+        });
+    }
+    out
 }
 
 /// 解析一段 Markdown 为块序列（供「插入内容 / 整节重写」使用）。
@@ -542,7 +602,11 @@ pub fn parse_markdown_blocks(md: &str) -> Vec<Block> {
 /// 解析核心：返回 (标题, 顶层块)。`h1_as_title=true` 时 `#` 作标题（ingest 用）；
 /// false 时 `#`/`##`/`###` 分别对应深度 0/1/2（插入/重写用）。
 fn parse_blocks_core(md: &str, h1_as_title: bool) -> (String, Vec<Block>) {
-    let md = strip_fences(md);
+    parse_blocks_core_inner(strip_fences(md), h1_as_title)
+}
+
+/// `parse_blocks_core` 的实现（不含剥围栏，供直接导入保留代码块）。
+fn parse_blocks_core_inner(md: &str, h1_as_title: bool) -> (String, Vec<Block>) {
     let lines: Vec<&str> = md.lines().collect();
 
     let mut title = String::new();
@@ -1290,5 +1354,35 @@ mod tests {
         assert!(!note.remove_block("nope"));
         note.renumber();
         assert_eq!(note.find_section_by_number("1").unwrap().text, "B");
+    }
+
+    #[test]
+    fn import_note_headingless_splits_paragraphs() {
+        let note = parse_import_note("第一段\n\n第二段\n\n第三段", "讲义");
+        assert_eq!(note.title, "讲义");
+        assert_eq!(note.blocks.len(), 3);
+        assert!(note.blocks.iter().all(|b| b.kind == BlockKind::Paragraph));
+        assert!(note.raw_text.is_empty(), "直接导入的笔记 raw_text 应为空");
+    }
+
+    #[test]
+    fn import_note_with_headings_builds_sections() {
+        let md = "# 标题\n## 第一章\n内容 A\n\n## 第二章\n内容 B\n";
+        let note = parse_import_note(md, "fallback");
+        assert_eq!(note.title, "标题");
+        assert_eq!(note.blocks.len(), 2);
+        assert_eq!(note.blocks[0].kind, BlockKind::Section);
+        assert_eq!(note.blocks[0].text, "第一章");
+    }
+
+    #[test]
+    fn import_note_keeps_leading_code_fence() {
+        let md = "```python\nprint(1)\n```\n\n后面的说明";
+        let note = parse_import_note(md, "代码");
+        assert_eq!(note.title, "代码");
+        assert!(
+            note.blocks.iter().any(|b| b.text.contains("```python")),
+            "直接导入应保留代码围栏，不应被剥掉"
+        );
     }
 }

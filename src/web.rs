@@ -47,6 +47,10 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/interrupt", post(api_interrupt))
         .route("/api/state", get(api_state))
         .route("/api/note", get(api_note))
+        .route("/api/styles", get(api_styles))
+        .route("/api/styles/save", post(api_style_save))
+        .route("/api/styles/delete", post(api_style_delete))
+        .route("/api/styles/reset", post(api_style_reset))
         .route("/api/note/block", get(api_note_block))
         .route("/api/note/edit", post(api_note_edit))
         .route("/api/note/rewrite", post(api_note_rewrite))
@@ -298,6 +302,7 @@ fn build_state(a: &App) -> serde_json::Value {
                 "title": p.title,
                 "path": p.path,
                 "read_at": p.read_at,
+                "kind": p.kind,
                 "pinned": p.pinned,
             })
         })
@@ -405,6 +410,82 @@ fn hidden_expl_ids(sess: &session::Session) -> std::collections::HashSet<String>
         }
     }
     set
+}
+
+// ===== 笔记风格（管理 / 导入时可选） =====
+
+async fn api_styles() -> Json<serde_json::Value> {
+    match crate::prompts::list_styles() {
+        Ok(list) => {
+            let items: Vec<serde_json::Value> = list
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "label": s.label,
+                        "desc": s.desc,
+                        "builtin": s.builtin,
+                        "scope": s.scope,
+                        "prompt": crate::prompts::style_prompt_text(s),
+                    })
+                })
+                .collect();
+            Json(json!({ "styles": items }))
+        }
+        Err(e) => Json(json!({ "styles": [], "error": format!("{e:#}") })),
+    }
+}
+
+#[derive(Deserialize)]
+struct StyleSaveReq {
+    id: String,
+    label: String,
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    prompt: String,
+}
+
+/// 新建/更新一个风格（写 `styles.toml` + `styles/<id>.txt`）。
+async fn api_style_save(
+    Json(req): Json<StyleSaveReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let meta = crate::prompts::NoteStyle {
+        id: req.id.trim().to_string(),
+        label: req.label,
+        desc: req.desc,
+        file: String::new(),
+        builtin: false,
+        scope: if req.scope.trim().is_empty() { "any".into() } else { req.scope },
+    };
+    crate::prompts::save_style(&meta, &req.prompt)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct StyleIdReq {
+    id: String,
+}
+
+/// 删除自定义风格（内置不可删）。
+async fn api_style_delete(
+    Json(req): Json<StyleIdReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::prompts::delete_style(&req.id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 恢复内置风格的默认提示词与说明。
+async fn api_style_reset(
+    Json(req): Json<StyleIdReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::prompts::reset_style(&req.id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ===== 笔记编辑（改文字 / 整节重写 / 插入 / 删除 / AI 生成） =====

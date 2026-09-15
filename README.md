@@ -12,7 +12,8 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 - **笔记内就地提问**：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内问答；答案与所选文字绑定，点击高亮即可重新展开。选中公式会把它在 KaTeX 里的**原始 LaTeX**交给模型（不是渲染后的文本）
 - **章节提问**：右键笔记标题（h1=全文，h2/h3=小节）→「对本章节提问」
 - **递归嵌套批注**：对追问的回答再追问，批注层层嵌套；**回答里也能选中文字提问**（引用同样持久高亮，点击回看）；`sum` 把子树折叠成「总结」并可展开
-- **多种笔记风格**：导入时可选「四段式 / 逐段翻译（忠实原文）/ 自由笔记（结构自定）」；翻译为单次整篇，输出被截断会明确提示
+- **多种笔记风格（可自定义）**：导入时可选内置风格「四段式 / 逐段翻译 / 中英对照 / 忠实照抄 / 讲义提纲 / 自由笔记」，也能新建自己的风格；导入时可再填一句「本次额外要求」（如"只翻译"），并可一键「另存为风格」。风格 = 名字 + 说明 + 提示词模板，文件在 `.paperhelper/styles/`（清单 `styles.toml`），Web 里可视化新建/编辑/复制/删除/恢复默认
+- **直接导入笔记 / 课程讲义**：把已有的笔记、讲义（Markdown / TXT / HTML / PDF）直接导入，不调用模型、不花 token；PDF 讲义可在导入时改选「AI 整理为讲义」或「逐段翻译」。HTML 会在浏览器端转成 Markdown（公式按 KaTeX 还原）
 - **编辑与 AI 改写**：悬停笔记块点「✎ 编辑」即可改文字；也可让 AI 重写 / 补充某段，或手动插入内容、删除整块（普通编辑不换块 id，追问与批注不受影响）；**所有编辑/删除都能用顶栏「撤销」回退**（内存多级，最多 20 步）
 - **导入 PDF → 结构化笔记**：LLM 按固定四段架构（问题 / 前人方案 / 本文方案 / 前景）生成详细 Markdown，含公式、表格、数值结果
 - **跨论文知识库**：自动积累读过的论文与学过的概念，追问时自动关联已学知识
@@ -53,7 +54,14 @@ paperhelper web --port 9000  # 指定端口
 - **已读论文 / 已学概念**：点击查看详情；「加载该会话」可跳回当时的问答（若该问答来自批注，会滚动到原文并打开批注弹窗）；右键置顶 / 删除。
 - **批量操作**：三个列表均支持 **Ctrl(⌘) 点选、Shift 连选**，右键即可批量置顶 / 删除；标题旁显示「已选 N」，`Esc` 取消选择。
 
-**导入**：新建会话（或还没有笔记）时，「笔记」页中央显示「＋ 导入论文」按钮，点击选择文件；也可直接把 PDF / TXT 拖进窗口。上传前弹出**导入窗口**：填笔记文件名、选**笔记风格**（四段式 / 逐段翻译 / 自由笔记）。上传时显示百分比；解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。
+**导入**：新建会话（或还没有笔记）时，「笔记」页中央显示「＋ 导入资料」按钮，点击选择文件；也可直接把 PDF / TXT / MD / HTML 拖进窗口。上传前弹出**导入窗口**，先选模式：
+
+- **论文 → 生成笔记**：读论文全文，按所选风格生成结构化笔记（默认四段式；也可选逐段翻译 / 中英对照 / 忠实照抄 / 自由笔记等）。
+- **笔记 / 讲义 → 导入**：导入已有的讲义或自己整理的笔记。默认「**原样导入**」——直接解析成笔记树，不调用模型、不花 token；也可以选一种风格让 AI 处理（例如 PDF 讲义选「讲义提纲」，英文讲义选「逐段翻译」）。上传 **HTML** 时会自动转成 Markdown：标题成章节、公式按 KaTeX 隐藏层还原成 `$...$`、脚本与事件属性剔除。
+
+导入窗口里还能：填「**本次额外要求**」（如"只翻译""数学符号别翻译"），它会被拼到所选风格的提示词之后；点「**另存为风格…**」把当前风格 + 这次要求存成一个新风格；点「**管理…**」打开风格管理（新建 / 编辑 / 复制 / 删除 / 恢复默认，改完即可在导入时选用）。
+
+上传时显示百分比；解析与生成笔记期间，顶部显示**流动进度条 + 实时已生成字数/耗时**，控制台同步流式输出 Markdown。翻译/整理为单次整篇，**超长讲义可能被截断**（会明确提示，建议按章拆分导入）。直接导入的笔记不发原文给模型，ask 时只带笔记本身。
 
 **编辑笔记**：鼠标悬停任意标题 / 段落 → 右上角浮出「✎ 编辑」→ 弹窗内可：
 - **手动改文字**：直接改（支持 Markdown 与 `$公式$`），点「应用」保存；
@@ -117,14 +125,21 @@ source ~/.bashrc
 
 ```bash
 > ingest samples/论文.pdf                       # 默认：PyMuPDF 提取文本 + 四段式笔记
-> ingest --style translate samples/论文.pdf    # 逐段翻译风格（忠实原文）
-> ingest --style free samples/论文.pdf         # 自由笔记（不加结构约束）
+> ingest --style translate samples/论文.pdf    # 逐段翻译（只译文；长文可能被截断）
+> ingest --style lecture samples/讲义.pdf      # 讲义提纲（知识点 + 复习清单）
+> ingest --style verbatim samples/资料.pdf     # 忠实照抄（只做标题/公式/表格结构化）
+> ingest --note --text samples/我的笔记.md      # 直接导入笔记/讲义（不调 LLM，0 token）
+> ingest --note --ocr samples/扫描讲义.pdf     # 扫描件 OCR 后直接导入
+> ingest --extra "只保留公式和结论" --style free samples/资料.pdf   # 本次额外要求
 > ingest --text samples/论文.txt                # 直接读取文本文件（跳过 PDF 解析）
 > ingest --ocr samples/扫描件.pdf               # OCR 识别（需安装 tesseract）
+> styles                                       # 列出全部风格；styles show <id> 看提示词
 ```
 
-- `--style four|translate|free`：笔记生成风格（可与其他选项任意顺序组合），对应提示词 `note.txt`/`translate.txt`/`free.txt`
-- `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果
+- `--style <风格id>`：任意内置或自定义风格（`styles` 可列出），对应提示词在 `.paperhelper/styles/<id>.txt`
+- `--note`：直接导入笔记/讲义——解析成笔记树、登记知识库，**不调用 LLM**；`--kind paper|note|lecture` 只影响列表里的类型标记
+- `--extra "…"`：本次额外要求，拼到所选风格提示词之后（Web 的「另存为风格…」可把它固化成新风格）
+- `--text`：适合已用其他工具提取好文本的场景，或想手动修正 PDF 提取结果；直接导入 HTML 请在 Web 界面操作（浏览器端转换会保留公式）
 - `--ocr`：适合扫描版 PDF（无文本层）；未装 tesseract 会给出安装指引，不影响其他功能
 - 翻译为**单次整篇**生成；若模型输出达到上限被截断，会提示「⚠️ 笔记可能被截断」
 
@@ -137,7 +152,8 @@ source ~/.bashrc
 
 | 命令 | 说明 |
 |------|------|
-| `ingest [--style four\|translate\|free] <pdf>` | 导入 PDF 生成笔记（可选风格），自动导出 |
+| `ingest [--style <id>] [--extra "…"] <pdf>` | 导入 PDF 按风格生成笔记（`styles` 可列出风格），自动导出 |
+| `ingest --note <文件>` | 直接导入笔记/讲义（不调 LLM；`--kind paper\|note\|lecture`） |
 | `ingest --text <txt>` | 直接读取文本文件（跳过 PDF 解析） |
 | `ingest --ocr <pdf>` | OCR 识别扫描件（需 tesseract） |
 | `ask <编号> <问题>` | 按编号定位 Section 追问，解释插入笔记对应位置，递归嵌套 |
@@ -152,7 +168,8 @@ source ~/.bashrc
 | `stats` | 查看本次/累计 token 用量与成本 |
 | `budget <n>` | 设置 token 预算（0=不限），到上限自动中断 |
 | `export md\|mindmap\|html [file]` | 导出笔记；自动补后缀，省略文件名时用 ingest 时的笔记名 |
-| `papers` / `concepts` | 列出已读论文 / 已学概念 |
+| `papers` / `concepts` | 列出已读论文（含讲义/笔记标记）/ 已学概念 |
+| `styles` / `styles show <id>` | 列出笔记风格 / 查看某个风格的提示词（编辑走 Web 或改文件） |
 | `save [file]` / `load <file>` | 保存 / 加载会话 |
 | `new` | 新建会话 |
 | `config show` / `config set <k> <v>` | 查看 / 设置配置 |
@@ -258,14 +275,20 @@ paperhelper                  # CLI REPL
 ```
 .paperhelper/
 ├── config.toml          # 配置文件
-├── knowledge.json       # 跨论文知识库（论文+概念+累计用量）
-├── prompts/             # 提示词模板（可编辑）
+├── knowledge.json       # 跨论文知识库（论文/讲义/笔记 + 概念 + 累计用量）
+├── styles.toml          # 笔记风格清单（id / 名称 / 说明 / 适用 / 文件）
+├── styles/              # 笔记风格提示词（可直接编辑；内置风格首次启动自动写出）
+│   ├── four.txt         # 四段式（{raw_text} 为资料全文占位符）
+│   ├── translate.txt    # 逐段翻译
+│   ├── translate-bi.txt # 中英对照
+│   ├── verbatim.txt     # 忠实照抄
+│   ├── lecture.txt      # 讲义提纲
+│   ├── free.txt         # 自由笔记
+│   └── my-style.txt     # 自定义风格（Web「管理风格」新建）
+├── prompts/             # 行为提示词（可编辑）
 │   ├── ask.txt          # ask/check 的 system prompt
-│   ├── note.txt         # 四段式笔记模板（{raw_text} 为论文占位符）
-│   ├── translate.txt    # 逐段翻译模板
-│   ├── free.txt         # 自由笔记模板
 │   └── rewrite.txt      # AI 改写/补充模板（{paper}/{note}/{target}/{instruction}/{task}）
-├── uploads/             # Web 端上传的论文文件
+├── uploads/             # Web 端上传的文件（论文/讲义/笔记）
 ├── logs/                # 运行日志（超过 5MB 轮转为 paperhelper.log.1）
 │   └── paperhelper.log
 └── sessions/            # 会话存档（文件名 = 会话编号 = 首次保存时间戳）
@@ -288,7 +311,8 @@ paperhelper                  # CLI REPL
 
 ## 自定义提示词与补全预设
 
-- **提示词**：直接编辑 `.paperhelper/prompts/` 下的模板：`ask.txt`（回答风格）、`note.txt` / `translate.txt` / `free.txt`（三种笔记风格，`{raw_text}` 会被替换为论文全文）、`rewrite.txt`（AI 改写/补充）。改完重启生效；删除文件则恢复内置默认。
+- **笔记风格**：编辑 `.paperhelper/styles/<id>.txt`（`{raw_text}` 会被替换为资料全文），或改 `.paperhelper/styles.toml` 增删风格；Web「导入 → 管理…」可视化新建/编辑/复制/删除/恢复默认。内置风格删掉文件后重启会自动恢复默认。
+- **行为提示词**：直接编辑 `.paperhelper/prompts/` 下的模板：`ask.txt`（回答风格）、`rewrite.txt`（AI 改写/补充）。改完重启生效；删除文件则恢复内置默认。
 - **补全预设**：`config.toml` 的 `[presets]` 节可增删 `config set llm.model` / `llm.api_endpoint` 的 Tab 补全候选：
 
 ```toml
@@ -306,6 +330,9 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，`sum` 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **文本锚点批注**：批注记录「锚点 + 选中文字」，笔记锚点是 `block_id`、回答锚点是 `node_id`，渲染时按文本引用定位并高亮，点击可重开弹窗；匹配时跳过 KaTeX 隐藏 MathML、按可见文本逐节点包裹，含公式的引用也能高亮且不破坏公式结构
 - **公式上下文**：选中 KaTeX 公式时从隐藏层的 `<annotation encoding="application/x-tex">` 还原 LaTeX（`$...$`/`$$...$$`）作为给 LLM 的上下文（`quote_tex`），避免传渲染后的线性文本；只选中子片段时给整条公式并注明片段（KaTeX 无子表达式源码映射）
+- **笔记风格注册表**：风格 = `id/名称/说明/适用/提示词`，清单在 `.paperhelper/styles.toml`、提示词在 `.paperhelper/styles/<id>.txt`（旧 `prompts/{note,translate,free}.txt` 首次启动自动迁移，用户改动不丢）；生成时把所选风格的 `{raw_text}` 替换为全文，并可选追加「本次额外要求」
+- **材料类型**：`Note.material_kind` / `Paper.kind`（`paper|note|lecture`，serde 默认值兼容旧数据）；直接导入的笔记 `raw_text` 为空，`build_context_messages` 会省略【原文材料】段——ask 只发笔记本身
+- **导入解析**：`parse_import_note`（有标题建 Section 树、无标题按空行切多个段落、不剥代码围栏）；HTML 在浏览器端用 DOMParser 白名单转换（KaTeX 公式还原、脚本/事件属性丢弃）
 - **可编辑笔记树**：块级编辑（改文字 / 整节重写 / 插入 / 删除）尽量保持块 id 稳定；`parse_markdown_blocks` 把 Markdown 解析成块序列（`#` 也当 Section），结构变化后统一重排编号
 - **流式输出 + 进度**：LLM 输出实时渲染；推理模型的 `reasoning_content` 走独立的 `Event::Reasoning` → SSE `reasoning`，界面显示「思考过程」，等待期显示上下文规模与计时；耗时任务显示进度条与实时字数/耗时
 - **可中止**：`interrupt` 全局信号 + `tokio::select!`——LLM 的发送/读取、重试等待、PDF/OCR 子进程（`kill_on_drop`）都能被 `Ctrl-C` / Web「停止」立即打断

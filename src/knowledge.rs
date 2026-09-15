@@ -21,6 +21,9 @@ pub struct Paper {
     pub title: String,
     pub path: String,
     pub read_at: String,
+    /// 材料类型：paper（论文，默认）/ note（笔记）/ lecture（讲义）。
+    #[serde(default)]
+    pub kind: String,
     /// 是否在列表中置顶。
     #[serde(default)]
     pub pinned: bool,

@@ -11,7 +11,7 @@
   <div class="brand">PaperHelper <span class="sub">论文学习助手</span></div>
   <div class="model" id="model"></div>
   <div class="actions">
-    <input type="file" id="file-input" accept=".pdf,.txt,.md" hidden>
+    <input type="file" id="file-input" accept=".pdf,.txt,.md,.markdown,.html,.htm" hidden>
     <div class="dropdown">
       <button id="btn-export" class="ghost">导出 ▾</button>
       <div id="export-menu" class="dropdown-menu hidden">
@@ -76,8 +76,8 @@
         <div id="note-empty" class="note-empty hidden">
           <div class="ne-icon">▤</div>
           <h2>还没有笔记</h2>
-          <p>导入一篇论文（PDF / TXT），自动生成结构化笔记</p>
-          <button id="btn-import" class="primary">＋ 导入论文</button>
+          <p>导入论文生成笔记，或直接导入笔记 / 课程讲义（PDF / TXT / MD / HTML）</p>
+          <button id="btn-import" class="primary">＋ 导入资料</button>
           <p class="ne-hint">也可以直接把文件拖进窗口</p>
         </div>
       </div>
@@ -88,7 +88,7 @@
   </main>
 </div>
 
-<div id="drop-overlay" class="drop-overlay hidden"><div class="drop-inner">松开鼠标，导入论文文件</div></div>
+<div id="drop-overlay" class="drop-overlay hidden"><div class="drop-inner">松开鼠标，导入文件（论文 / 笔记 / 讲义）</div></div>
 
 <div id="ctx-menu" class="ctx-menu hidden"></div>
 
@@ -122,23 +122,67 @@
   <div id="ann-resize" class="ann-resize" title="拖动调整弹窗大小"></div>
 </div>
 
-<!-- 导入论文：文件名 + 笔记风格 -->
+<!-- 导入：论文生成笔记 / 笔记·讲义导入（风格可选，支持临时额外要求） -->
 <div id="import-modal" class="modal hidden">
-  <div class="modal-box">
-    <h2>导入论文</h2>
+  <div class="modal-box import-box">
+    <h2>导入资料</h2>
     <p id="import-file" class="muted"></p>
+    <div class="mode-tabs" id="import-modes">
+      <button class="mode-tab active" data-mode="paper">论文 → 生成笔记</button>
+      <button class="mode-tab" data-mode="note">笔记 / 讲义 → 导入</button>
+    </div>
     <label>笔记文件名<input id="import-name" type="text" placeholder="笔记_xxx.md"></label>
     <label>笔记风格
-      <select id="import-style">
-        <option value="four">四段式（问题 / 前人方案 / 本文方案 / 前景）</option>
-        <option value="translate">逐段翻译（忠实原文、几乎照搬；长文可能被截断）</option>
-        <option value="free">自由笔记（不加结构约束，由模型自行组织）</option>
-      </select>
+      <span class="style-row">
+        <select id="import-style"></select>
+        <button id="btn-style-manage" class="mini ghost" title="新建 / 编辑风格">管理…</button>
+      </span>
+      <span id="import-style-desc" class="hint"></span>
     </label>
+    <label id="import-extra-wrap">本次额外要求（可选）
+      <textarea id="import-extra" rows="2" placeholder="如：只保留公式和结论 / 数学符号别翻译 / 按章节整理…"></textarea>
+    </label>
+    <div class="import-extra-actions">
+      <button id="btn-import-save-style" class="mini ghost" title="把所选风格提示词 + 本次要求另存为新风格">另存为风格…</button>
+    </div>
     <div class="modal-actions">
       <button id="btn-import-cancel" class="ghost">取消</button>
       <button id="btn-import-ok" class="primary">导入</button>
     </div>
+  </div>
+</div>
+
+<!-- 笔记风格管理：列表 + 编辑（文件同源：.paperhelper/styles.toml + styles/<id>.txt） -->
+<div id="styles-modal" class="modal hidden">
+  <div class="modal-box styles-box">
+    <h2>笔记风格管理</h2>
+    <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除；文件在 <code>.paperhelper/styles/</code>。</p>
+    <div class="styles-layout">
+      <div class="styles-list" id="styles-list"></div>
+      <div class="styles-edit">
+        <label>id（文件名，创建后不可改）<input id="style-id" type="text" placeholder="my-style"></label>
+        <label>名称<input id="style-label" type="text" placeholder="我的风格"></label>
+        <label>说明<input id="style-desc" type="text" placeholder="一句话说明这个风格生成什么笔记"></label>
+        <label>适用
+          <select id="style-scope">
+            <option value="any">通用</option>
+            <option value="paper">论文</option>
+            <option value="note">笔记 / 讲义</option>
+          </select>
+        </label>
+        <label>提示词（<code>{raw_text}</code> 会被替换为资料全文）</label>
+        <textarea id="style-prompt" rows="12" placeholder="请阅读以下资料，生成…"></textarea>
+        <div class="styles-actions">
+          <button id="btn-style-new" class="mini ghost">新建</button>
+          <button id="btn-style-copy" class="mini ghost">复制</button>
+          <button id="btn-style-delete" class="mini ghost danger">删除</button>
+          <button id="btn-style-reset" class="mini ghost">恢复默认</button>
+          <button id="btn-style-save" class="mini primary">保存</button>
+        </div>
+        <p id="style-status" class="status"></p>
+      </div>
+    </div>
+    <div class="modal-actions"><button id="btn-styles-close" class="ghost">关闭</button></div>
   </div>
 </div>
 
@@ -199,8 +243,10 @@
   <div class="modal-box">
     <h2>使用帮助</h2>
     <ul class="help-list">
-      <li><b>导入</b>：在还没有笔记的「笔记」页点「＋ 导入论文」，或直接把 PDF/TXT 拖进窗口。</li>
-      <li><b>多种风格</b>：导入时可选择「四段式 / 逐段翻译 / 自由笔记」；提示词可在 <code>.paperhelper/prompts/</code> 里改。</li>
+      <li><b>导入</b>：在「笔记」页点「＋ 导入资料」，或直接把文件拖进窗口（PDF / TXT / MD / HTML）。</li>
+      <li><b>论文 / 讲义模式</b>：论文走「论文 → 生成笔记」；自己的笔记或课程讲义走「笔记 / 讲义 → 导入」，可「原样导入（不调模型、0 token）」或选一种风格生成。</li>
+      <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「管理…」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
+      <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除）。</li>
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。所有编辑/删除都能用顶栏「撤销」回退。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>

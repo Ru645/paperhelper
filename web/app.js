@@ -513,7 +513,8 @@ function renderPapers(st) {
     li.dataset.key = paperKey(p);
     if (selection.papers.has(paperKey(p))) li.classList.add("selected");
     const pin = p.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
-    li.innerHTML = `${pin}《${esc(p.title)}》`;
+    const badge = p.kind === "lecture" ? ' <span class="badge">讲义</span>' : p.kind === "note" ? ' <span class="badge">笔记</span>' : "";
+    li.innerHTML = `${pin}《${esc(p.title)}》${badge}`;
     li.title = "点击查看笔记与对应会话 · Ctrl/⌘ 点选、Shift 连选 · 右键更多";
     li.onclick = (e) => listClick("papers", e, paperKey(p), () => openPaperTab(p));
     li.oncontextmenu = (e) => {
@@ -2271,13 +2272,84 @@ function uploadFile(file, onProgress) {
   });
 }
 
-/// 弹出导入弹窗，返回 {name, style} 或 null（取消）。
-function promptImport(file, defaultName) {
+// ===== 导入（论文 / 笔记·讲义）与笔记风格 =====
+
+let stylesCache = [];   // GET /api/styles 的结果
+let importCtx = null;   // 导入弹窗状态：{ file, mode: "paper"|"note" }
+
+/// 拉取风格列表（导入弹窗与风格管理共用）。
+async function refreshStyles() {
+  try {
+    const d = await (await fetch("/api/styles")).json();
+    stylesCache = d.styles || [];
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+/// 按当前模式渲染风格下拉：论文只看 scope=paper/any；
+/// 笔记·讲义看 scope=note/any，且第一项是「原样导入（不调 LLM）」。
+function renderImportStyles() {
+  const sel = $("import-style");
+  const mode = importCtx ? importCtx.mode : "paper";
+  const ok = (scope) =>
+    mode === "paper" ? scope === "paper" || scope === "any" : scope === "note" || scope === "any";
+  const prev = sel.value;
+  sel.innerHTML = "";
+  if (mode === "note") {
+    const o = document.createElement("option");
+    o.value = "__raw__";
+    o.textContent = "原样导入（不调 LLM，0 token）";
+    sel.appendChild(o);
+  }
+  for (const s of stylesCache) {
+    if (!ok(s.scope)) continue;
+    const o = document.createElement("option");
+    o.value = s.id;
+    o.textContent = s.label + (s.builtin ? "" : "（自定义）");
+    o.title = s.desc || "";
+    sel.appendChild(o);
+  }
+  const has = [...sel.options].some((o) => o.value === prev);
+  sel.value = has ? prev : (mode === "note" ? "__raw__" : "four");
+  updateImportStyleHint();
+}
+
+/// 切换风格时更新说明与「额外要求/另存为」的可见性。
+function updateImportStyleHint() {
+  const id = $("import-style").value;
+  const raw = id === "__raw__";
+  const s = stylesCache.find((x) => x.id === id);
+  $("import-style-desc").textContent = raw
+    ? "直接读取文件内容建笔记，不调用模型、不花 token"
+    : (s ? s.desc : "");
+  $("import-extra-wrap").classList.toggle("hidden", raw);
+  $("btn-import-save-style").classList.toggle("hidden", raw);
+}
+
+function setImportMode(mode) {
+  if (!importCtx) return;
+  importCtx.mode = mode;
+  document.querySelectorAll("#import-modes .mode-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.mode === mode)
+  );
+  renderImportStyles();
+}
+
+/// 弹出导入弹窗，返回 {name, mode, style, extra} 或 null（取消）。
+async function promptImport(file, defaultName) {
+  await refreshStyles();
+  const isPdf = /\.pdf$/i.test(file.name);
   return new Promise((resolve) => {
     importResolve = resolve;
-    $("import-file").textContent = "文件：" + file.name;
+    importCtx = { file, mode: isPdf ? "paper" : "note" };
+    $("import-file").textContent = "文件：" + file.name + "（可直接拖拽多个文件逐个导入）";
     $("import-name").value = defaultName;
-    $("import-style").value = "four";
+    $("import-extra").value = "";
+    document.querySelectorAll("#import-modes .mode-tab").forEach((t) =>
+      t.classList.toggle("active", t.dataset.mode === importCtx.mode)
+    );
+    renderImportStyles();
     $("import-modal").classList.remove("hidden");
     $("import-name").focus();
     $("import-name").select();
@@ -2286,10 +2358,40 @@ function promptImport(file, defaultName) {
 
 function closeImportModal(result) {
   $("import-modal").classList.add("hidden");
+  importCtx = null;
   if (importResolve) {
     const r = importResolve;
     importResolve = null;
     r(result);
+  }
+}
+
+/// 「另存为风格…」：把所选风格的提示词 + 本次额外要求保存成一个新风格。
+async function saveImportAsStyle() {
+  const id = $("import-style").value;
+  if (id === "__raw__") return;
+  const base = (stylesCache.find((s) => s.id === id) || {}).prompt || "";
+  const extra = $("import-extra").value.trim();
+  const newId = (prompt("新风格 id（字母/数字/-/_）", "") || "").trim();
+  if (!newId) return;
+  const label = (prompt("新风格名称", newId) || "").trim() || newId;
+  const promptText = base + (extra ? `\n\n【本次额外要求】\n${extra}` : "");
+  const scope = importCtx && importCtx.mode === "note" ? "note" : "paper";
+  try {
+    await postJson("/api/styles/save", {
+      id: newId,
+      label,
+      desc: extra.slice(0, 60) || `由「${id}」另存`,
+      scope,
+      prompt: promptText,
+    });
+    await refreshStyles();
+    renderImportStyles();
+    $("import-style").value = newId;
+    updateImportStyleHint();
+    appendConsole(`✓ 已保存风格 ${newId}（可在「管理…」里编辑）`);
+  } catch (e) {
+    alert("保存失败: " + e.message);
   }
 }
 
@@ -2300,18 +2402,35 @@ async function importFile(file) {
   const opts = await promptImport(file, "笔记_" + stem + ".md");
   if (!opts) return; // 取消
   const exportName = opts.name.trim() || ("笔记_" + stem + ".md");
-  setProgress("上传中…");
-  switchTab("console");
-  appendConsole("> 导入文件: " + file.name + "（风格：" + opts.style + "）");
   try {
-    const j = await uploadFile(file, (p) => setUploadPct(p));
+    // HTML：浏览器端先转成 Markdown（公式按 KaTeX 隐藏层还原），再当 md 上传
+    let uploadTarget = file;
+    let isText = /\.(txt|md|markdown)$/i.test(file.name);
+    if (/\.html?$/i.test(file.name)) {
+      setProgress("转换 HTML…");
+      const md = htmlToMarkdown(await file.text());
+      if (!md.trim()) throw new Error("HTML 里没有提取到正文");
+      uploadTarget = new File([md], stem + ".md", { type: "text/markdown" });
+      isText = true;
+    }
+    setProgress("上传中…");
+    switchTab("console");
+    const isRaw = opts.mode === "note" && opts.style === "__raw__";
+    const modeLabel = opts.mode === "paper" ? "论文 → 生成笔记" : isRaw ? "原样导入" : "风格 " + opts.style;
+    appendConsole("> 导入文件: " + file.name + "（" + modeLabel + "）");
+    const j = await uploadFile(uploadTarget, (p) => setUploadPct(p));
     setProgress("");
-    // .txt/.md 走 --text（跳过 PDF 解析），其余按 PDF 处理
-    const isText = /\.(txt|md|markdown)$/i.test(file.name);
-    const cmd = `ingest ${isText ? "--text " : ""}--style ${opts.style} ` + shellQuote(j.path);
+    const extra = (opts.extra || "").trim();
+    const extraArg = extra ? " --extra " + shellQuote(extra) : "";
+    const textArg = isText ? "--text " : "";
+    // PDF 讲义标为 lecture，md/txt/html 笔记标为 note
+    const kind = opts.mode === "note" ? (/\.pdf$/i.test(file.name) ? "lecture" : "note") : "paper";
+    const cmd = isRaw
+      ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
+      : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
     await runCommand(cmd, { export: exportName });
   } catch (e) {
-    appendConsole("❌ 上传失败: " + e.message, "err");
+    appendConsole("❌ 导入失败: " + e.message, "err");
     setProgress("");
     switchTab("console");
   }
@@ -2320,6 +2439,229 @@ async function importFile(file) {
 /// 把路径包成双引号（内部反斜杠/引号转义），与后端 normalize_path_arg 对应。
 function shellQuote(p) {
   return '"' + String(p).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+// ===== 风格管理弹窗 =====
+
+let editingStyleId = null; // null = 新建
+
+async function openStylesModal() {
+  await refreshStyles();
+  if (!editingStyleId && stylesCache.length) editingStyleId = stylesCache[0].id;
+  renderStylesList();
+  if (editingStyleId) selectStyleForEdit(editingStyleId);
+  $("styles-modal").classList.remove("hidden");
+}
+
+function renderStylesList() {
+  const box = $("styles-list");
+  box.innerHTML = "";
+  for (const s of stylesCache) {
+    const scope = s.scope === "paper" ? "论文" : s.scope === "note" ? "讲义" : "通用";
+    const d = document.createElement("div");
+    d.className = "style-item" + (s.id === editingStyleId ? " active" : "");
+    d.innerHTML = `<span>${esc(s.label)}</span><span class="s-meta">${esc(s.id)} · ${s.builtin ? "内置" : "自定义"} · ${scope}</span>`;
+    d.onclick = () => selectStyleForEdit(s.id);
+    box.appendChild(d);
+  }
+}
+
+function selectStyleForEdit(id) {
+  const s = stylesCache.find((x) => x.id === id);
+  if (!s) return;
+  editingStyleId = id;
+  $("style-id").value = s.id;
+  $("style-id").disabled = true;
+  $("style-label").value = s.label;
+  $("style-desc").value = s.desc || "";
+  $("style-scope").value = s.scope || "any";
+  $("style-prompt").value = s.prompt || "";
+  $("style-status").textContent = s.builtin ? "内置风格可编辑，点「恢复默认」可还原" : "自定义风格";
+  $("style-status").className = "status";
+  renderStylesList();
+}
+
+function newStyleForEdit() {
+  editingStyleId = null;
+  $("style-id").value = "";
+  $("style-id").disabled = false;
+  $("style-label").value = "";
+  $("style-desc").value = "";
+  $("style-scope").value = "any";
+  $("style-prompt").value = "请阅读以下资料，生成一份学习笔记 Markdown。\n\n资料全文：\n{raw_text}";
+  $("style-status").textContent = "新建风格：填 id 与名称后点「保存」";
+  $("style-status").className = "status";
+  renderStylesList();
+}
+
+function copyStyleForEdit() {
+  const s = stylesCache.find((x) => x.id === editingStyleId);
+  if (!s) { newStyleForEdit(); return; }
+  const base = { id: s.id, label: s.label, desc: s.desc, scope: s.scope, prompt: s.prompt };
+  newStyleForEdit();
+  $("style-id").value = base.id + "-copy";
+  $("style-label").value = base.label + "（副本）";
+  $("style-desc").value = base.desc || "";
+  $("style-scope").value = base.scope || "any";
+  $("style-prompt").value = base.prompt || "";
+}
+
+async function saveStyleFromForm() {
+  const id = $("style-id").value.trim();
+  const st = $("style-status");
+  try {
+    await postJson("/api/styles/save", {
+      id,
+      label: $("style-label").value.trim(),
+      desc: $("style-desc").value.trim(),
+      scope: $("style-scope").value,
+      prompt: $("style-prompt").value,
+    });
+    await refreshStyles();
+    editingStyleId = id;
+    $("style-id").disabled = true;
+    selectStyleForEdit(id);
+    st.textContent = "✓ 已保存";
+    st.className = "status ok";
+  } catch (e) {
+    st.textContent = "❌ " + e.message;
+    st.className = "status err";
+  }
+}
+
+async function deleteStyleFromForm() {
+  const id = $("style-id").value.trim();
+  const st = $("style-status");
+  if (!id || !confirm(`删除风格「${id}」？提示词文件会一并删除。`)) return;
+  try {
+    await postJson("/api/styles/delete", { id });
+    await refreshStyles();
+    editingStyleId = stylesCache.length ? stylesCache[0].id : null;
+    if (editingStyleId) selectStyleForEdit(editingStyleId);
+    else newStyleForEdit();
+    st.textContent = "✓ 已删除";
+    st.className = "status ok";
+  } catch (e) {
+    st.textContent = "❌ " + e.message;
+    st.className = "status err";
+  }
+}
+
+async function resetStyleFromForm() {
+  const id = $("style-id").value.trim();
+  const st = $("style-status");
+  if (!id || !confirm(`把「${id}」恢复为内置默认提示词？`)) return;
+  try {
+    await postJson("/api/styles/reset", { id });
+    await refreshStyles();
+    selectStyleForEdit(id);
+    st.textContent = "✓ 已恢复默认";
+    st.className = "status ok";
+  } catch (e) {
+    st.textContent = "❌ " + e.message;
+    st.className = "status err";
+  }
+}
+
+// ===== HTML → Markdown（浏览器端，导入讲义用） =====
+
+/// 把 HTML 转成 Markdown：只提取白名单结构/属性（script/style/iframe/on* 一律丢弃），
+/// KaTeX 公式从隐藏 MathML 的 <annotation encoding="application/x-tex"> 还原成 $...$。
+function htmlToMarkdown(html) {
+  const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const safeUrl = (u) => {
+    const s = String(u || "").trim();
+    return /^(https?:|mailto:|data:image\/)/i.test(s) ? s : "";
+  };
+  const inline = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.replace(/\s+/g, " ");
+    if (node.nodeType !== Node.ELEMENT_NODE) return "";
+    const el = node;
+    const tag = el.tagName.toLowerCase();
+    if (el.classList && el.classList.contains("katex")) {
+      const ann = el.querySelector('annotation[encoding="application/x-tex"]');
+      const tex = ann ? ann.textContent.trim() : (el.textContent || "").trim();
+      return (el.closest && el.closest(".katex-display")) ? `$$${tex}$$` : `$${tex}$`;
+    }
+    if (["script", "style", "noscript", "iframe", "svg", "canvas"].includes(tag)) return "";
+    const children = [...el.childNodes].map(inline).join("");
+    switch (tag) {
+      case "strong": case "b": return children.trim() ? `**${children.trim()}**` : "";
+      case "em": case "i": return children.trim() ? `*${children.trim()}*` : "";
+      case "code": return children ? "`" + children.trim() + "`" : "";
+      case "a": {
+        const href = safeUrl(el.getAttribute("href"));
+        return href ? `[${children.trim() || href}](${href})` : children;
+      }
+      case "img": {
+        const src = safeUrl(el.getAttribute("src"));
+        const alt = el.getAttribute("alt") || "";
+        return src ? `![${alt}](${src})` : alt ? `![${alt}]()` : "";
+      }
+      case "br": return "\n";
+      default: return children;
+    }
+  };
+  const blocks = [];
+  const walkBlock = (el) => {
+    for (const child of el.children) {
+      const tag = child.tagName.toLowerCase();
+      if (["script", "style", "noscript", "iframe", "nav", "footer", "svg", "canvas"].includes(tag)) continue;
+      if (/^h[1-6]$/.test(tag)) {
+        const text = inline(child).trim();
+        if (text) blocks.push("#".repeat(+tag[1]) + " " + text);
+        continue;
+      }
+      if (tag === "p") {
+        const text = inline(child).trim();
+        if (text) blocks.push(text);
+        continue;
+      }
+      if (["div", "section", "article", "main", "header", "aside"].includes(tag)) {
+        const hasBlock = child.querySelector("p,div,section,article,ul,ol,table,pre,h1,h2,h3,h4,h5,h6");
+        if (hasBlock) walkBlock(child);
+        else {
+          const text = inline(child).trim();
+          if (text) blocks.push(text);
+        }
+        continue;
+      }
+      if (tag === "ul" || tag === "ol") {
+        const items = [...child.querySelectorAll(":scope > li")]
+          .map((li, i) => {
+            const text = inline(li).trim();
+            return text ? (tag === "ol" ? i + 1 + ". " : "- ") + text : "";
+          })
+          .filter(Boolean);
+        if (items.length) blocks.push(items.join("\n"));
+        continue;
+      }
+      if (tag === "pre") {
+        const code = child.textContent.replace(/^\n+|\s+$/g, "");
+        if (code) blocks.push("```\n" + code + "\n```");
+        continue;
+      }
+      if (tag === "table") {
+        const rows = [...child.querySelectorAll("tr")].map((tr) =>
+          [...tr.children].map((td) => inline(td).trim().replace(/\|/g, "\\|"))
+        ).filter((r) => r.length);
+        if (rows.length) {
+          const lines = [
+            "| " + rows[0].join(" | ") + " |",
+            "| " + rows[0].map(() => "---").join(" | ") + " |",
+          ];
+          for (const r of rows.slice(1)) lines.push("| " + r.join(" | ") + " |");
+          blocks.push(lines.join("\n"));
+        }
+        continue;
+      }
+      const text = inline(child).trim();
+      if (text) blocks.push(text);
+      else walkBlock(child);
+    }
+  };
+  walkBlock(doc.body);
+  return blocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // ===== 配置弹窗 =====
@@ -2620,13 +2962,32 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config-test-stop").onclick = stopConfigTest;
   $("btn-config-save").onclick = saveConfig;
 
-  // 导入弹窗：文件名 + 笔记风格
+  // 导入弹窗：模式 + 动态风格 + 临时额外要求 + 风格管理
   $("btn-import-cancel").onclick = () => closeImportModal(null);
   $("btn-import-ok").onclick = () =>
-    closeImportModal({ name: $("import-name").value.trim(), style: $("import-style").value });
+    closeImportModal({
+      name: $("import-name").value.trim(),
+      mode: importCtx ? importCtx.mode : "paper",
+      style: $("import-style").value,
+      extra: $("import-extra").value,
+    });
   $("import-name").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); $("btn-import-ok").click(); }
   });
+  document.querySelectorAll("#import-modes .mode-tab").forEach(
+    (t) => (t.onclick = () => setImportMode(t.dataset.mode))
+  );
+  $("import-style").onchange = updateImportStyleHint;
+  $("btn-style-manage").onclick = openStylesModal;
+  $("btn-import-save-style").onclick = saveImportAsStyle;
+
+  // 风格管理弹窗
+  $("btn-styles-close").onclick = () => $("styles-modal").classList.add("hidden");
+  $("btn-style-new").onclick = newStyleForEdit;
+  $("btn-style-copy").onclick = copyStyleForEdit;
+  $("btn-style-save").onclick = saveStyleFromForm;
+  $("btn-style-delete").onclick = deleteStyleFromForm;
+  $("btn-style-reset").onclick = resetStyleFromForm;
 
   // 笔记编辑弹窗：手动 / AI 重写 / AI 补充
   document.querySelectorAll(".edit-tab").forEach((t) => (t.onclick = () => setEditTab(t.dataset.mode)));
