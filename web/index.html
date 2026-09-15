@@ -115,9 +115,12 @@
   <div class="ann-thread" id="ann-thread"></div>
   <div id="ann-input-resize" class="ann-input-resize" title="拖动调整输入栏高度"></div>
   <div class="ann-input">
-    <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
-    <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…" autocomplete="off"></textarea>
-    <button id="ann-send" class="mini primary">发送</button>
+    <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
+    <div class="ann-input-row">
+      <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
+      <span class="ann-input-spacer"></span>
+      <button id="ann-send" class="mini primary">发送</button>
+    </div>
   </div>
   <div id="ann-resize" class="ann-resize" title="拖动调整弹窗大小"></div>
 </div>
@@ -246,13 +249,13 @@
       <li><b>导入</b>：在「笔记」页点「＋ 导入资料」，或直接把文件拖进窗口（PDF / TXT / MD / HTML）。</li>
       <li><b>论文 / 讲义模式</b>：论文走「论文 → 生成笔记」；自己的笔记或课程讲义走「笔记 / 讲义 → 导入」，可「原样导入（不调模型、0 token）」或选一种风格生成。</li>
       <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「管理…」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
-      <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除）。</li>
+      <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除；MathJax 的 <code>\newcommand</code> 宏定义会自动注册，公式里的自定义宏也能渲染）。</li>
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。所有编辑/删除都能用顶栏「撤销」回退。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
       <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
-      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动、右下角拖拽缩放（尺寸记忆），输入栏可拖上缘调整高度。</li>
+      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动、右下角拖拽缩放（尺寸记忆，无上限；双击把手恢复默认），输入栏在底部、可拖上缘调整高度。</li>
       <li><b>进度与思考</b>：等待模型时显示上下文规模与计时；推理模型的思考过程会流式显示在「思考过程」折叠区。</li>
       <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>

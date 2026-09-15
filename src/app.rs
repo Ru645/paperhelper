@@ -1015,17 +1015,39 @@ PaperHelper 命令：
         let web = !emitter.is_terminal();
         let mut first_token = true;
         emitter.progress("笔记生成中…");
+        // Web：不把每个 token 灌进控制台，只节流上报「已生成 N 字」（顶部进度条显示）；
+        // CLI：保持流式打印，首个 token 到达即收起 spinner。
+        let mut gen_chars: u64 = 0;
+        let mut pending_chars: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
-            // CLI：首个 token 到达即收起 spinner，避免与流式输出交叠；
-            // Web：保持进度条到生成结束，由前端实时显示已生成字数与耗时。
             if first_token {
                 if !web {
                     emitter.progress_done();
                 }
                 first_token = false;
             }
-            emitter.token(t);
-        }, Some(&mut |r| emitter.reasoning(r))).await;
+            if web {
+                let n = t.chars().count() as u64;
+                gen_chars += n;
+                pending_chars += n;
+                if pending_chars >= 64 || last_emit.elapsed() >= std::time::Duration::from_millis(200) {
+                    emitter.chars(gen_chars);
+                    pending_chars = 0;
+                    last_emit = std::time::Instant::now();
+                }
+            } else {
+                emitter.token(t);
+            }
+        }, Some(&mut |r| {
+            // Web 导入时思考过程不进控制台（顶部有进度与计时）；CLI 暗色打印
+            if !web {
+                emitter.reasoning(r);
+            }
+        })).await;
+        if web {
+            emitter.chars(gen_chars);
+        }
         if first_token || web {
             emitter.progress_done();
         }

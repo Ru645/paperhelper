@@ -399,8 +399,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .edit-tools button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 
 .ann-popup {
-  position: fixed; z-index: 65; width: 380px; max-width: calc(100vw - 24px);
-  max-height: calc(100vh - 24px); overflow: hidden;
+  position: fixed; z-index: 65; width: 380px;
   background: #fff; border: 1px solid var(--line); border-radius: 10px;
   box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column;
 }
@@ -439,15 +438,21 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
   margin-left: -22px; background: var(--line); border-radius: 2px;
 }
 .ann-input-resize:hover::after { background: var(--blue); }
-.ann-input { display: flex; gap: 6px; padding: 4px 10px 8px; align-items: flex-end; }
+.ann-input { display: flex; flex-direction: column; gap: 6px; padding: 4px 10px 8px; }
 .ann-input textarea {
-  flex: 1; min-width: 0; resize: none; box-sizing: border-box;
-  min-height: 34px; max-height: 40vh; overflow-y: auto;
+  width: 100%; box-sizing: border-box; resize: none;
+  min-height: 34px; max-height: 50vh; overflow-y: auto;
   font: inherit; font-size: 13px; line-height: 1.5;
   padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
   background: #fff; color: var(--fg);
 }
 .ann-input textarea:focus { outline: none; border-color: var(--blue); }
+/* 按钮都放底边：ask 靠左，发送靠右，宽度全让给输入框 */
+.ann-input-row { display: flex; align-items: center; gap: 6px; }
+.ann-input-spacer { flex: 1; }
+/* 拖拽期间：禁止选中、禁掉笔记 iframe 抢指针（否则会丢 pointerup） */
+body.dragging { user-select: none; }
+body.dragging #note-frame { pointer-events: none; }
 /* 右下角缩放把手 */
 .ann-resize {
   position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;

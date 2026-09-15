@@ -86,6 +86,10 @@ pub struct Note {
     /// 用于界面标注与 ask 上下文策略；直接导入的笔记 raw_text 为空。
     #[serde(default)]
     pub material_kind: String,
+    /// 数学宏定义（`\newcommand` 等原文），渲染公式时作为 KaTeX 的 macros 注册。
+    /// 常见于 HTML/讲义导入（MathJax 的宏块），普通笔记为空。
+    #[serde(default)]
+    pub math_macros: Option<String>,
 }
 
 impl Note {
@@ -504,11 +508,30 @@ fn is_cjk(c: char) -> bool {
     ('\u{4e00}'..='\u{9fff}').contains(&c)
 }
 
+/// 从笔记 Markdown 里取出并剥离开头的 `<!-- paperhelper-macros … -->` 宏定义注释。
+/// 返回 `(宏原文, 去掉注释后的 Markdown)`；没有注释时原样返回。
+pub fn take_macros_comment(md: &str) -> (Option<String>, String) {
+    const START: &str = "<!-- paperhelper-macros";
+    let t = md.trim_start();
+    let Some(rest) = t.strip_prefix(START) else {
+        return (None, md.to_string());
+    };
+    let Some(end) = rest.find("-->") else {
+        return (None, md.to_string());
+    };
+    let raw = rest[..end].trim().to_string();
+    let after = rest[end + 3..]
+        .trim_start_matches(['\r', '\n', ' ', '\t'])
+        .to_string();
+    (if raw.is_empty() { None } else { Some(raw) }, after)
+}
+
 /// 解析 LLM 输出的 Markdown 为笔记树。
 /// 约定：`#`=标题；`##`/`###`…=按层级嵌套的 Section；`$$…$$`=Formula；
 /// 其余非空行=Paragraph（连续行合并为一段），挂到最近的 Section 下。
 pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
-    let (mut title, mut roots) = parse_blocks_core(md, true);
+    let (macros, md) = take_macros_comment(md);
+    let (mut title, mut roots) = parse_blocks_core(&md, true);
 
     if title.is_empty() {
         title = "未命名论文".to_string();
@@ -532,6 +555,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         blocks: roots,
         raw_text: raw_text.to_string(),
         material_kind: String::new(),
+        math_macros: macros,
     };
     assign_numbers(&mut note);
     note
@@ -541,14 +565,15 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
 /// 无标题则按空行切成多个 Paragraph（保证大纲/锚点/批注可用）。
 /// 与 `parse_markdown_note` 不同：不剥开头的 ``` 围栏（保留代码块），raw_text 置空。
 pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
+    let (macros, md) = take_macros_comment(md);
     let has_heading = md.lines().any(|l| {
         let t = l.trim_start();
         t.starts_with('#') && t.strip_prefix('#').is_some_and(|r| r.starts_with(' ') || r.starts_with('\t'))
     });
     let (title, mut roots) = if has_heading {
-        parse_blocks_core_inner(md, true)
+        parse_blocks_core_inner(&md, true)
     } else {
-        (String::new(), split_into_paragraphs(md))
+        (String::new(), split_into_paragraphs(&md))
     };
     if roots.is_empty() && !md.trim().is_empty() {
         roots.push(Block {
@@ -567,6 +592,7 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
         blocks: roots,
         raw_text: String::new(),
         material_kind: String::new(),
+        math_macros: macros,
     };
     assign_numbers(&mut note);
     note
@@ -1384,5 +1410,25 @@ mod tests {
             note.blocks.iter().any(|b| b.text.contains("```python")),
             "直接导入应保留代码围栏，不应被剥掉"
         );
+    }
+
+    #[test]
+    fn import_note_extracts_macros_comment() {
+        let md = "<!-- paperhelper-macros\n\\newcommand{\\ket}[1]{\\vert#1\\rangle}\n-->\n\n# 讲义\n\n正文 $\\ket{0}$";
+        let note = parse_import_note(md, "fallback");
+        assert_eq!(note.title, "讲义");
+        assert!(
+            note.math_macros.as_deref().unwrap_or("").contains("\\ket"),
+            "宏定义应被抽出保存"
+        );
+        assert_eq!(note.blocks.len(), 1, "宏注释不应变成内容块");
+        assert!(!note.blocks[0].text.contains("paperhelper-macros"));
+    }
+
+    #[test]
+    fn take_macros_comment_without_comment_is_noop() {
+        let (m, md) = take_macros_comment("# T\n\nx");
+        assert!(m.is_none());
+        assert_eq!(md, "# T\n\nx");
     }
 }

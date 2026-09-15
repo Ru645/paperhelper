@@ -324,6 +324,68 @@ const ANN_CSS: &str = r#"
 
 /// 批注相关的 JS（只读：高亮 + 点击弹窗；注入导出 HTML）。
 const ANN_SCRIPT: &str = r#"
+/// 扫描文本里的宏定义（支持多级花括号嵌套的宏体）：
+/// 返回 `{ macros: { name: body }, leftover: 去掉定义后的文本 }`。
+function scanMacroDefs(raw) {
+  const macros = {};
+  const s = String(raw || "");
+  const readGroup = (i) => {
+    let depth = 0;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === "{") depth++;
+      else if (s[j] === "}") {
+        depth--;
+        if (depth === 0) return [s.slice(i + 1, j), j + 1];
+      }
+    }
+    return [null, s.length];
+  };
+  const readName = (i) => {
+    let j = i;
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] === "{") {
+      const [inner, end] = readGroup(j);
+      const m = inner && inner.match(/^\\([A-Za-z]+)$/);
+      return [m ? m[1] : null, end];
+    }
+    const m = /^\\([A-Za-z]+)/.exec(s.slice(j));
+    return m ? [m[1], j + m[0].length] : [null, j];
+  };
+  let leftover = "";
+  let last = 0;
+  const re = /\\(?:(?:re)?new|provide)command|\\g?def/g;
+  let m;
+  while ((m = re.exec(s))) {
+    let j = m.index + m[0].length;
+    const [name, afterName] = readName(j);
+    if (!name) continue;
+    j = afterName;
+    while (j < s.length && /[#\d\s]/.test(s[j])) j++;
+    if (s[j] === "[") {
+      const k = s.indexOf("]", j);
+      if (k > 0) j = k + 1;
+    }
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] !== "{") continue;
+    const [body, end] = readGroup(j);
+    if (body == null) continue;
+    macros[name] = body;
+    leftover += s.slice(last, m.index);
+    last = end;
+    re.lastIndex = end;
+  }
+  leftover += s.slice(last);
+  return { macros, leftover };
+}
+/// 宏定义文本 → KaTeX 的 `macros` 选项对象。
+/// 注意：KaTeX 的 macro 名必须带反斜杠（`"\\abs"`），否则单字母会被当成
+/// 普通字符展开，导致 `A` → `\mathcal{A}` 这类无限递归。
+function parseMathMacros(raw) {
+  const out = {};
+  const defs = scanMacroDefs(raw).macros;
+  for (const [name, body] of Object.entries(defs)) out["\\" + name] = body;
+  return out;
+}
 function convertMathDelims(md) {
   const out = [];
   let inCode = false;
@@ -331,7 +393,10 @@ function convertMathDelims(md) {
     const t = line.trimStart();
     if (t.startsWith('```')) { inCode = !inCode; out.push(line); continue; }
     if (inCode) { out.push(line); continue; }
-    out.push(line.replace(/\\\[/g, '$$').replace(/\\\]/g, '$$').replace(/\\\(/g, '$').replace(/\\\)/g, '$'));
+    // 注意：replace 的替换串里 `$$` 表示字面 `$`，必须用函数返回 "$$"
+    out.push(line
+      .replace(/\\\[/g, () => '$$').replace(/\\\]/g, () => '$$')
+      .replace(/\\\(/g, '$').replace(/\\\)/g, '$'));
   }
   return out.join('\n');
 }
@@ -361,7 +426,7 @@ function renderMd(md) {
     const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, '').trim();
     const display = entry[1];
     if (window.katex) {
-      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false }); } catch (e) {}
+      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, macros: MATH_MACROS }); } catch (e) {}
     }
     const raw = display ? '$$' + tex + '$$' : '$' + tex + '$';
     return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -518,6 +583,9 @@ fn to_html_with(
 ) -> String {
     let md = convert_inline_math_delims(&to_markdown_with(note, true, hidden));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
+    // 数学宏定义（HTML/讲义导入时收集）：渲染公式时注册给 KaTeX
+    let macros_json =
+        serde_json::to_string(note.math_macros.as_deref().unwrap_or("")).unwrap_or_default();
     let summary_map = note.summary_map();
     let anns: Vec<serde_json::Value> = annotations
         .iter()
@@ -631,6 +699,8 @@ function loadScripts(paths) {{
   }})), Promise.resolve(true));
 }}
 const MD = {md_json};
+const MACROS_TEXT = {macros_json};
+const MATH_MACROS = parseMathMacros(MACROS_TEXT);
 const ANNOTATIONS = {annotations_json};
 {ann_script}
 (async () => {{
@@ -655,6 +725,7 @@ const ANNOTATIONS = {annotations_json};
         title = title,
         aside = aside,
         md_json = md_json,
+        macros_json = macros_json,
         annotations_json = annotations_json,
         ann_css = ANN_CSS,
         ann_script = ANN_SCRIPT

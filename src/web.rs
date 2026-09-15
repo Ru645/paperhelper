@@ -215,6 +215,7 @@ fn to_sse(ev: OutEvent) -> SseEvent {
         OutEvent::Stdout(s) => ("stdout", s),
         OutEvent::Stderr(s) => ("stderr", s),
         OutEvent::Token(s) => ("token", s),
+        OutEvent::Chars(n) => ("chars", n.to_string()),
         OutEvent::Reasoning(s) => ("reasoning", s),
         OutEvent::Progress(s) => ("progress", s),
         OutEvent::ProgressDone => ("progress_done", String::new()),
@@ -346,6 +347,13 @@ fn build_state(a: &App) -> serde_json::Value {
         },
         "has_note": a.session.notes.is_some(),
         "note_title": a.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
+        // 数学宏定义（HTML/讲义导入时收集）；前端渲染公式时注册给 KaTeX
+        "math_macros": a
+            .session
+            .notes
+            .as_ref()
+            .and_then(|n| n.math_macros.clone())
+            .unwrap_or_default(),
         "session_id": a.session.session_id,
         "export_path": a.export_path,
         "current": a.session.conversation.current_label(),

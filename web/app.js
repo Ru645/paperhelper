@@ -336,6 +336,8 @@ function handleFrame(frame) {
     case "stdout": appendConsole(text); break;
     case "stderr": appendConsole(text, "err"); break;
     case "token": appendToken(text); break;
+    // 已生成字数：只更新顶部进度（导入笔记等场景不再把 token 灌进控制台）
+    case "chars": progressChars = Math.max(0, parseInt(text, 10) || 0); updateProgressText(); break;
     case "reasoning": appendConsole(text, "dim"); break;
     case "progress": setProgress(text); break;
     case "progress_done": setProgress(""); break;
@@ -445,6 +447,7 @@ async function refreshState() {
   try {
     const st = await (await fetch("/api/state")).json();
     lastState = st;
+    mathMacros = parseMathMacros(st.math_macros || "");
     $("btn-undo").disabled = !st.can_undo;
     renderModel(st);
     renderUsage(st);
@@ -662,6 +665,73 @@ function loadMathLibs() {
 }
 
 /// 渲染 Markdown + LaTeX 为 HTML（先抽公式占位符，marked 后再用 KaTeX 回填）。
+/// 数学宏定义（来自当前笔记，HTML/讲义导入时收集）→ KaTeX 的 `macros` 选项。
+let mathMacros = {};
+
+/// 扫描文本里的宏定义（支持多级花括号嵌套的宏体）：
+/// 返回 `{ macros: { name: body }, leftover: 去掉定义后的文本 }`。
+function scanMacroDefs(raw) {
+  const macros = {};
+  const s = String(raw || "");
+  const readGroup = (i) => {
+    let depth = 0;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === "{") depth++;
+      else if (s[j] === "}") {
+        depth--;
+        if (depth === 0) return [s.slice(i + 1, j), j + 1];
+      }
+    }
+    return [null, s.length];
+  };
+  const readName = (i) => {
+    let j = i;
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] === "{") {
+      const [inner, end] = readGroup(j);
+      const m = inner && inner.match(/^\\([A-Za-z]+)$/);
+      return [m ? m[1] : null, end];
+    }
+    const m = /^\\([A-Za-z]+)/.exec(s.slice(j));
+    return m ? [m[1], j + m[0].length] : [null, j];
+  };
+  let leftover = "";
+  let last = 0;
+  const re = /\\(?:(?:re)?new|provide)command|\\g?def/g;
+  let m;
+  while ((m = re.exec(s))) {
+    let j = m.index + m[0].length;
+    const [name, afterName] = readName(j);
+    if (!name) continue;
+    j = afterName;
+    while (j < s.length && /[#\d\s]/.test(s[j])) j++; // \def 的参数占位 #1#2…
+    if (s[j] === "[") {
+      const k = s.indexOf("]", j);
+      if (k > 0) j = k + 1;
+    }
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] !== "{") continue;
+    const [body, end] = readGroup(j);
+    if (body == null) continue;
+    macros[name] = body;
+    leftover += s.slice(last, m.index);
+    last = end;
+    re.lastIndex = end; // 宏体里若再定义宏也能继续扫
+  }
+  leftover += s.slice(last);
+  return { macros, leftover };
+}
+
+/// 宏定义文本 → KaTeX 的 `macros` 选项对象。
+/// 注意：KaTeX 的 macro 名必须带反斜杠（`"\\abs"`），否则单字母会被当成
+/// 普通字符展开，导致 `A` → `\mathcal{A}` 这类无限递归。
+function parseMathMacros(raw) {
+  const out = {};
+  const defs = scanMacroDefs(raw).macros;
+  for (const [name, body] of Object.entries(defs)) out["\\" + name] = body;
+  return out;
+}
+
 /// 把 LaTeX 的 \(…\) / \[…\] 定界符统一成 $ / $$（按 ``` 围栏跳过代码块）。
 function convertMathDelims(md) {
   const out = [];
@@ -670,7 +740,10 @@ function convertMathDelims(md) {
     const t = line.trimStart();
     if (t.startsWith("```")) { inCode = !inCode; out.push(line); continue; }
     if (inCode) { out.push(line); continue; }
-    out.push(line.replace(/\\\[/g, "$$").replace(/\\\]/g, "$$").replace(/\\\(/g, "$").replace(/\\\)/g, "$"));
+    // 注意：replace 的替换串里 `$$` 表示字面 `$`，必须用函数返回 "$$"
+    out.push(line
+      .replace(/\\\[/g, () => "$$").replace(/\\\]/g, () => "$$")
+      .replace(/\\\(/g, "$").replace(/\\\)/g, "$"));
   }
   return out.join("\n");
 }
@@ -702,7 +775,7 @@ function renderMathMarkdown(md) {
     const tex = entry[0].replace(/^(?:[ \t]*>[ \t]?)+/gm, "").trim();
     const display = entry[1];
     if (window.katex) {
-      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false }); } catch (e) {}
+      try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, macros: mathMacros }); } catch (e) {}
     }
     const raw = display ? "$$" + tex + "$$" : "$" + tex + "$";
     return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1390,11 +1463,39 @@ function positionPopup(x, y) {
   const el = $("ann-popup");
   const r = el.getBoundingClientRect();
   const w = r.width || 380, h = r.height || 460;
-  el.style.left = Math.min(window.innerWidth - w - 12, Math.max(12, x)) + "px";
-  el.style.top = Math.min(window.innerHeight - h - 12, Math.max(12, y)) + "px";
+  // 弹窗允许比视口大：这时只保证左/上边可见，不再往负方向推
+  el.style.left = Math.min(Math.max(12, window.innerWidth - w - 12), Math.max(12, x)) + "px";
+  el.style.top = Math.min(Math.max(12, window.innerHeight - h - 12), Math.max(12, y)) + "px";
 }
 
-/// 让批注弹窗可拖动：按住头部（按钮/输入框除外）即可移动，并钳制在视口内。
+/// 统一的指针拖拽：对 handle 做 setPointerCapture，
+/// 这样指针移到笔记 iframe 上时事件也会重定向回 handle —— 不会丢 pointerup、
+/// 不会「黏住」、不会在松开左键后还继续改大小。
+function startPointerDrag(handle, e, { cursor, onMove, onEnd }) {
+  const id = e.pointerId;
+  try { handle.setPointerCapture(id); } catch (err) { /* 忽略 */ }
+  document.body.classList.add("dragging");
+  if (cursor) document.body.style.cursor = cursor;
+  cancelBlkEditHide();
+  $("blk-edit-btn").classList.add("hidden");
+  const move = (ev) => { if (ev.pointerId === id) onMove(ev); };
+  const finish = (ev) => {
+    if (ev && ev.pointerId !== id) return;
+    try { handle.releasePointerCapture(id); } catch (err) { /* 忽略 */ }
+    handle.removeEventListener("pointermove", move);
+    handle.removeEventListener("pointerup", finish);
+    handle.removeEventListener("pointercancel", finish);
+    document.body.classList.remove("dragging");
+    document.body.style.cursor = "";
+    if (onEnd) onEnd();
+  };
+  handle.addEventListener("pointermove", move);
+  handle.addEventListener("pointerup", finish);
+  handle.addEventListener("pointercancel", finish);
+  e.preventDefault();
+}
+
+/// 让批注弹窗可拖动：按住头部（按钮/输入框除外）即可移动，并保证头部不滑出视口。
 /// 位置不持久化——每次打开仍由 positionPopup 定位到选区 / 高亮附近。
 function setupAnnDrag() {
   const popup = $("ann-popup");
@@ -1402,36 +1503,25 @@ function setupAnnDrag() {
   if (!head) return;
   const MIN_VISIBLE_X = 60; // 横向至少露出这么多，避免拖出屏幕找不回
   const HEAD_H = 44;        // 纵向至少露出头部
-  let drag = null;
-
-  const onMove = (e) => {
-    if (!drag) return;
-    const left = Math.min(
-      window.innerWidth - MIN_VISIBLE_X,
-      Math.max(MIN_VISIBLE_X - drag.w, e.clientX - drag.dx)
-    );
-    const top = Math.min(window.innerHeight - HEAD_H, Math.max(0, e.clientY - drag.dy));
-    popup.style.left = left + "px";
-    popup.style.top = top + "px";
-  };
-  const onUp = () => {
-    if (!drag) return;
-    drag = null;
-    popup.classList.remove("dragging");
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
-  };
 
   head.addEventListener("pointerdown", (e) => {
     if (e.target.closest("button, input, textarea")) return; // 按钮/输入框不触发拖动
     const r = popup.getBoundingClientRect();
-    drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width };
+    const off = { dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width };
     popup.classList.add("dragging");
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-    e.preventDefault(); // 防止拖动时选中文字 / 丢焦点
+    startPointerDrag(head, e, {
+      cursor: "move",
+      onMove: (ev) => {
+        const left = Math.min(
+          window.innerWidth - MIN_VISIBLE_X,
+          Math.max(MIN_VISIBLE_X - off.w, ev.clientX - off.dx)
+        );
+        const top = Math.min(window.innerHeight - HEAD_H, Math.max(0, ev.clientY - off.dy));
+        popup.style.left = left + "px";
+        popup.style.top = top + "px";
+      },
+      onEnd: () => popup.classList.remove("dragging"),
+    });
   });
 
   // 窗口尺寸变化后把可见的弹窗拉回视口内
@@ -1445,7 +1535,8 @@ function setupAnnDrag() {
 
 const ANN_SIZE_KEY = "ph.ann.size";
 
-/// 批注弹窗右下角把手：拖拽调整大小，尺寸存 localStorage（位置仍不记忆）。
+/// 批注弹窗右下角把手：拖拽调整大小（无上限），尺寸存 localStorage，双击恢复默认。
+/// 位置仍不记忆——每次打开由 positionPopup 定位。
 function setupAnnResize() {
   const popup = $("ann-popup");
   const handle = $("ann-resize");
@@ -1458,32 +1549,33 @@ function setupAnnResize() {
       popup.style.height = s.h + "px";
     }
   } catch (e) { /* 忽略损坏的存储 */ }
-  let drag = null;
-  const onMove = (e) => {
-    if (!drag) return;
-    const w = Math.max(MIN_W, Math.min(window.innerWidth - 24, drag.w + (e.clientX - drag.x)));
-    const h = Math.max(MIN_H, Math.min(window.innerHeight - 24, drag.h + (e.clientY - drag.y)));
-    popup.style.width = Math.round(w) + "px";
-    popup.style.height = Math.round(h) + "px";
-  };
-  const onUp = () => {
-    if (!drag) return;
-    drag = null;
-    popup.classList.remove("resizing");
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
-    const r = popup.getBoundingClientRect();
-    try { localStorage.setItem(ANN_SIZE_KEY, JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height) })); } catch (e) { /* 忽略 */ }
-  };
   handle.addEventListener("pointerdown", (e) => {
     const r = popup.getBoundingClientRect();
-    drag = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+    const start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
     popup.classList.add("resizing");
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-    e.preventDefault();
+    startPointerDrag(handle, e, {
+      cursor: "nwse-resize",
+      onMove: (ev) => {
+        // 只设最小值，不设上限：想拖多大都行（超出视口可再拖回来）
+        const w = Math.max(MIN_W, start.w + (ev.clientX - start.x));
+        const h = Math.max(MIN_H, start.h + (ev.clientY - start.y));
+        popup.style.width = Math.round(w) + "px";
+        popup.style.height = Math.round(h) + "px";
+      },
+      onEnd: () => {
+        popup.classList.remove("resizing");
+        const r2 = popup.getBoundingClientRect();
+        try {
+          localStorage.setItem(ANN_SIZE_KEY, JSON.stringify({ w: Math.round(r2.width), h: Math.round(r2.height) }));
+        } catch (err) { /* 忽略 */ }
+      },
+    });
+  });
+  // 双击恢复默认大小
+  handle.addEventListener("dblclick", () => {
+    popup.style.width = "";
+    popup.style.height = "";
+    try { localStorage.removeItem(ANN_SIZE_KEY); } catch (e) { /* 忽略 */ }
   });
 }
 
@@ -1502,28 +1594,18 @@ function setupAnnInputResize() {
   const handle = $("ann-input-resize");
   const ta = $("ann-q");
   if (!handle || !ta) return;
-  let drag = null;
-  const onMove = (e) => {
-    if (!drag) return;
-    const h = Math.max(34, Math.round(drag.h + (drag.y - e.clientY)));
-    ta.dataset.baseH = String(h);
-    ta.style.height = h + "px";
-  };
-  const onUp = () => {
-    if (!drag) return;
-    drag = null;
-    handle.classList.remove("dragging");
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
-  };
   handle.addEventListener("pointerdown", (e) => {
-    drag = { y: e.clientY, h: ta.getBoundingClientRect().height };
+    const start = { y: e.clientY, h: ta.getBoundingClientRect().height };
     handle.classList.add("dragging");
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-    e.preventDefault();
+    startPointerDrag(handle, e, {
+      cursor: "row-resize",
+      onMove: (ev) => {
+        const h = Math.max(34, Math.round(start.h + (start.y - ev.clientY)));
+        ta.dataset.baseH = String(h);
+        ta.style.height = h + "px";
+      },
+      onEnd: () => handle.classList.remove("dragging"),
+    });
   });
 }
 
@@ -2408,9 +2490,13 @@ async function importFile(file) {
     let isText = /\.(txt|md|markdown)$/i.test(file.name);
     if (/\.html?$/i.test(file.name)) {
       setProgress("转换 HTML…");
-      const md = htmlToMarkdown(await file.text());
-      if (!md.trim()) throw new Error("HTML 里没有提取到正文");
-      uploadTarget = new File([md], stem + ".md", { type: "text/markdown" });
+      const conv = htmlToMarkdown(await file.text());
+      if (!conv.md.trim()) throw new Error("HTML 里没有提取到正文");
+      // 数学宏定义随笔记一起带走（解析器会抽出），供 KaTeX 注册
+      const withMacros = conv.macros
+        ? `<!-- paperhelper-macros\n${conv.macros}\n-->\n\n${conv.md}`
+        : conv.md;
+      uploadTarget = new File([withMacros], stem + ".md", { type: "text/markdown" });
       isText = true;
     }
     setProgress("上传中…");
@@ -2566,12 +2652,29 @@ async function resetStyleFromForm() {
 // ===== HTML → Markdown（浏览器端，导入讲义用） =====
 
 /// 把 HTML 转成 Markdown：只提取白名单结构/属性（script/style/iframe/on* 一律丢弃），
-/// KaTeX 公式从隐藏 MathML 的 <annotation encoding="application/x-tex"> 还原成 $...$。
+/// KaTeX 公式从隐藏 MathML 的 <annotation encoding="application/x-tex"> 还原成 $...$，
+/// Pandoc/MathJax 的 `.math` 容器（`\(...\)`/`\[...\]`）同样转成 $...$/$$...$$。
+/// 隐藏元素一律跳过；但「几乎全是 \newcommand 定义」的宏块会被收集，返回 { md, macros }。
 function htmlToMarkdown(html) {
   const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+  const macros = [];
   const safeUrl = (u) => {
     const s = String(u || "").trim();
     return /^(https?:|mailto:|data:image\/)/i.test(s) ? s : "";
+  };
+  const isHidden = (el) => {
+    if (!el.getAttribute) return false;
+    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") return true;
+    const style = el.getAttribute("style") || "";
+    return /display\s*:\s*none/i.test(style);
+  };
+  // 宏块识别：含宏定义，且去掉定义后几乎没有别的正文
+  const collectMacros = (text) => {
+    if (!text || !text.includes("\\")) return;
+    const { macros: defs, leftover } = scanMacroDefs(text);
+    if (!Object.keys(defs).length) return;
+    const rest = leftover.replace(/\\[()\[\]]/g, "").replace(/\s+/g, "");
+    if (rest.length <= 24) macros.push(text.trim());
   };
   const inline = (node) => {
     if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.replace(/\s+/g, " ");
@@ -2582,6 +2685,15 @@ function htmlToMarkdown(html) {
       const ann = el.querySelector('annotation[encoding="application/x-tex"]');
       const tex = ann ? ann.textContent.trim() : (el.textContent || "").trim();
       return (el.closest && el.closest(".katex-display")) ? `$$${tex}$$` : `$${tex}$`;
+    }
+    // Pandoc/MathJax：<span class="math inline|display">\(…\) / \[…\]
+    if (el.classList && el.classList.contains("math") && !el.querySelector(".katex")) {
+      const display = el.classList.contains("display");
+      const tex = (el.textContent || "")
+        .replace(/^\s*\\[\(\[]/, "")
+        .replace(/\\[\)\]]\s*$/, "")
+        .trim();
+      if (tex) return display ? `$$${tex}$$` : `$${tex}$`;
     }
     if (["script", "style", "noscript", "iframe", "svg", "canvas"].includes(tag)) return "";
     const children = [...el.childNodes].map(inline).join("");
@@ -2607,6 +2719,11 @@ function htmlToMarkdown(html) {
     for (const child of el.children) {
       const tag = child.tagName.toLowerCase();
       if (["script", "style", "noscript", "iframe", "nav", "footer", "svg", "canvas"].includes(tag)) continue;
+      // 宏块（常被藏在 display:none 的容器里）：收集而不是当正文
+      const before = macros.length;
+      collectMacros(child.textContent || "");
+      if (macros.length > before) continue;
+      if (isHidden(child)) continue;
       if (/^h[1-6]$/.test(tag)) {
         const text = inline(child).trim();
         if (text) blocks.push("#".repeat(+tag[1]) + " " + text);
@@ -2661,7 +2778,10 @@ function htmlToMarkdown(html) {
     }
   };
   walkBlock(doc.body);
-  return blocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+  return {
+    md: blocks.join("\n\n").replace(/\n{3,}/g, "\n\n").trim(),
+    macros: macros.join("\n").trim(),
+  };
 }
 
 // ===== 配置弹窗 =====

@@ -25,6 +25,8 @@ pub enum Event {
     Stderr(String),
     /// LLM 流式 token（无换行，需前端累加）
     Token(String),
+    /// 已生成的总字数（Web 导入等场景：只关心进度，不逐字外显）
+    Chars(u64),
     /// LLM 流式思考过程（reasoning 模型才可能有；用于界面展示进度）
     Reasoning(String),
     /// 进度提示开始/更新（对应 spinner 的 set_message）
@@ -118,6 +120,11 @@ impl Emitter {
             eprint!("\x1b[2m{t}\x1b[0m");
             let _ = std::io::stderr().flush();
         }
+    }
+
+    /// 报告「已生成 N 字」（Web 端顶部进度用；终端无操作，因为 CLI 直接打印 token）。
+    pub fn chars(&self, n: u64) {
+        self.send(Event::Chars(n));
     }
 
     /// 开始/更新一个进度提示。终端下复用同一个 spinner。
