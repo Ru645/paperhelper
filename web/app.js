@@ -7,6 +7,9 @@ const consoleEl = $("console");
 const noteFrame = $("note-frame");
 
 let running = false;
+// 正在执行的 LLM 任务名（导入/提问/AI 生成…）：LLM 任务互斥，非 LLM 操作可并行
+let llmBusyTask = "";
+const LLM_CMD_RE = /^(ingest|ask|q|check|sum)\b/;
 let streamSpan = null;      // 当前流式 token 的容器
 let lastState = null;       // 最近一次 /api/state 快照
 let currentAbort = null;    // 当前 /api/run 的 AbortController
@@ -328,6 +331,20 @@ function setRunning(v) {
   $("btn-stop").classList.toggle("hidden", !v);
 }
 
+/// 当前正在进行的任务名（顶部进度优先，其次 LLM 任务名）。
+function busyLabel() {
+  return progressLabel || llmBusyTask || "任务";
+}
+
+/// 轻提示：正在忙什么、请稍候（2.6s 自动消失）。
+function showBusyHint(text) {
+  const el = $("busy-hint");
+  el.textContent = text || ("正在" + busyLabel() + "，请稍候…（可点顶部「停止」）");
+  el.classList.remove("hidden");
+  clearTimeout(showBusyHint._timer);
+  showBusyHint._timer = setTimeout(() => el.classList.add("hidden"), 2600);
+}
+
 // ===== 标签页 =====
 
 function switchTab(key) {
@@ -454,13 +471,21 @@ async function stopCurrent() {
 }
 
 async function runCommand(command, opts = {}) {
-  if (running) return;
   if (!command || !command.trim()) return;
-  setRunning(true);
+  // LLM 任务互斥；非 LLM 命令（撤销/跳转/查看等）在 LLM 任务期间仍可执行
+  const isLlm = LLM_CMD_RE.test(command.trim());
+  if (isLlm && (running || llmBusyTask)) {
+    showBusyHint();
+    return;
+  }
+  if (isLlm) {
+    llmBusyTask = command.trim().startsWith("ingest") ? "生成笔记" : "处理当前提问";
+    setRunning(true);
+  }
   if (!opts.quiet) appendConsole("> " + command, "ok");
   // 不自动跳控制台；仅出错时（handleFrame 的 error）切过去
   const controller = new AbortController();
-  currentAbort = controller;
+  if (isLlm) currentAbort = controller;
   try {
     const res = await fetch("/api/run", {
       method: "POST",
@@ -495,8 +520,11 @@ async function runCommand(command, opts = {}) {
       switchTab("console");
     }
   } finally {
-    if (currentAbort === controller) currentAbort = null;
-    setRunning(false);
+    if (isLlm && currentAbort === controller) currentAbort = null;
+    if (isLlm) {
+      setRunning(false);
+      llmBusyTask = "";
+    }
     await refreshState();
     if (opts.skipReload) {
       // 笔记未变（如 goto）：不重载，直接滚动到目标位置
@@ -1429,6 +1457,7 @@ function closeEditModal() {
 
 async function generateEdit() {
   if (!editBlockId) return;
+  if (running || llmBusyTask) { showBusyHint(); return; }
   const instruction = $("edit-instruction").value.trim();
   const st = $("edit-status");
   const isRestyle = editMode === "restyle";
@@ -1438,6 +1467,7 @@ async function generateEdit() {
     return;
   }
   const mode = editMode === "append" ? "append" : "rewrite";
+  llmBusyTask = isRestyle ? "按风格重写全文" : "AI 生成";
   setEditProgress(isRestyle ? "按风格重写中…" : "AI 生成中…");
   resetReasoning("edit");
   $("edit-text").value = "";
@@ -1493,6 +1523,7 @@ async function generateEdit() {
     }
   }
   editAbort = null;
+  llmBusyTask = "";
   setEditProgress("");
   showBar("edit-ai-bar", false);
   $("btn-edit-gen").disabled = false;
@@ -2036,6 +2067,8 @@ function recordConceptOn() {
 async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
+  if (running || llmBusyTask) { showBusyHint(); return; }
+  llmBusyTask = "回答提问";
   $("ann-q").value = "";
   annInputGrow();
   clearAnnSubquote();
@@ -2119,6 +2152,7 @@ async function sendAnnotation() {
     }
   }
   if (annAbort === controller) annAbort = null;
+  llmBusyTask = "";
   showBar("ann-bar", false);
   $("ann-stop").classList.add("hidden");
   $("ann-send").disabled = false;
@@ -2252,6 +2286,10 @@ function renderSessions(list) {
 }
 
 async function loadSession(id, opts = {}) {
+  // 有 LLM 任务在跑时，切换会话会让未提交的结果作废（后端 epoch 保护），先确认
+  if (running || llmBusyTask) {
+    if (!confirm("有 LLM 任务正在运行（" + busyLabel() + "）。\n切换会话将放弃未写入的结果，确定切换？")) return;
+  }
   const res = await fetch("/api/sessions/load", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2686,7 +2724,7 @@ async function saveImportAsStyle() {
 
 async function importFile(file) {
   if (!file) return;
-  if (running) { alert("有任务正在运行，请稍后再导入。"); return; }
+  if (running || llmBusyTask) { showBusyHint(); return; }
   const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 20);
   const opts = await promptImport(file, "笔记_" + stem + ".md");
   if (!opts) return; // 取消
@@ -3350,5 +3388,5 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   refreshState();
-  setInterval(() => { if (!running) refreshState(); }, 15000);
+  setInterval(refreshState, 15000);
 });

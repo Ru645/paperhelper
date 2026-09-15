@@ -96,6 +96,25 @@ fn default_true() -> bool {
     true
 }
 
+/// 全局 LLM 门：同一时刻只允许一个 LLM 流式任务（导入/提问/重写…）。
+/// 不持 App 锁即可抢，因此**非 LLM 请求不会被 LLM 任务阻塞**。
+static LLM_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// 抢 LLM 门失败时的统一文案。
+const LLM_BUSY_MSG: &str = "已有 LLM 任务在运行（如导入或提问），请稍候或先点「停止」";
+
+/// 不持 App 锁时把结果发回 SSE（prepare 失败等场景）。
+fn emit_result_channel(
+    tx: &mpsc::UnboundedSender<OutEvent>,
+    result: anyhow::Result<()>,
+    what: &str,
+    t0: std::time::Instant,
+) {
+    let emitter = Emitter::channel(tx.clone());
+    emit_result(&emitter, result, what, t0);
+}
+
 /// 每个请求记一条日志：方法、路径、状态码、耗时。
 async fn log_requests(req: Request, next: Next) -> Response {
     let method = req.method().clone();
@@ -183,26 +202,95 @@ async fn api_run(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        // 锁在整个命令期间持有：单用户串行，避免状态竞争
+        let RunReq { command, export } = req;
+        let first = command.split_whitespace().next().unwrap_or("").to_string();
+        let what = format!("命令 `{command}`");
+        let t0 = std::time::Instant::now();
+        logging::info(format!("执行命令: {command}"));
+
+        // ingest：走 prepare/run/commit 三段式（LLM 生成阶段不持 App 锁）
+        if matches!(first.as_str(), "ingest" | "pdf") {
+            let rest: String = command
+                .split_once(char::is_whitespace)
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
+            let prepared = {
+                let mut g = app2.lock().await;
+                g.emitter = Emitter::channel(tx.clone());
+                if let Some(e) = export.clone() {
+                    if !e.trim().is_empty() {
+                        g.export_path = Some(e);
+                    }
+                }
+                let r = g.prepare_ingest(&rest).await;
+                g.emitter = Emitter::terminal();
+                r
+            };
+            match prepared {
+                Ok(crate::app::IngestPrep::Direct { file_path, mode, kind }) => {
+                    let mut g = app2.lock().await;
+                    g.emitter = Emitter::channel(tx.clone());
+                    let result = g.import_note(&file_path, &mode, &kind).await;
+                    if result.is_ok() {
+                        let _ = g.auto_persist();
+                    }
+                    emit_result(&g.emitter, result, &what, t0);
+                    g.emitter = Emitter::terminal();
+                }
+                Ok(crate::app::IngestPrep::Llm(job)) => {
+                    let res = match LLM_GATE.try_lock() {
+                        Ok(_guard) => {
+                            let emitter = Emitter::channel(tx.clone());
+                            job.run(&emitter).await
+                        }
+                        Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+                    };
+                    let mut g = app2.lock().await;
+                    g.emitter = Emitter::channel(tx.clone());
+                    let result = match res {
+                        Ok(res) => g.commit_ingest(*job, res),
+                        Err(e) => Err(e),
+                    };
+                    if result.is_ok() {
+                        let _ = g.auto_persist();
+                    }
+                    emit_result(&g.emitter, result, &what, t0);
+                    g.emitter = Emitter::terminal();
+                }
+                Err(e) => emit_result_channel(&tx, Err(e), &what, t0),
+            }
+            return;
+        }
+
+        // 其它命令：短命令直接持锁执行；ask/check/sum 等 LLM 命令额外用门串行化
+        let needs_gate = matches!(first.as_str(), "ask" | "q" | "check" | "sum");
+        let _gate = if needs_gate {
+            match LLM_GATE.try_lock() {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    emit_result_channel(&tx, Err(anyhow::anyhow!(LLM_BUSY_MSG)), &what, t0);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
-        if let Some(e) = req.export {
+        guard.emitter = Emitter::channel(tx.clone());
+        if let Some(e) = export.clone() {
             if !e.trim().is_empty() {
                 guard.export_path = Some(e);
             }
         }
-        let first = req.command.split_whitespace().next().unwrap_or("");
         let mutating = matches!(
-            first,
-            "ingest" | "pdf" | "ask" | "q" | "check" | "sum" | "del" | "rm" | "undo"
+            first.as_str(),
+            "ingest" | "pdf" | "ask" | "q" | "check" | "sum" | "del" | "rm" | "undo" | "new" | "load"
         );
-        logging::info(format!("执行命令: {}", req.command));
-        let t0 = std::time::Instant::now();
-        let result = guard.run_command(&req.command).await;
+        let result = guard.run_command(&command).await;
         if result.is_ok() && mutating {
             let _ = guard.auto_persist();
         }
-        emit_result(&guard.emitter, result, &format!("命令 `{}`", req.command), t0);
+        emit_result(&guard.emitter, result, &what, t0);
         // 关键：恢复为终端输出器，丢弃 SSE sender，让接收端在 done 后正常结束流
         guard.emitter = Emitter::terminal();
     });
@@ -637,53 +725,47 @@ async fn api_note_ai(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
         let mode = req.mode.clone().unwrap_or_else(|| "rewrite".to_string());
         let what = format!("AI {mode} {}", req.block_id);
         let t0 = std::time::Instant::now();
-        let res = run_note_ai(&mut guard, &req.block_id, &req.instruction, &mode).await;
-        emit_result(&guard.emitter, res, &what, t0);
-        guard.emitter = Emitter::terminal();
+        // 1) prepare（持锁）
+        let prepared = {
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let r = g.prepare_note_ai(&req.block_id, &req.instruction, &mode);
+            g.emitter = Emitter::terminal();
+            r
+        };
+        let job = match prepared {
+            Ok(j) => j,
+            Err(e) => {
+                emit_result_channel(&tx, Err(e), &what, t0);
+                return;
+            }
+        };
+        // 2) 锁外执行（LLM 门串行化）
+        let res = match LLM_GATE.try_lock() {
+            Ok(_guard) => {
+                let emitter = Emitter::channel(tx.clone());
+                job.run(&emitter).await
+            }
+            Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+        };
+        // 3) commit（持锁）
+        let mut g = app2.lock().await;
+        g.emitter = Emitter::channel(tx.clone());
+        let result = match res {
+            Ok(res) => {
+                g.commit_usage(&res);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        emit_result(&g.emitter, result, &what, t0);
+        g.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// 调 LLM 流式生成改写/补充内容（不改笔记）；结果经 emitter 的 token 事件流出。
-async fn run_note_ai(a: &mut App, block_id: &str, instruction: &str, mode: &str) -> Result<()> {
-    let msgs = a.note_ai_messages(block_id, instruction, mode)?;
-    interrupt::reset();
-    let emitter = a.emitter.clone();
-    let approx = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
-    let ctx = a.config.llm.context_length;
-    if ctx > 0 && approx > ctx {
-        emitter.stderr(format!(
-            "⚠️ 提示上下文约 {approx} token，超过配置的 {ctx}，可能报错；可精简论文或调大 llm.context_length"
-        ));
-    }
-    let client = a.client.clone();
-    let cfg = a.config.llm.clone();
-    emitter.progress(&format!("AI 生成中…（上下文约 {approx} token）"));
-    let mut first = true;
-    let res = llm::chat(&client, &cfg, &msgs, false, cfg.thinking_mode, &mut |t| {
-        if first {
-            emitter.progress_done();
-            first = false;
-        }
-        emitter.token(t);
-    }, Some(&mut |r| emitter.reasoning(r)))
-    .await;
-    if first {
-        emitter.progress_done();
-    }
-    let res = res?;
-    emitter.stdout("");
-    if res.truncated() {
-        emitter.stderr("⚠️ 输出达到上限（finish_reason=length），内容可能被截断".to_string());
-    }
-    a.record_usage(res.input_tokens, res.output_tokens);
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -702,43 +784,46 @@ async fn api_note_restyle(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
+        let what = format!("按风格重写（{}）", req.style);
         let t0 = std::time::Instant::now();
-        let result = run_restyle(&mut guard, &req.style, &req.extra).await;
-        emit_result(&guard.emitter, result, &format!("按风格重写（{}）", req.style), t0);
-        guard.emitter = Emitter::terminal();
+        // 1) prepare（持锁）
+        let prepared = {
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let r = g.prepare_restyle(&req.style, &req.extra);
+            g.emitter = Emitter::terminal();
+            r
+        };
+        let job = match prepared {
+            Ok(j) => j,
+            Err(e) => {
+                emit_result_channel(&tx, Err(e), &what, t0);
+                return;
+            }
+        };
+        // 2) 锁外执行（LLM 门）
+        let res = match LLM_GATE.try_lock() {
+            Ok(_guard) => {
+                let emitter = Emitter::channel(tx.clone());
+                job.run(&emitter).await
+            }
+            Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+        };
+        // 3) commit（持锁）
+        let mut g = app2.lock().await;
+        g.emitter = Emitter::channel(tx.clone());
+        let result = match res {
+            Ok(res) => {
+                g.commit_usage(&res);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        emit_result(&g.emitter, result, &what, t0);
+        g.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// 调 LLM 按所选风格生成整篇重写（不改笔记；由前端确认后 apply）。
-async fn run_restyle(a: &mut App, style: &str, extra: &str) -> Result<()> {
-    let msgs = a.restyle_messages(style, extra)?;
-    interrupt::reset();
-    let emitter = a.emitter.clone();
-    let client = a.client.clone();
-    let cfg = a.config.llm.clone();
-    emitter.progress("按风格重写中…");
-    let mut first = true;
-    let res = llm::chat(&client, &cfg, &msgs, false, cfg.thinking_mode, &mut |t| {
-        if first {
-            emitter.progress_done();
-            first = false;
-        }
-        emitter.token(t);
-    }, Some(&mut |r| emitter.reasoning(r)))
-    .await;
-    if first {
-        emitter.progress_done();
-    }
-    let res = res?;
-    a.record_usage(res.input_tokens, res.output_tokens);
-    if res.truncated() {
-        emitter.stderr("⚠️ 输出达到上限（finish_reason=length），重写内容可能被截断".to_string());
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -990,6 +1075,7 @@ async fn api_session_load(
     let mut a = app.lock().await;
     a.session = loaded;
     a.export_path = a.session.export_path.clone();
+    a.bump_epoch(); // 切换会话：让在途 LLM 任务的结果不再写回
     a.update_completions();
     let name = a.session.session_name.clone();
     Ok(Json(json!({ "ok": true, "id": target, "name": name })))
@@ -1076,6 +1162,7 @@ async fn api_session_delete(
         // 删除的是当前会话：自动新建空会话
         a.session = session::Session::default();
         a.export_path = None;
+        a.bump_epoch(); // 会话被重置：在途 LLM 任务的结果不再写回
         a.update_completions();
         reset = true;
     }
@@ -1306,31 +1393,51 @@ async fn api_annotate(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
         let is_check = matches!(req.mode.as_deref(), Some("check"));
+        let what = format!("批注提问「{}」", req.question);
         let t0 = std::time::Instant::now();
-        let result = guard
-            .annotate(
+        let prepared = {
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let r = g.prepare_annotate(
                 &req.block_id,
                 &req.quote,
                 req.quote_tex.as_deref(),
                 &req.question,
                 is_check,
                 req.record_concept,
-            )
-            .await
-            .map(|_| ());
+            );
+            g.emitter = Emitter::terminal();
+            r
+        };
+        let (job, anchor) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                emit_result_channel(&tx, Err(e), &what, t0);
+                return;
+            }
+        };
+        let res = match LLM_GATE.try_lock() {
+            Ok(_guard) => {
+                let emitter = Emitter::channel(tx.clone());
+                job.run(&emitter).await
+            }
+            Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+        };
+        let mut g = app2.lock().await;
+        g.emitter = Emitter::channel(tx.clone());
+        let result = match res {
+            Ok(res) => g.commit_annotate(job, anchor, res).map(|_| ()),
+            Err(e) => {
+                g.abort_ask(&job);
+                Err(e)
+            }
+        };
         if result.is_ok() {
-            let _ = guard.auto_persist();
+            let _ = g.auto_persist();
         }
-        emit_result(
-            &guard.emitter,
-            result,
-            &format!("批注提问「{}」", req.question),
-            t0,
-        );
-        guard.emitter = Emitter::terminal();
+        emit_result(&g.emitter, result, &what, t0);
+        g.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -1360,31 +1467,51 @@ async fn api_annotate_answer(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
         let is_check = matches!(req.mode.as_deref(), Some("check"));
+        let what = format!("回答批注「{}」", req.question);
         let t0 = std::time::Instant::now();
-        let result = guard
-            .annotate_answer(
+        let prepared = {
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let r = g.prepare_annotate_answer(
                 &req.node_id,
                 &req.quote,
                 req.quote_tex.as_deref(),
                 &req.question,
                 is_check,
                 req.record_concept,
-            )
-            .await
-            .map(|_| ());
+            );
+            g.emitter = Emitter::terminal();
+            r
+        };
+        let (job, anchor) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                emit_result_channel(&tx, Err(e), &what, t0);
+                return;
+            }
+        };
+        let res = match LLM_GATE.try_lock() {
+            Ok(_guard) => {
+                let emitter = Emitter::channel(tx.clone());
+                job.run(&emitter).await
+            }
+            Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+        };
+        let mut g = app2.lock().await;
+        g.emitter = Emitter::channel(tx.clone());
+        let result = match res {
+            Ok(res) => g.commit_annotate(job, anchor, res).map(|_| ()),
+            Err(e) => {
+                g.abort_ask(&job);
+                Err(e)
+            }
+        };
         if result.is_ok() {
-            let _ = guard.auto_persist();
+            let _ = g.auto_persist();
         }
-        emit_result(
-            &guard.emitter,
-            result,
-            &format!("回答批注「{}」", req.question),
-            t0,
-        );
-        guard.emitter = Emitter::terminal();
+        emit_result(&g.emitter, result, &what, t0);
+        g.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -1408,24 +1535,44 @@ async fn api_annotate_reply(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut guard = app2.lock().await;
-        guard.emitter = Emitter::channel(tx);
         let is_check = matches!(req.mode.as_deref(), Some("check"));
+        let what = format!("批注追问「{}」", req.question);
         let t0 = std::time::Instant::now();
-        let result = guard
-            .annotate_reply(&req.node_id, &req.question, is_check, req.record_concept)
-            .await
-            .map(|_| ());
+        let prepared = {
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let r = g.prepare_annotate_reply(&req.node_id, &req.question, is_check, req.record_concept);
+            g.emitter = Emitter::terminal();
+            r
+        };
+        let job = match prepared {
+            Ok(j) => j,
+            Err(e) => {
+                emit_result_channel(&tx, Err(e), &what, t0);
+                return;
+            }
+        };
+        let res = match LLM_GATE.try_lock() {
+            Ok(_guard) => {
+                let emitter = Emitter::channel(tx.clone());
+                job.run(&emitter).await
+            }
+            Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+        };
+        let mut g = app2.lock().await;
+        g.emitter = Emitter::channel(tx.clone());
+        let result = match res {
+            Ok(res) => g.commit_ask(job, res).map(|_| ()),
+            Err(e) => {
+                g.abort_ask(&job);
+                Err(e)
+            }
+        };
         if result.is_ok() {
-            let _ = guard.auto_persist();
+            let _ = g.auto_persist();
         }
-        emit_result(
-            &guard.emitter,
-            result,
-            &format!("批注追问「{}」", req.question),
-            t0,
-        );
-        guard.emitter = Emitter::terminal();
+        emit_result(&g.emitter, result, &what, t0);
+        g.emitter = Emitter::terminal();
     });
     let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
     Sse::new(stream).keep_alive(KeepAlive::default())

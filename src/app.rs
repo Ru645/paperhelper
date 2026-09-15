@@ -297,6 +297,148 @@ pub struct App {
     node_numbers: Arc<Mutex<Vec<String>>>,
     /// del 的内存撤销栈（最近在后，上限 20）。
     undo_stack: Vec<UndoSnapshot>,
+    /// 会话状态版本号：任何会改动会话内容（笔记/对话/批注）的操作都会递增。
+    /// 长时间 LLM 任务在开始时记录它，完成时若版本已变就放弃写入，
+    /// 避免把结果写进被切换/编辑过的会话。
+    pub state_epoch: u64,
+}
+
+/// 一次 ask/批注提问的「可锁外执行」上下文：
+/// prepare 阶段在持锁时构造；`run()` 不访问 App（可在锁外流式执行）；
+/// `commit_ask()` 再持锁落地，并检查 epoch 是否变化。
+pub struct AskJob {
+    msgs: Vec<Message>,
+    cfg: crate::config::LlmConfig,
+    client: reqwest::Client,
+    epoch: u64,
+    /// LLM 失败/中止时要恢复的 conversation.current（批注流程会临时改它）。
+    restore_current: Option<String>,
+    /// 新节点的父节点（prepare 时捕获，避免流式期间用户 goto 影响挂载位置）。
+    parent: Option<String>,
+    question: String,
+    block_id: Option<String>,
+    is_check: bool,
+    quote: Option<String>,
+    record_concept: bool,
+    approx_tokens: usize,
+}
+
+impl AskJob {
+    /// 锁外执行 LLM 流式调用（进度/思考/正文都经 emitter 输出）。
+    pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        interrupt::reset();
+        emitter.progress(&format!(
+            "{}（上下文约 {} token）",
+            if self.is_check { "核对中…" } else { "思考中…" },
+            self.approx_tokens
+        ));
+        let mut first = true;
+        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |t| {
+            if first {
+                emitter.progress_done();
+                first = false;
+                emitter.token("\n");
+            }
+            emitter.token(t);
+        }, Some(&mut |r| emitter.reasoning(r))).await;
+        if first {
+            emitter.progress_done();
+        }
+        res
+    }
+}
+
+/// 批注锚点（prepare 时确定，commit 时写入 Annotation）。
+pub enum AnnAnchor {
+    Note { block_id: String, quote: String, quote_tex: Option<String> },
+    Answer { node_id: String, quote: String, quote_tex: Option<String> },
+}
+
+/// ingest（LLM 生成路径）的任务：prepare 在持锁时构造，`run()` 可在锁外流式执行。
+pub struct IngestJob {
+    msgs: Vec<Message>,
+    cfg: crate::config::LlmConfig,
+    client: reqwest::Client,
+    epoch: u64,
+    raw_text: String,
+    source_path: String,
+    export_file: String,
+    kind: String,
+}
+
+/// ingest 的两种执行方式：直接导入（无 LLM，立即执行）或 LLM 生成（可锁外流式执行）。
+pub enum IngestPrep {
+    Direct { file_path: String, mode: String, kind: String },
+    Llm(Box<IngestJob>),
+}
+
+/// 简单 LLM 任务（AI 重写 / 按风格重写全文）：只生成内容，不改会话（除用量统计）。
+pub struct SimpleJob {
+    msgs: Vec<Message>,
+    cfg: crate::config::LlmConfig,
+    client: reqwest::Client,
+    progress: String,
+}
+
+impl SimpleJob {
+    /// 锁外执行 LLM 流式调用。
+    pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        interrupt::reset();
+        emitter.progress(&self.progress);
+        let mut first = true;
+        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |t| {
+            if first {
+                emitter.progress_done();
+                first = false;
+            }
+            emitter.token(t);
+        }, Some(&mut |r| emitter.reasoning(r))).await;
+        if first {
+            emitter.progress_done();
+        }
+        res
+    }
+}
+
+impl IngestJob {
+    /// 锁外执行 LLM 流式调用（正文 + 思考 + 字数进度）。
+    pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        interrupt::reset();
+        let web = !emitter.is_terminal();
+        let mut first_token = true;
+        emitter.progress("笔记生成中…");
+        let mut gen_chars: u64 = 0;
+        let mut pending_chars: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |t| {
+            if first_token {
+                if !web {
+                    emitter.progress_done();
+                }
+                first_token = false;
+            }
+            // 流式笔记文本：CLI 直接打印，Web 送到「笔记区」的生成中预览
+            emitter.token(t);
+            if web {
+                // 同时节流上报总字数，供顶部进度条显示
+                let n = t.chars().count() as u64;
+                gen_chars += n;
+                pending_chars += n;
+                if pending_chars >= 64 || last_emit.elapsed() >= std::time::Duration::from_millis(200) {
+                    emitter.chars(gen_chars);
+                    pending_chars = 0;
+                    last_emit = std::time::Instant::now();
+                }
+            }
+        }, Some(&mut |r| emitter.reasoning(r))).await;
+        if web {
+            emitter.chars(gen_chars);
+        }
+        if first_token || web {
+            emitter.progress_done();
+        }
+        res
+    }
 }
 
 impl App {
@@ -315,7 +457,13 @@ impl App {
             section_numbers: Arc::new(Mutex::new(Vec::new())),
             node_numbers: Arc::new(Mutex::new(Vec::new())),
             undo_stack: Vec::new(),
+            state_epoch: 0,
         }
+    }
+
+    /// 递增会话版本号（见 `state_epoch`）。
+    pub(crate) fn bump_epoch(&mut self) {
+        self.state_epoch = self.state_epoch.wrapping_add(1);
     }
 
     /// 是否有可撤销的删除（Web 用于启用/禁用撤销按钮）。
@@ -527,8 +675,8 @@ impl App {
     /// 每条命令结束后统一刷新补全列表（区块/节点编号可能已变化）。
     /// 支持别名：tree|trajectory、ingest|pdf、ask|q、help|?。
     pub async fn run_command(&mut self, line: &str) -> Result<()> {
-        // 每条命令开始时清掉上一次的打断标志（CLI Ctrl-C / Web 停止按钮）
-        interrupt::reset();
+        // 注意：不在这里 interrupt::reset()——LLM 任务可能正在另一个线程流式执行、
+        // 并依赖打断标志；各 LLM 任务在真正开始调模型前自己 reset（见 Job::run）。
         let (cmd, rest) = split_cmd(line);
         crate::logging::debug(format!("收到命令: {line}"));
         let t0 = std::time::Instant::now();
@@ -551,6 +699,7 @@ impl App {
                 self.session = Session::default();
                 self.export_path = None;
                 self.undo_stack.clear();
+                self.bump_epoch();
                 outln!(self, "已新建会话。");
                 Ok(())
             }
@@ -859,6 +1008,7 @@ PaperHelper 命令：
         let path = normalize_path_arg(rest);
         self.session = Session::load(Path::new(&path))?;
         self.export_path = self.session.export_path.clone();
+        self.bump_epoch();
         outln!(self, "已加载会话: 笔记={}, 对话节点={}",
             self.session.notes.is_some(),
             self.session.conversation.nodes.len());
@@ -913,7 +1063,9 @@ PaperHelper 命令：
     /// 3. 成功后 `parse_markdown_note` 解析成树、登记知识库 Paper；
     ///    首次询问导出文件名（写 export_path，之后 ask 自动同步到该文件）。
     /// 全程记录 token，超预算/被打断即中止且不写会话。
-    async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
+    /// ingest 的 **prepare 段**（持锁）：解析参数、抽取文本、组装提示词。
+    /// 返回 `IngestPrep::Llm` 时，其任务可在**不持 App 锁**时流式执行。
+    pub async fn prepare_ingest(&mut self, rest: &str) -> Result<IngestPrep> {
         let rest = rest.trim();
         // 先剥离选项（--style / --extra / --kind / --note，与 --text/--ocr 任意顺序）
         let (style_raw, rest) = take_style_arg(rest)?;
@@ -947,7 +1099,7 @@ PaperHelper 命令：
                 "lecture" => "lecture",
                 _ => "note",
             };
-            return self.import_note(&file_path, mode, kind).await;
+            return Ok(IngestPrep::Direct { file_path, mode: mode.to_string(), kind: kind.to_string() });
         }
         interrupt::reset();
 
@@ -976,16 +1128,13 @@ PaperHelper 命令：
             bail!("已打断");
         }
 
-        // 2. 确定笔记导出文件名。
-        //    终端：交互式询问；Web：用预先设置的 export_path，否则用默认名。
+        // 2. 确定笔记导出文件名（终端交互询问；Web 用预设 export_path）
         let export_file = self.ask_export_name(&file_path)?;
 
-        // 3. 调用 LLM 生成结构化 Markdown 笔记（不打印输出，只显示进度条）
-        let budget_ok = self.check_budget()?;
-        if !budget_ok {
+        // 3. 预算检查 + 组装提示词（风格注册表 + 固定输出契约）
+        if !self.check_budget()? {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
         }
-        // 风格查注册表（styles.toml + styles/<id>.txt）；固定输出契约由程序自动前置
         let (meta, _template) = crate::prompts::style_prompt(&style)?;
         crate::logging::info(format!(
             "生成笔记：风格={}（{}），scope={}",
@@ -1008,46 +1157,22 @@ PaperHelper 命令：
             Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
             Message { role: "user".into(), content: prompt },
         ];
-        let raw_clone = raw_text.clone();
-        let emitter = self.emitter.clone();
-        let web = !emitter.is_terminal();
-        let mut first_token = true;
-        emitter.progress("笔记生成中…");
-        // Web：不把每个 token 灌进控制台，只节流上报「已生成 N 字」（顶部进度条显示）；
-        // CLI：保持流式打印，首个 token 到达即收起 spinner。
-        let mut gen_chars: u64 = 0;
-        let mut pending_chars: u64 = 0;
-        let mut last_emit = std::time::Instant::now();
-        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
-            if first_token {
-                if !web {
-                    emitter.progress_done();
-                }
-                first_token = false;
-            }
-            // 流式笔记文本：CLI 直接打印，Web 送到「笔记区」的生成中预览
-            emitter.token(t);
-            if web {
-                // 同时节流上报总字数，供顶部进度条显示
-                let n = t.chars().count() as u64;
-                gen_chars += n;
-                pending_chars += n;
-                if pending_chars >= 64 || last_emit.elapsed() >= std::time::Duration::from_millis(200) {
-                    emitter.chars(gen_chars);
-                    pending_chars = 0;
-                    last_emit = std::time::Instant::now();
-                }
-            }
-        }, Some(&mut |r| emitter.reasoning(r))).await;
-        if web {
-            emitter.chars(gen_chars);
-        }
-        if first_token || web {
-            emitter.progress_done();
-        }
-        self.emitter.stdout("");
-        let res = res?;
+        Ok(IngestPrep::Llm(Box::new(IngestJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            epoch: self.state_epoch,
+            raw_text,
+            source_path: file_path,
+            export_file,
+            kind: kind.to_string(),
+        })))
+    }
 
+    /// ingest 的 **落地段**（持锁）：解析生成结果、登记知识库与会话、导出。
+    /// 若导入期间会话已被切换/编辑（epoch 变化），则把结果另存为新会话，避免丢数据。
+    pub fn commit_ingest(&mut self, job: IngestJob, res: crate::llm::LlmResult) -> Result<()> {
+        self.record_usage(res.input_tokens, res.output_tokens);
         if res.truncated() {
             outerr!(
                 self,
@@ -1056,27 +1181,68 @@ PaperHelper 命令：
                 "⚠️ ".yellow()
             );
         }
-
-        // 3. 统计与预算检查
-        self.record_usage(res.input_tokens, res.output_tokens);
-
-        // 4. 解析 Markdown 为笔记树
-        let mut note = notes::parse_markdown_note(&res.content, &raw_clone);
-        note.material_kind = kind.to_string();
+        let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
+        note.material_kind = job.kind.clone();
         let title = note.title.clone();
         let nblocks = note.count_blocks();
-        outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
 
-        // 5. 注册到知识库 + 会话根 + 导出
-        self.register_note(note, &file_path, &export_file, res.input_tokens, res.output_tokens)
+        if job.epoch != self.state_epoch {
+            // 导入期间用户切换/编辑了会话：不覆盖当前会话，另存为新会话
+            let paper_id = uuid::Uuid::new_v4().to_string();
+            note.paper_id = paper_id.clone();
+            let mut sess = Session::default();
+            sess.notes = Some(note);
+            sess.current_paper_id = Some(paper_id.clone());
+            sess.session_name = title.clone();
+            sess.session_id = crate::paths::new_session_stamp();
+            sess.export_path = Some(job.export_file.clone());
+            self.kb.add_paper(Paper {
+                id: paper_id,
+                title: title.clone(),
+                path: job.source_path.clone(),
+                read_at: Utc::now().to_rfc3339(),
+                kind: job.kind.clone(),
+                pinned: false,
+            });
+            self.kb.save()?;
+            crate::paths::ensure_sessions_dir()?;
+            sess.save(&crate::paths::session_path(&sess.session_id))?;
+            outerr!(
+                self,
+                "{} 导入期间会话已切换，结果已另存为新会话《{}》（{}）",
+                "⚠️ ".yellow(),
+                title,
+                sess.session_id
+            );
+            return Ok(());
+        }
+
+        outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
+        self.register_note(note, &job.source_path, &job.export_file, res.input_tokens, res.output_tokens)
             .with_context(|| format!("导入《{title}》"))?;
         self.update_completions();
         Ok(())
     }
 
+    /// ingest 主流程（CLI）：prepare → 锁外 LLM → commit。
+    async fn cmd_ingest(&mut self, rest: &str) -> Result<()> {
+        match self.prepare_ingest(rest).await? {
+            IngestPrep::Direct { file_path, mode, kind } => {
+                self.import_note(&file_path, &mode, &kind).await
+            }
+            IngestPrep::Llm(job) => {
+                let emitter = self.emitter.clone();
+                match job.run(&emitter).await {
+                    Ok(res) => self.commit_ingest(*job, res),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
     /// 直接导入笔记/讲义（不调 LLM，0 token）：抽取文本 → 解析成笔记树 → 登记知识库。
     /// `mode`：text（md/txt）/ ocr / pdf；`kind`：paper / note / lecture。
-    async fn import_note(&mut self, file_path: &str, mode: &str, kind: &str) -> Result<()> {
+    pub(crate) async fn import_note(&mut self, file_path: &str, mode: &str, kind: &str) -> Result<()> {
         let progress_msg = match mode {
             "text" => "读取文本文件…",
             "ocr" => "OCR 识别中（可能较慢，可 Ctrl-C/停止 打断）…",
@@ -1134,6 +1300,7 @@ PaperHelper 命令：
         } else {
             note.material_kind.clone()
         };
+        self.bump_epoch();
         note.paper_id = paper_id.clone();
         self.session.notes = Some(note);
         self.session.current_paper_id = Some(paper_id.clone());
@@ -1291,61 +1458,61 @@ PaperHelper 命令：
 
     /// ask/check 共用核心：预算检查 → 构建上下文 → 流式 LLM → 写解释（仅 ask）→
     /// 记录会话节点。返回 `(新节点 id, 新解释 id 或 None)`。
-    async fn ask_core(
-        &mut self,
+    /// ask/check 的 **prepare 段**（持锁）：预算检查 + 组装上下文。
+    /// 返回的 `AskJob` 自带 msgs/config/client/emitter，可在**不持 App 锁**时流式执行。
+    pub fn prepare_ask(
+        &self,
         question: &str,
         block_id: Option<String>,
         is_check: bool,
         quote: Option<&str>,
         record_concept: bool,
-    ) -> Result<(String, Option<String>)> {
-        interrupt::reset();
-        let budget_ok = self.check_budget()?;
-        if !budget_ok {
+    ) -> Result<AskJob> {
+        if !self.check_budget()? {
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
-
         let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref(), quote);
-        let block_id_for_hint = block_id.clone();
+        let approx_tokens = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
+        Ok(AskJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            epoch: self.state_epoch,
+            restore_current: self.session.conversation.current.clone(),
+            parent: self.session.conversation.current.clone(),
+            question: question.to_string(),
+            block_id,
+            is_check,
+            quote: quote.map(|s| s.to_string()),
+            record_concept,
+            approx_tokens,
+        })
+    }
 
-        // 流式调用 LLM
-        let emitter = self.emitter.clone();
-        let mut first_token = true;
-        // 等首个 token 前也能看到进度：给出上下文规模 + 计时（前端每秒刷新）
-        let approx = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
-        emitter.progress(&format!(
-            "{}（上下文约 {approx} token）",
-            if is_check { "核对中…" } else { "思考中…" }
-        ));
-        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
-            if first_token {
-                emitter.progress_done();
-                first_token = false;
-                emitter.token("\n");
-            }
-            emitter.token(t);
-        }, Some(&mut |r| emitter.reasoning(r))).await;
-        if first_token {
-            emitter.progress_done();
+    /// LLM 段失败/被中止：恢复 prepare 时临时改动的 conversation.current。
+    pub fn abort_ask(&mut self, job: &AskJob) {
+        self.session.conversation.current = job.restore_current.clone();
+    }
+
+    /// ask/check 的 **落地段**（持锁）：写解释/概念/对话节点。
+    /// 若期间会话已被切换/编辑（epoch 变化），则不写入并报错。
+    pub fn commit_ask(&mut self, job: AskJob, res: crate::llm::LlmResult) -> Result<(String, Option<String>)> {
+        if job.epoch != self.state_epoch {
+            bail!("会话已变更，本次回答未写入（可重新提问）");
         }
-        let res = res?;
-        self.emitter.stdout("");
-
         self.record_usage(res.input_tokens, res.output_tokens);
         let (clean_answer, concept) = extract_concept(&res.content);
         // 节点标题：模型给出了概念就用它，否则用问题前若干字（仅作显示）
-        let concept_label = concept.clone().unwrap_or_else(|| derive_concept(question));
+        let concept_label = concept.clone().unwrap_or_else(|| derive_concept(&job.question));
         let now = Utc::now().to_rfc3339();
 
         let mut explanation_id: Option<String> = None;
         let mut is_nested = false;
 
-        if !is_check {
+        if !job.is_check {
             let expl_id = uuid::Uuid::new_v4().to_string();
-            let parent_expl_id = self
-                .session
-                .conversation
-                .current
+            let parent_expl_id = job
+                .parent
                 .as_deref()
                 .and_then(|cur| Conversation::explanation_ancestor(&self.session.conversation.nodes, cur));
             is_nested = parent_expl_id.is_some();
@@ -1354,7 +1521,7 @@ PaperHelper 命令：
                     if let Some(parent_expl) = note.find_explanation_mut(&parent_eid) {
                         parent_expl.children.push(Explanation {
                             id: expl_id.clone(),
-                            question: question.to_string(),
+                            question: job.question.clone(),
                             answer: clean_answer.clone(),
                             concept: concept_label.clone(),
                             created_at: now.clone(),
@@ -1364,7 +1531,7 @@ PaperHelper 命令：
                         });
                     }
                 }
-            } else if let Some(bid) = &block_id {
+            } else if let Some(bid) = &job.block_id {
                 if let Some(note) = self.session.notes.as_mut() {
                     let target_id = note.find_block(bid).and_then(|b| {
                         if b.kind == notes::BlockKind::Section {
@@ -1380,7 +1547,7 @@ PaperHelper 命令：
                         if let Some(b) = note.find_block_mut(&tid) {
                             b.explanations.push(Explanation {
                                 id: expl_id.clone(),
-                                question: question.to_string(),
+                                question: job.question.clone(),
                                 answer: clean_answer.clone(),
                                 concept: concept_label.clone(),
                                 created_at: now.clone(),
@@ -1395,7 +1562,7 @@ PaperHelper 命令：
             explanation_id = Some(expl_id);
 
             // 加入知识库概念：只在用户允许、且模型明确标注了知识点时记录
-            if let (true, Some(concept_name)) = (record_concept, concept.as_ref()) {
+            if let (true, Some(concept_name)) = (job.record_concept, concept.as_ref()) {
                 let (pid, ptitle) = self
                     .session
                     .current_paper_id
@@ -1407,7 +1574,7 @@ PaperHelper 命令：
                     definition: clean_answer.chars().take(200).collect(),
                     paper_id: pid,
                     paper_title: ptitle,
-                    block_id: if is_nested { None } else { block_id.clone() },
+                    block_id: if is_nested { None } else { job.block_id.clone() },
                     created_at: now.clone(),
                     pinned: false,
                 });
@@ -1415,34 +1582,56 @@ PaperHelper 命令：
             }
 
             // 自动同步导出
-            self.sync_export(block_id_for_hint.as_deref())?;
+            self.sync_export(job.block_id.as_deref())?;
         }
 
         // 记录会话节点（当前节点为父）
-        let parent = self.session.conversation.current.clone();
+        let parent = job.parent.clone();
         let node_id = uuid::Uuid::new_v4().to_string();
         self.session.conversation.add_exchange(ConvNode {
             id: node_id.clone(),
             parent,
-            question: question.to_string(),
-            quote: quote.map(|s| s.to_string()),
+            question: job.question.clone(),
+            quote: job.quote.clone(),
             answer: clean_answer.clone(),
-            block_id: if is_check || is_nested { None } else { block_id.clone() },
+            block_id: if job.is_check || is_nested { None } else { job.block_id.clone() },
             explanation_id: explanation_id.clone(),
             input_tokens: res.input_tokens,
             output_tokens: res.output_tokens,
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
                 + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
             created_at: now.clone(),
-            label: if is_check { format!("[核对] {}", concept_label) } else { concept_label.clone() },
+            label: if job.is_check { format!("[核对] {}", concept_label) } else { concept_label.clone() },
         });
         self.session.conversation.current = Some(node_id.clone());
 
         if res.estimated {
             outln!(self, "[注: 本次 token 数为估算]");
         }
+        self.bump_epoch();
         self.update_completions();
         Ok((node_id, explanation_id))
+    }
+
+
+    /// ask/check 共用核心（CLI 顺序执行）：prepare → 锁外 LLM → commit。
+    async fn ask_core(
+        &mut self,
+        question: &str,
+        block_id: Option<String>,
+        is_check: bool,
+        quote: Option<&str>,
+        record_concept: bool,
+    ) -> Result<(String, Option<String>)> {
+        let job = self.prepare_ask(question, block_id, is_check, quote, record_concept)?;
+        let emitter = self.emitter.clone();
+        match job.run(&emitter).await {
+            Ok(res) => self.commit_ask(job, res),
+            Err(e) => {
+                self.abort_ask(&job);
+                Err(e)
+            }
+        }
     }
 
     /// 自动同步导出笔记（ask/批注后调用）；终端下必要时询问导出文件名。
@@ -1622,6 +1811,7 @@ PaperHelper 命令：
 
     /// 变更笔记后的统一收尾：同步导出到 export_path + 保存会话（失败只记日志，不影响主操作）。
     fn after_note_change(&mut self) {
+        self.bump_epoch();
         if let Some(p) = self.export_path.clone() {
             if !p.is_empty() {
                 if let Some(note) = &self.session.notes {
@@ -1696,6 +1886,51 @@ PaperHelper 命令：
         ])
     }
 
+    /// 组装消息后的通用提示：估算上下文规模；超限时告警（经 emitter 输出）。
+    /// 返回带上下文规模的进度文案，供锁外任务使用。
+    fn announce_context(&self, msgs: &[Message], label: &str) -> String {
+        let approx = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
+        let ctx = self.config.llm.context_length;
+        if ctx > 0 && approx > ctx {
+            self.emitter.stderr(format!(
+                "⚠️ 提示上下文约 {approx} token，超过配置的 {ctx}，可能报错；可精简论文或调大 llm.context_length"
+            ));
+        }
+        format!("{label}（上下文约 {approx} token）")
+    }
+
+    /// AI 重写/补充的 **prepare 段**（持锁）：只读会话，组装消息。
+    pub fn prepare_note_ai(&self, block_id: &str, instruction: &str, mode: &str) -> Result<SimpleJob> {
+        let msgs = self.note_ai_messages(block_id, instruction, mode)?;
+        let progress = self.announce_context(&msgs, "AI 生成中…");
+        Ok(SimpleJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            progress,
+        })
+    }
+
+    /// 按风格重写全文的 **prepare 段**（持锁）。
+    pub fn prepare_restyle(&self, style: &str, extra: &str) -> Result<SimpleJob> {
+        let msgs = self.restyle_messages(style, extra)?;
+        let progress = self.announce_context(&msgs, "按风格重写中…");
+        Ok(SimpleJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            progress,
+        })
+    }
+
+    /// 只生成、不改会话的任务落地（持锁）：记用量 + 截断提示。
+    pub fn commit_usage(&mut self, res: &crate::llm::LlmResult) {
+        self.record_usage(res.input_tokens, res.output_tokens);
+        if res.truncated() {
+            outerr!(self, "{} 输出达到上限（finish_reason=length），内容可能被截断", "⚠️ ".yellow());
+        }
+    }
+
     /// 用「按风格重写」的结果替换整篇笔记（重建全部块 id）。
     /// 会清空现有批注（块锚点已失效），并入撤销栈供「撤销」恢复。
     pub fn apply_restyle(&mut self, markdown: &str) -> Result<()> {
@@ -1725,7 +1960,8 @@ PaperHelper 命令：
 
     /// 新建批注（Web）：在 block_id 处针对选中文字提问，作为独立线程的根节点。
     /// 返回 `(批注 id, 根节点 id, 解释 id 或 None)`。
-    pub async fn annotate(
+    /// 笔记批注的 **prepare 段**（持锁）：校验块、切到独立线程、组装上下文。
+    pub fn prepare_annotate(
         &mut self,
         block_id: &str,
         quote: &str,
@@ -1733,7 +1969,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
-    ) -> Result<(String, String, Option<String>)> {
+    ) -> Result<(AskJob, AnnAnchor)> {
         // 全文提问：block_id 用哨兵 __title__，解释挂到首个块（保证追问嵌套），
         // 但批注仍记录 __title__ 供前端高亮标题。
         let is_title = block_id == "__title__";
@@ -1760,52 +1996,83 @@ PaperHelper 命令：
         self.session.conversation.current = None; // 独立线程：新根
         // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
         let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
-        let (node_id, expl_id) =
-            match self.ask_core(question, insert_block, is_check, Some(ctx), record_concept).await {
-            Ok(v) => v,
+        let mut job = match self.prepare_ask(question, insert_block, is_check, Some(ctx), record_concept) {
+            Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
                 return Err(e);
             }
         };
-        let ann_id = uuid::Uuid::new_v4().to_string();
-        self.session.annotations.push(Annotation {
-            id: ann_id.clone(),
+        job.restore_current = saved;
+        let anchor = AnnAnchor::Note {
             block_id: block_id.to_string(),
             quote: quote.to_string(),
             quote_tex: quote_tex.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
-            node_id: None,
-            root_node_id: node_id.clone(),
-            created_at: Utc::now().to_rfc3339(),
-        });
+        };
+        Ok((job, anchor))
+    }
+
+    /// 批注的 **落地段**（持锁）：写问答节点 + 批注记录。
+    pub fn commit_annotate(
+        &mut self,
+        job: AskJob,
+        anchor: AnnAnchor,
+        res: crate::llm::LlmResult,
+    ) -> Result<(String, String, Option<String>)> {
+        let (node_id, expl_id) = self.commit_ask(job, res)?;
+        let ann_id = uuid::Uuid::new_v4().to_string();
+        let annotation = match anchor {
+            AnnAnchor::Note { block_id, quote, quote_tex } => Annotation {
+                id: ann_id.clone(),
+                block_id,
+                quote,
+                quote_tex,
+                node_id: None,
+                root_node_id: node_id.clone(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+            AnnAnchor::Answer { node_id: anchor_node, quote, quote_tex } => Annotation {
+                id: ann_id.clone(),
+                block_id: String::new(),
+                quote,
+                quote_tex,
+                node_id: Some(anchor_node),
+                root_node_id: node_id.clone(),
+                created_at: Utc::now().to_rfc3339(),
+            },
+        };
+        self.session.annotations.push(annotation);
+        self.bump_epoch();
         Ok((ann_id, node_id, expl_id))
     }
 
-    /// 批注内追问（Web）：在指定会话节点下继续 ask/check。
-    pub async fn annotate_reply(
+    /// 批注内追问的 **prepare 段**（持锁）。
+    pub fn prepare_annotate_reply(
         &mut self,
         node_id: &str,
         question: &str,
         is_check: bool,
         record_concept: bool,
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<AskJob> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
         }
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let res = self.ask_core(question, fallback_block, is_check, None, record_concept).await;
-        if res.is_err() {
-            self.session.conversation.current = saved;
-        }
-        res
+        let mut job = match self.prepare_ask(question, fallback_block, is_check, None, record_concept) {
+            Ok(j) => j,
+            Err(e) => {
+                self.session.conversation.current = saved;
+                return Err(e);
+            }
+        };
+        job.restore_current = saved;
+        Ok(job)
     }
 
-    /// 回答批注（Web）：在某个回答里选中文字提问。
-    /// 与笔记批注的区别：锚点是对话节点（`node_id`）而不是笔记块，
-    /// 新问答挂在选中节点下（成为其子节点），前端在回答里高亮该段文字。
-    pub async fn annotate_answer(
+    /// 回答批注的 **prepare 段**（持锁）：锚点是对话节点（`node_id`）。
+    pub fn prepare_annotate_answer(
         &mut self,
         node_id: &str,
         quote: &str,
@@ -1813,7 +2080,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
-    ) -> Result<(String, String)> {
+    ) -> Result<(AskJob, AnnAnchor)> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
         }
@@ -1822,27 +2089,20 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let (new_id, _expl) = match self
-            .ask_core(question, fallback_block, is_check, Some(ctx), record_concept)
-            .await
-        {
-            Ok(v) => v,
+        let mut job = match self.prepare_ask(question, fallback_block, is_check, Some(ctx), record_concept) {
+            Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
                 return Err(e);
             }
         };
-        let ann_id = uuid::Uuid::new_v4().to_string();
-        self.session.annotations.push(Annotation {
-            id: ann_id.clone(),
-            block_id: String::new(),
+        job.restore_current = saved;
+        let anchor = AnnAnchor::Answer {
+            node_id: node_id.to_string(),
             quote: quote.to_string(),
             quote_tex: quote_tex.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
-            node_id: Some(node_id.to_string()),
-            root_node_id: new_id.clone(),
-            created_at: Utc::now().to_rfc3339(),
-        });
-        Ok((ann_id, new_id))
+        };
+        Ok((job, anchor))
     }
 
     /// 找到包含指定节点的批注，返回其 block_id（批注内追问的兜底定位）。
@@ -1885,6 +2145,7 @@ PaperHelper 命令：
         }
         self.session.conversation.remove_subtree(&root);
         self.session.annotations.remove(idx);
+        self.bump_epoch();
         self.update_completions();
         Ok(())
     }
@@ -2034,6 +2295,7 @@ PaperHelper 命令：
             }
         }
         let removed = self.session.conversation.remove_subtree(&cur);
+        self.bump_epoch();
         // 批注线程的根若在被删子树里，批注记录一并清理（否则会悬空）
         let removed_set: std::collections::HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
         let before = self.session.annotations.len();

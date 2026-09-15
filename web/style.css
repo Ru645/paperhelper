@@ -500,6 +500,14 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 /* 拖拽期间：禁止选中、禁掉笔记 iframe 抢指针（否则会丢 pointerup） */
 body.dragging { user-select: none; }
 body.dragging #note-frame { pointer-events: none; }
+/* LLM 任务进行中时的轻提示 */
+.busy-hint {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 80; padding: 9px 16px; border-radius: 999px;
+  background: rgba(30,41,59,.94); color: #fff; font-size: 13px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.28); pointer-events: none;
+}
+.busy-hint.hidden { display: none; }
 /* 八向缩放把手：四条边 + 四个角（无上限，可超出视口再拖回来） */
 .ann-rz { position: absolute; z-index: 3; touch-action: none; }
 .ann-rz.n { top: -3px; left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
