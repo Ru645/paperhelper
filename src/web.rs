@@ -70,6 +70,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/kb/concept/pin", post(api_concept_pin))
         .route("/api/kb/concept/delete", post(api_concept_delete))
         .route("/api/annotate", post(api_annotate))
+        .route("/api/annotate/answer", post(api_annotate_answer))
         .route("/api/annotate/reply", post(api_annotate_reply))
         .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
@@ -210,6 +211,7 @@ fn to_sse(ev: OutEvent) -> SseEvent {
         OutEvent::Stdout(s) => ("stdout", s),
         OutEvent::Stderr(s) => ("stderr", s),
         OutEvent::Token(s) => ("token", s),
+        OutEvent::Reasoning(s) => ("reasoning", s),
         OutEvent::Progress(s) => ("progress", s),
         OutEvent::ProgressDone => ("progress_done", String::new()),
         OutEvent::Done => ("done", String::new()),
@@ -557,7 +559,7 @@ async fn run_note_ai(a: &mut App, block_id: &str, instruction: &str, mode: &str)
     }
     let client = a.client.clone();
     let cfg = a.config.llm.clone();
-    emitter.progress("AI 生成中…");
+    emitter.progress(&format!("AI 生成中…（上下文约 {approx} token）"));
     let mut first = true;
     let res = llm::chat(&client, &cfg, &msgs, false, cfg.thinking_mode, &mut |t| {
         if first {
@@ -565,7 +567,7 @@ async fn run_note_ai(a: &mut App, block_id: &str, instruction: &str, mode: &str)
             first = false;
         }
         emitter.token(t);
-    })
+    }, Some(&mut |r| emitter.reasoning(r)))
     .await;
     if first {
         emitter.progress_done();
@@ -1108,6 +1110,9 @@ async fn api_concept_delete(
 struct AnnotateReq {
     block_id: String,
     quote: String,
+    /// 给 LLM 的上下文（公式已还原成 TeX）；缺省回退 `quote`。
+    #[serde(default)]
+    quote_tex: Option<String>,
     question: String,
     /// "ask"（默认，写入笔记解释）或 "check"（只进批注线程）。
     #[serde(default)]
@@ -1126,7 +1131,7 @@ async fn api_annotate(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let t0 = std::time::Instant::now();
         let result = guard
-            .annotate(&req.block_id, &req.quote, &req.question, is_check)
+            .annotate(&req.block_id, &req.quote, req.quote_tex.as_deref(), &req.question, is_check)
             .await
             .map(|_| ());
         if result.is_ok() {
@@ -1136,6 +1141,50 @@ async fn api_annotate(
             &guard.emitter,
             result,
             &format!("批注提问「{}」", req.question),
+            t0,
+        );
+        guard.emitter = Emitter::terminal();
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct AnnotateAnswerReq {
+    /// 引用文字所在的对话节点（回答批注锚点）。
+    node_id: String,
+    quote: String,
+    /// 给 LLM 的上下文（公式已还原成 TeX）；缺省回退 `quote`。
+    #[serde(default)]
+    quote_tex: Option<String>,
+    question: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// 回答批注：在某个回答里选中文字提问（新问答挂在该节点下，回答里高亮引用）。
+async fn api_annotate_answer(
+    State(app): State<SharedApp>,
+    Json(req): Json<AnnotateAnswerReq>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut guard = app2.lock().await;
+        guard.emitter = Emitter::channel(tx);
+        let is_check = matches!(req.mode.as_deref(), Some("check"));
+        let t0 = std::time::Instant::now();
+        let result = guard
+            .annotate_answer(&req.node_id, &req.quote, req.quote_tex.as_deref(), &req.question, is_check)
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            let _ = guard.auto_persist();
+        }
+        emit_result(
+            &guard.emitter,
+            result,
+            &format!("回答批注「{}」", req.question),
             t0,
         );
         guard.emitter = Emitter::terminal();
@@ -1215,7 +1264,9 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
             json!({
                 "id": ann.id,
                 "block_id": ann.block_id,
+                "node_id": ann.node_id,
                 "quote": ann.quote,
+                "quote_tex": ann.quote_tex,
                 "root_node_id": ann.root_node_id,
                 "thread": build_thread(&a.session.conversation, &ann.root_node_id, &summary_map),
             })

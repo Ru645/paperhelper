@@ -75,10 +75,16 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Annotation {
     pub id: String,
-    /// 引用文字所在的笔记块 id。
+    /// 引用文字所在的笔记块 id（回答批注为空）。
     pub block_id: String,
-    /// 选中的引用文字。
+    /// 选中的引用文字（可见文本，用于高亮匹配）。
     pub quote: String,
+    /// 交给 LLM 的上下文（把选中公式还原成 TeX，如 `$N$`；旧数据为空则回退 `quote`）。
+    #[serde(default)]
+    pub quote_tex: Option<String>,
+    /// 回答批注的锚点：引用文字所在对话节点（笔记批注为 None）。
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// 该批注对话线程的根会话节点 id。
     pub root_node_id: String,
     #[serde(default)]
@@ -377,5 +383,29 @@ mod tests {
         assert_eq!(loaded.stats.calls, 1);
         assert_eq!(loaded.conversation.current.as_deref(), Some("n1"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn annotation_backward_compatible() {
+        // 旧会话 JSON 没有 quote_tex / node_id 字段，应能正常反序列化
+        let old = r#"{"id":"a1","block_id":"b1","quote":"x","root_node_id":"n1","created_at":""}"#;
+        let ann: Annotation = serde_json::from_str(old).unwrap();
+        assert_eq!(ann.quote, "x");
+        assert!(ann.quote_tex.is_none(), "旧数据 quote_tex 应为 None");
+        assert!(ann.node_id.is_none(), "旧数据 node_id 应为 None");
+
+        // 新字段可正常往返
+        let ann = Annotation {
+            id: "a2".into(),
+            block_id: String::new(),
+            quote: "y".into(),
+            quote_tex: Some("$y$".into()),
+            node_id: Some("n9".into()),
+            root_node_id: "n10".into(),
+            created_at: String::new(),
+        };
+        let back: Annotation = serde_json::from_str(&serde_json::to_string(&ann).unwrap()).unwrap();
+        assert_eq!(back.quote_tex.as_deref(), Some("$y$"));
+        assert_eq!(back.node_id.as_deref(), Some("n9"));
     }
 }

@@ -95,6 +95,9 @@
 <!-- 选中文字后浮出的“提问”按钮 -->
 <button id="sel-btn" class="sel-btn hidden">提问</button>
 
+<!-- 批注弹窗里选中回答文字后浮出的“提问”按钮 -->
+<button id="ann-sel-btn" class="sel-btn hidden">提问</button>
+
 <!-- 悬停笔记块时浮出的“编辑”按钮 -->
 <button id="blk-edit-btn" class="blk-edit-btn hidden" title="编辑该块">✎ 编辑</button>
 
@@ -108,12 +111,15 @@
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>
   <div id="ann-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
+  <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div></details>
   <div class="ann-thread" id="ann-thread"></div>
+  <div id="ann-input-resize" class="ann-input-resize" title="拖动调整输入栏高度"></div>
   <div class="ann-input">
     <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
-    <input id="ann-q" type="text" placeholder="针对选中文字提问，回车发送…" autocomplete="off">
+    <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…" autocomplete="off"></textarea>
     <button id="ann-send" class="mini primary">发送</button>
   </div>
+  <div id="ann-resize" class="ann-resize" title="拖动调整弹窗大小"></div>
 </div>
 
 <!-- 导入论文：文件名 + 笔记风格 -->
@@ -152,6 +158,7 @@
       <button id="btn-edit-stop" class="mini ghost hidden">停止</button>
     </div>
     <div id="edit-ai-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
+    <details id="edit-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="edit-reasoning-text" class="reasoning-text"></div></details>
     <textarea id="edit-text" rows="14" placeholder="支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节"></textarea>
     <div class="edit-tools">
       <button id="btn-edit-insert" class="mini ghost">插入到该块后</button>
@@ -195,10 +202,12 @@
       <li><b>导入</b>：在还没有笔记的「笔记」页点「＋ 导入论文」，或直接把 PDF/TXT 拖进窗口。</li>
       <li><b>多种风格</b>：导入时可选择「四段式 / 逐段翻译 / 自由笔记」；提示词可在 <code>.paperhelper/prompts/</code> 里改。</li>
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。所有编辑/删除都能用顶栏「撤销」回退。</li>
-      <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。</li>
+      <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
+      <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
-      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可按住顶部标题栏拖动。</li>
+      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动、右下角拖拽缩放（尺寸记忆），输入栏可拖上缘调整高度。</li>
+      <li><b>进度与思考</b>：等待模型时显示上下文规模与计时；推理模型的思考过程会流式显示在「思考过程」折叠区。</li>
       <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>
       <li><b>配置</b>：点「配置」修改 API 端点/密钥/模型/价格/预算。</li>

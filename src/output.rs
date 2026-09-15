@@ -25,6 +25,8 @@ pub enum Event {
     Stderr(String),
     /// LLM 流式 token（无换行，需前端累加）
     Token(String),
+    /// LLM 流式思考过程（reasoning 模型才可能有；用于界面展示进度）
+    Reasoning(String),
     /// 进度提示开始/更新（对应 spinner 的 set_message）
     Progress(String),
     /// 进度结束（对应 spinner 的 finish_and_clear）
@@ -105,6 +107,16 @@ impl Emitter {
             use std::io::Write;
             print!("{t}");
             let _ = std::io::stdout().flush();
+        }
+    }
+
+    /// 输出 LLM 的思考过程分片：Web 端转 SSE 供界面展示；
+    /// 终端下用暗色写到 stderr（避免和正文混在一起）。
+    pub fn reasoning(&self, t: &str) {
+        if !self.send(Event::Reasoning(t.to_string())) {
+            use std::io::Write;
+            eprint!("\x1b[2m{t}\x1b[0m");
+            let _ = std::io::stderr().flush();
         }
     }
 

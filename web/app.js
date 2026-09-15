@@ -212,6 +212,71 @@ function showBar(id, on) {
   if (el) el.classList.toggle("hidden", !on);
 }
 
+// ===== 思考过程（reasoning 流）与「等待响应」计时 =====
+const reasoningBuf = { ann: "", edit: "" };
+
+/// 追加一段思考流（截断保留末尾，避免无限增长），并展开折叠区。
+function appendReasoning(which, text) {
+  const box = $(which + "-reasoning");
+  const el = $(which + "-reasoning-text");
+  if (!box || !el) return;
+  reasoningBuf[which] = (reasoningBuf[which] + text).slice(-4000);
+  el.textContent = reasoningBuf[which];
+  box.classList.remove("hidden");
+  box.open = true;
+  el.scrollTop = el.scrollHeight;
+}
+
+function resetReasoning(which) {
+  const box = $(which + "-reasoning");
+  const el = $(which + "-reasoning-text");
+  reasoningBuf[which] = "";
+  if (el) el.textContent = "";
+  if (box) { box.classList.add("hidden"); box.open = true; }
+}
+
+/// 弹窗右上角的进度文案 + 计时（后端 progress 事件会更新 base，计时器每秒刷新）。
+let annProgBase = "", annProgStart = 0, annProgTimer = null;
+function setAnnProgress(msg) {
+  if (!msg) {
+    if (annProgTimer) { clearInterval(annProgTimer); annProgTimer = null; }
+    annProgBase = "";
+    $("ann-progress").textContent = "";
+    return;
+  }
+  annProgBase = msg;
+  if (!annProgTimer) annProgStart = Date.now();
+  $("ann-progress").textContent = msg;
+  if (!annProgTimer) {
+    annProgTimer = setInterval(() => {
+      if (!annProgBase) return;
+      $("ann-progress").textContent = annProgBase + " · " + Math.round((Date.now() - annProgStart) / 1000) + "s";
+    }, 1000);
+  }
+}
+
+/// AI 重写弹窗的状态行计时（有 token / 结束时停止）。
+let editProgBase = "", editProgStart = 0, editProgTimer = null;
+function setEditProgress(msg) {
+  const st = $("edit-status");
+  if (!msg) {
+    if (editProgTimer) { clearInterval(editProgTimer); editProgTimer = null; }
+    editProgBase = "";
+    return;
+  }
+  editProgBase = msg;
+  if (!editProgTimer) editProgStart = Date.now();
+  st.className = "status";
+  st.textContent = msg;
+  if (!editProgTimer) {
+    editProgTimer = setInterval(() => {
+      if (!editProgBase) return;
+      if (st.classList.contains("err") || st.classList.contains("ok")) return;
+      st.textContent = editProgBase + " · " + Math.round((Date.now() - editProgStart) / 1000) + "s";
+    }, 1000);
+  }
+}
+
 function setRunning(v) {
   running = v;
   if (!v) setProgress("");
@@ -271,6 +336,7 @@ function handleFrame(frame) {
     case "stdout": appendConsole(text); break;
     case "stderr": appendConsole(text, "err"); break;
     case "token": appendToken(text); break;
+    case "reasoning": appendConsole(text, "dim"); break;
     case "progress": setProgress(text); break;
     case "progress_done": setProgress(""); break;
     case "aborted": appendConsole("⏹ 已中止", "warn"); setProgress(""); break;
@@ -730,8 +796,11 @@ function onNoteLoaded() {
   if (!doc.__annBound) {
     doc.__annBound = true;
     doc.addEventListener("mouseup", () => setTimeout(showSelButton, 0));
-    doc.addEventListener("mouseover", (e) => showBlkEditBtn(e.target));
-    doc.addEventListener("mouseleave", () => $("blk-edit-btn").classList.add("hidden"));
+    // 注意：鼠标从笔记移到「✎ 编辑」（在父文档里）会触发 iframe 的 mouseleave，
+    // 若立即隐藏按钮，指针就又落回笔记内容上 → 按钮反复闪烁、首次点击落空。
+    // 因此延迟隐藏，指针进入按钮时取消（见 cancelBlkEditHide）。
+    doc.addEventListener("mouseover", (e) => { cancelBlkEditHide(); showBlkEditBtn(e.target); });
+    doc.addEventListener("mouseleave", scheduleBlkEditHide);
     doc.addEventListener("click", (e) => {
       hideCtxMenu();
       const mark = e.target && e.target.closest ? e.target.closest("mark.ann-mark") : null;
@@ -775,7 +844,7 @@ function showHeadingMenu(doc, heading, x, y) {
   const blockId = blockIdForNode(doc, heading);
   if (!blockId) return;
   const text = (heading.textContent || "").trim();
-  const items = [{ label: "对本章节提问", fn: () => openAnnotationCreate(blockId, text) }];
+  const items = [{ label: "对本章节提问", fn: () => openAnnotationCreate({ block_id: blockId, quote: text, context: text }) }];
   const ann = (annotationsCache || []).find((a) => a.block_id === blockId);
   if (ann) {
     items.unshift({ label: "打开批注", fn: () => openAnnotationView(ann.id) });
@@ -786,10 +855,12 @@ function showHeadingMenu(doc, heading, x, y) {
 
 /// 右键高亮文字：打开 / 删除整条批注。
 function showAnnMarkMenu(annId, x, y) {
-  showMenu(x, y, [
-    { label: "打开批注", fn: () => openAnnotationView(annId) },
-    { label: "删除该批注", danger: true, fn: () => deleteAnnotation(annId) },
-  ]);
+  const ann = (annotationsCache || []).find((a) => a.id === annId);
+  const items = [];
+  // 回答批注就嵌在当前线程里，无需「打开批注」跳走
+  if (ann && !ann.node_id) items.push({ label: "打开批注", fn: () => openAnnotationView(annId) });
+  items.push({ label: "删除该批注", danger: true, fn: () => deleteAnnotation(annId) });
+  showMenu(x, y, items);
 }
 
 async function deleteAnnotation(annId) {
@@ -845,6 +916,96 @@ function cleanQuote(s) {
     .replace(/[\u{1D400}-\u{1D7FF}]/gu, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/// 计算 range 与 node 内容范围的交集（无交集返回 null）。
+function rangeIntersect(doc, range, node) {
+  const r = doc.createRange();
+  r.selectNodeContents(node);
+  if (range.compareBoundaryPoints(Range.END_TO_START, r) > 0 ||
+      range.compareBoundaryPoints(Range.START_TO_END, r) < 0) return null;
+  const out = doc.createRange();
+  if (range.compareBoundaryPoints(Range.START_TO_START, r) <= 0) out.setStart(r.startContainer, r.startOffset);
+  else out.setStart(range.startContainer, range.startOffset);
+  if (range.compareBoundaryPoints(Range.END_TO_END, r) >= 0) out.setEnd(r.endContainer, r.endOffset);
+  else out.setEnd(range.endContainer, range.endOffset);
+  return out;
+}
+
+/// 某段范围的「可见文本」：去掉 KaTeX 隐藏的 MathML 层（复制后再删，不动原 DOM）。
+function rangeVisibleText(r) {
+  const frag = r.cloneContents();
+  frag.querySelectorAll(".katex-mathml").forEach((m) => m.remove());
+  return frag.textContent || "";
+}
+
+/// 把选区转成批注的「引用 + LLM 上下文」：
+/// - quote：可见文本（与笔记 DOM 一致，用于高亮匹配）
+/// - context：公式替换成 KaTeX 的原始 TeX（`$…$` / `$$…$$`），其余照旧；
+///   只选中公式一部分时无法还原子表达式 TeX，给整条并在括号里注明选中片段。
+function extractQuoteContext(doc, range) {
+  const isKatex = (el) => el && el.classList && el.classList.contains("katex");
+  const visibleOf = (el) => {
+    const c = el.cloneNode(true);
+    c.querySelectorAll(".katex-mathml").forEach((m) => m.remove());
+    return c.textContent || "";
+  };
+  const texOf = (el) => {
+    const ann = el.querySelector('annotation[encoding="application/x-tex"]');
+    return ann ? ann.textContent.trim() : "";
+  };
+  let quote = "", context = "";
+  const partials = [];
+  const pushFormula = (el) => {
+    const r = rangeIntersect(doc, range, el);
+    if (!r || r.collapsed) return;
+    const vis = cleanQuote(rangeVisibleText(r));
+    if (!vis) return;
+    const full = cleanQuote(visibleOf(el));
+    quote += vis;
+    const tex = texOf(el) || vis;
+    const wrapped = el.closest && el.closest(".katex-display") ? `$$${tex}$$` : `$${tex}$`;
+    if (full && vis !== full) {
+      partials.push(tex);
+      context += `${wrapped}（用户只选中了其中「${vis}」）`;
+    } else {
+      context += wrapped;
+    }
+  };
+  const root = range.commonAncestorContainer;
+  const rootEl = root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement;
+  const rootKatex = rootEl && (isKatex(rootEl) ? rootEl : rootEl.closest && rootEl.closest(".katex"));
+  if (rootKatex && range.intersectsNode(rootKatex)) {
+    // 选区整个落在某个公式内（含只选了公式里的一小段）
+    pushFormula(rootKatex);
+  } else if (root.nodeType === Node.TEXT_NODE) {
+    quote += range.toString();
+    context += range.toString();
+  } else {
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT, {
+      acceptNode: (n) => {
+        if (n.nodeType === Node.ELEMENT_NODE) {
+          if (isKatex(n)) return range.intersectsNode(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_SKIP; // 普通容器：进入子节点
+        }
+        if (n.parentElement && n.parentElement.closest && n.parentElement.closest(".katex")) {
+          return NodeFilter.FILTER_REJECT; // 公式内部由 .katex 整体处理
+        }
+        return range.intersectsNode(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n.nodeType === Node.ELEMENT_NODE) { pushFormula(n); continue; }
+      const r = rangeIntersect(doc, range, n);
+      if (r) { quote += r.toString(); context += r.toString(); }
+    }
+  }
+  return {
+    quote: cleanQuote(quote),
+    context: context.replace(/[ \t]+/g, " ").trim(),
+    partials,
+  };
 }
 
 /// 在块范围内高亮 quote：**逐文本节点**包裹 <mark>，只切分文本节点、
@@ -923,11 +1084,11 @@ function showSelButton() {
   if (!doc) return;
   const sel = doc.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return hideSelButton();
-  const text = cleanQuote(sel.toString());
-  if (!text) return hideSelButton();
   const range = sel.getRangeAt(0);
   const blockId = blockIdForNode(doc, range.startContainer);
   if (!blockId) return hideSelButton();
+  const info = extractQuoteContext(doc, range);
+  if (!info.quote) return hideSelButton();
   const rect = range.getBoundingClientRect();
   const fr = noteFrame.getBoundingClientRect();
   const btn = $("sel-btn");
@@ -937,7 +1098,47 @@ function showSelButton() {
   btn.onmousedown = (e) => e.preventDefault();
   btn.onclick = () => {
     hideSelButton();
-    openAnnotationCreate(blockId, text);
+    openAnnotationCreate({ block_id: blockId, quote: info.quote, context: info.context });
+  };
+}
+
+// ---- 批注弹窗内：选中回答文字 → 追问（回答批注） ----
+
+let annSelRange = null;
+
+/// 在批注弹窗的回答里选中文字后，浮出「提问」按钮（与笔记选区互不影响）。
+function showAnnSelButton() {
+  const btn = $("ann-sel-btn");
+  const pop = $("ann-popup");
+  if (!pop || pop.classList.contains("hidden")) return btn.classList.add("hidden");
+  const sel = document.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return btn.classList.add("hidden");
+  const range = sel.getRangeAt(0);
+  const startEl = range.startContainer.nodeType === Node.TEXT_NODE
+    ? range.startContainer.parentElement
+    : range.startContainer;
+  const answer = startEl && startEl.closest ? startEl.closest(".ann-a") : null;
+  const nodeEl = answer && answer.closest(".ann-node[data-node-id]");
+  if (!answer || !nodeEl || !pop.contains(answer)) return btn.classList.add("hidden");
+  annSelRange = range.cloneRange();
+  const rect = range.getBoundingClientRect();
+  btn.classList.remove("hidden");
+  btn.style.left = Math.min(window.innerWidth - 70, Math.max(8, rect.left)) + "px";
+  btn.style.top = Math.min(window.innerHeight - 40, Math.max(8, rect.bottom + 6)) + "px";
+  btn.onmousedown = (e) => e.preventDefault();
+  btn.onclick = () => {
+    btn.classList.add("hidden");
+    const r = annSelRange;
+    if (!r) return;
+    const info = extractQuoteContext(document, r);
+    if (!info.quote) return;
+    sel.removeAllRanges();
+    openAnnotationCreate({
+      node_id: nodeEl.dataset.nodeId,
+      quote: info.quote,
+      context: info.context,
+      rect: r.getBoundingClientRect(),
+    });
   };
 }
 
@@ -954,6 +1155,20 @@ function blockElementFor(doc, id) {
     return parent.nextElementSibling || parent;
   }
   return parent;
+}
+
+/// 延迟隐藏「✎ 编辑」：指针从笔记移到按钮上时 iframe 会 mouseleave，
+/// 但按钮本身在父文档，需要给指针进入按钮留出时间，否则按钮闪烁、首次点击落空。
+let blkEditHideTimer = null;
+function cancelBlkEditHide() {
+  if (blkEditHideTimer) { clearTimeout(blkEditHideTimer); blkEditHideTimer = null; }
+}
+function scheduleBlkEditHide() {
+  cancelBlkEditHide();
+  blkEditHideTimer = setTimeout(() => {
+    blkEditHideTimer = null;
+    $("blk-edit-btn").classList.add("hidden");
+  }, 150);
 }
 
 /// 悬停到某块上时，把「✎ 编辑」按钮浮到该块右上角。
@@ -976,7 +1191,13 @@ function showBlkEditBtn(target) {
   btn.style.top = Math.max(6, top + 2) + "px";
   btn.dataset.blockId = id;
   btn.onmousedown = (e) => e.preventDefault();
-  btn.onclick = () => openEditModal(id);
+  btn.onmouseenter = cancelBlkEditHide;
+  btn.onmouseleave = scheduleBlkEditHide;
+  btn.onclick = () => {
+    cancelBlkEditHide();
+    btn.classList.add("hidden");
+    openEditModal(id);
+  };
 }
 
 function setEditTab(mode) {
@@ -1032,6 +1253,7 @@ function closeEditModal() {
     try { editAbort.abort(); } catch (e) { /* 忽略 */ }
     editAbort = null;
   }
+  setEditProgress("");
   $("edit-modal").classList.add("hidden");
   $("blk-edit-btn").classList.add("hidden");
 }
@@ -1046,8 +1268,8 @@ async function generateEdit() {
     return;
   }
   const mode = editMode === "append" ? "append" : "rewrite";
-  st.textContent = "AI 生成中…";
-  st.className = "status";
+  setEditProgress("AI 生成中…");
+  resetReasoning("edit");
   $("edit-text").value = "";
   $("btn-edit-gen").disabled = true;
   $("btn-edit-stop").classList.remove("hidden");
@@ -1058,24 +1280,32 @@ async function generateEdit() {
   try {
     await postSse("/api/note/ai", { block_id: editBlockId, instruction, mode }, ({ name, text }) => {
       if (name === "token") {
-        if (!acc) showBar("edit-ai-bar", false); // 有内容流出即收起进度条
+        if (!acc) {
+          showBar("edit-ai-bar", false); // 有内容流出即收起进度条与计时
+          setEditProgress("");
+        }
         acc += text;
         $("edit-text").value = acc;
         $("edit-text").scrollTop = $("edit-text").scrollHeight;
+      } else if (name === "reasoning") {
+        appendReasoning("edit", text);
       } else if (name === "progress") {
-        st.textContent = text;
+        setEditProgress(text);
       } else if (name === "stderr") {
         appendConsole(text, "warn");
       } else if (name === "error") {
         const { summary } = parseError(text);
+        setEditProgress("");
         st.textContent = "❌ " + summary;
         st.className = "status err";
       } else if (name === "aborted") {
+        setEditProgress("");
         st.textContent = "⏹ 已中止";
         st.className = "status";
       }
     }, { signal: ctrl.signal });
     if (acc && !st.classList.contains("err")) {
+      setEditProgress("");
       st.textContent = "✓ 已生成（可修改后点" + (mode === "append" ? "「插入」" : "「应用」") + "）";
       st.className = "status ok";
     }
@@ -1089,9 +1319,12 @@ async function generateEdit() {
     }
   }
   editAbort = null;
+  setEditProgress("");
   showBar("edit-ai-bar", false);
   $("btn-edit-gen").disabled = false;
   $("btn-edit-stop").classList.add("hidden");
+  const rbox = $("edit-reasoning");
+  if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
 }
 
 function stopEditGen() {
@@ -1154,7 +1387,8 @@ async function deleteEditBlock() {
 
 function positionPopup(x, y) {
   const el = $("ann-popup");
-  const w = 380, h = 460;
+  const r = el.getBoundingClientRect();
+  const w = r.width || 380, h = r.height || 460;
   el.style.left = Math.min(window.innerWidth - w - 12, Math.max(12, x)) + "px";
   el.style.top = Math.min(window.innerHeight - h - 12, Math.max(12, y)) + "px";
 }
@@ -1208,19 +1442,119 @@ function setupAnnDrag() {
   });
 }
 
-async function openAnnotationCreate(blockId, quote) {
-  currentAnnotation = { id: null, block_id: blockId, quote };
-  annSelectedNode = null;
+const ANN_SIZE_KEY = "ph.ann.size";
+
+/// 批注弹窗右下角把手：拖拽调整大小，尺寸存 localStorage（位置仍不记忆）。
+function setupAnnResize() {
+  const popup = $("ann-popup");
+  const handle = $("ann-resize");
+  if (!handle) return;
+  const MIN_W = 300, MIN_H = 240;
+  try {
+    const s = JSON.parse(localStorage.getItem(ANN_SIZE_KEY) || "null");
+    if (s && s.w >= MIN_W && s.h >= MIN_H) {
+      popup.style.width = s.w + "px";
+      popup.style.height = s.h + "px";
+    }
+  } catch (e) { /* 忽略损坏的存储 */ }
+  let drag = null;
+  const onMove = (e) => {
+    if (!drag) return;
+    const w = Math.max(MIN_W, Math.min(window.innerWidth - 24, drag.w + (e.clientX - drag.x)));
+    const h = Math.max(MIN_H, Math.min(window.innerHeight - 24, drag.h + (e.clientY - drag.y)));
+    popup.style.width = Math.round(w) + "px";
+    popup.style.height = Math.round(h) + "px";
+  };
+  const onUp = () => {
+    if (!drag) return;
+    drag = null;
+    popup.classList.remove("resizing");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    const r = popup.getBoundingClientRect();
+    try { localStorage.setItem(ANN_SIZE_KEY, JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height) })); } catch (e) { /* 忽略 */ }
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    const r = popup.getBoundingClientRect();
+    drag = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+    popup.classList.add("resizing");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    e.preventDefault();
+  });
+}
+
+/// 输入框随内容自增高（受 CSS max-height 限制，超出出滚动条）。
+/// 用户拖动输入栏上游的把手会写入 dataset.baseH 作为最小高度。
+function annInputGrow() {
+  const ta = $("ann-q");
+  if (!ta) return;
+  const base = Number(ta.dataset.baseH || 0);
+  ta.style.height = "auto";
+  ta.style.height = Math.max(base, ta.scrollHeight) + "px";
+}
+
+/// 输入栏上的拖动条：上下拖动改变输入框高度（相对底部输入区）。
+function setupAnnInputResize() {
+  const handle = $("ann-input-resize");
+  const ta = $("ann-q");
+  if (!handle || !ta) return;
+  let drag = null;
+  const onMove = (e) => {
+    if (!drag) return;
+    const h = Math.max(34, Math.round(drag.h + (drag.y - e.clientY)));
+    ta.dataset.baseH = String(h);
+    ta.style.height = h + "px";
+  };
+  const onUp = () => {
+    if (!drag) return;
+    drag = null;
+    handle.classList.remove("dragging");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+  };
+  handle.addEventListener("pointerdown", (e) => {
+    drag = { y: e.clientY, h: ta.getBoundingClientRect().height };
+    handle.classList.add("dragging");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    e.preventDefault();
+  });
+}
+
+/// 新建批注：anchor = { block_id?, node_id?, quote（可见文本）, context（给 LLM，公式为 TeX）, rect? }。
+/// 笔记批注：`block_id` 锚定笔记块；回答批注：`node_id` 锚定弹窗里的某条回答。
+async function openAnnotationCreate(anchor) {
+  const isAnswer = !!anchor.node_id;
+  currentAnnotation = {
+    id: null,
+    block_id: anchor.block_id || "",
+    node_id: anchor.node_id || null,
+    quote: anchor.quote,
+    quote_tex: anchor.context || anchor.quote,
+  };
+  if (!isAnswer) annSelectedNode = null;
   await loadMathLibs();
-  $("ann-quote").textContent = quote;
-  $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
+  $("ann-quote").textContent = anchor.quote;
+  if (!isAnswer) {
+    $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
+  }
   $("ann-popup").classList.remove("hidden");
-  const doc = noteFrame.contentDocument;
-  const sel = doc && doc.getSelection();
-  const rect = sel && sel.rangeCount ? sel.getRangeAt(0).getBoundingClientRect() : { left: 200, bottom: 200 };
-  const fr = noteFrame.getBoundingClientRect();
-  positionPopup(fr.left + rect.left, fr.top + rect.bottom + 10);
+  if (isAnswer && anchor.rect) {
+    positionPopup(anchor.rect.left, anchor.rect.bottom + 10);
+  } else {
+    const doc = noteFrame.contentDocument;
+    const sel = doc && doc.getSelection();
+    const rect = sel && sel.rangeCount ? sel.getRangeAt(0).getBoundingClientRect() : { left: 200, bottom: 200 };
+    const fr = noteFrame.getBoundingClientRect();
+    positionPopup(fr.left + rect.left, fr.top + rect.bottom + 10);
+  }
   $("ann-q").value = "";
+  annInputGrow();
   $("ann-q").focus();
 }
 
@@ -1228,7 +1562,13 @@ async function openAnnotationView(annId, opts = {}) {
   await refreshAnnotations();
   const ann = annotationsCache.find((a) => a.id === annId);
   if (!ann) return;
-  currentAnnotation = { id: ann.id, block_id: ann.block_id, quote: ann.quote };
+  currentAnnotation = {
+    id: ann.id,
+    block_id: ann.block_id,
+    node_id: ann.node_id || null,
+    quote: ann.quote,
+    quote_tex: ann.quote_tex || ann.quote,
+  };
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
   await loadMathLibs();
   $("ann-quote").textContent = cleanQuote(ann.quote);
@@ -1242,20 +1582,45 @@ async function openAnnotationView(annId, opts = {}) {
     const fr = noteFrame.getBoundingClientRect();
     positionPopup(fr.left + r.left, fr.top + r.bottom + 10);
   } else {
-    // 高亮失配（如笔记被改过）时，至少滚动到所在块
-    if (opts.scroll && ann.block_id) scrollNoteToBlock(ann.block_id);
-    positionPopup(window.innerWidth / 2 - 190, 120);
+    // 笔记里没有对应高亮（回答批注 / 笔记被改过）：优先找弹窗线程里的高亮
+    const tmark = document.querySelector(`#ann-thread mark.ann-mark[data-ann-id="${annId}"]`);
+    if (tmark) {
+      if (opts.scroll) tmark.scrollIntoView({ block: "center" });
+      const r = tmark.getBoundingClientRect();
+      positionPopup(r.left, r.bottom + 10);
+    } else {
+      // 至少滚动到批注所在块（回答批注没有块则居中显示）
+      if (opts.scroll && ann.block_id) scrollNoteToBlock(ann.block_id);
+      positionPopup(window.innerWidth / 2 - 190, 120);
+    }
   }
   $("ann-q").focus();
 }
 
+/// 绑定节点点击但忽略「拖动选择」：拖选回答文字后浏览器会在共同祖先补发 click，
+/// 若不忽略就会触发节点跳转/折叠并重建 DOM，把选中的高亮清掉（并闪出顶栏停止按钮）。
+function onAnnNodeClick(el, fn) {
+  let down = null;
+  el.addEventListener("pointerdown", (e) => { down = { x: e.clientX, y: e.clientY }; });
+  el.addEventListener("click", (e) => {
+    const dragged = down && (Math.abs(e.clientX - down.x) > 4 || Math.abs(e.clientY - down.y) > 4);
+    down = null;
+    if (dragged) return;
+    fn(e);
+  });
+}
+
+let renderedThreadRoot = null; // 当前弹窗里渲染的线程根（点击回答高亮时需要重渲染）
+
 function renderAnnThread(root) {
   const box = $("ann-thread");
   box.innerHTML = "";
+  renderedThreadRoot = root || null;
   if (!root) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
   const add = (node, depth, container) => {
     const div = document.createElement("div");
     div.className = "ann-node" + (node.is_check ? " check" : "") + (annSelectedNode === node.node_id ? " selected" : "");
+    div.dataset.nodeId = node.node_id;
     div.style.marginLeft = depth * 10 + "px";
 
     const q = document.createElement("div");
@@ -1264,6 +1629,14 @@ function renderAnnThread(root) {
     const a = document.createElement("div");
     a.className = "ann-a";
     a.innerHTML = renderMathMarkdown(node.answer || "");
+    // 回答批注：在该条回答里高亮它引用的文字
+    for (const ann of annotationsCache) {
+      if (ann.node_id && ann.node_id === node.node_id) {
+        const r = document.createRange();
+        r.selectNodeContents(a);
+        wrapQuote(document, r, ann.quote, ann.id);
+      }
+    }
 
     if (node.summary) {
       // 总结节点：显示总结，折叠原对话（点击展开）
@@ -1283,13 +1656,14 @@ function renderAnnThread(root) {
       div.appendChild(sum);
       div.appendChild(hint);
       div.appendChild(orig);
-      div.onclick = (e) => {
+      onAnnNodeClick(div, (e) => {
         e.stopPropagation();
         const open = orig.style.display !== "none";
         orig.style.display = open ? "none" : "block";
         hint.textContent = open ? "▶ 展开原对话" : "▼ 收起";
-      };
+      });
       div.oncontextmenu = (e) => {
+        if (e.target.closest && e.target.closest("mark.ann-mark")) return; // 回答高亮交给批注菜单
         e.preventDefault();
         showAnnNodeMenu(e.clientX, e.clientY, node);
       };
@@ -1300,12 +1674,13 @@ function renderAnnThread(root) {
     // 普通节点
     div.appendChild(q);
     div.appendChild(a);
-    div.onclick = () => {
+    onAnnNodeClick(div, () => {
       annSelectedNode = node.node_id;
       renderAnnThread(root);
       runCommand("goto " + node.n, { skipReload: true });
-    };
+    });
     div.oncontextmenu = (e) => {
+      if (e.target.closest && e.target.closest("mark.ann-mark")) return; // 回答高亮交给批注菜单
       e.preventDefault();
       showAnnNodeMenu(e.clientX, e.clientY, node);
     };
@@ -1346,6 +1721,7 @@ async function afterAnnotationChange() {
 
 function closeAnnPopup() {
   $("ann-popup").classList.add("hidden");
+  $("ann-sel-btn").classList.add("hidden");
   currentAnnotation = null;
   annSelectedNode = null;
 }
@@ -1374,16 +1750,37 @@ async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
   $("ann-q").value = "";
+  annInputGrow();
   $("ann-send").disabled = true;
-  $("ann-progress").textContent = "思考中…";
+  setAnnProgress("思考中…");
+  resetReasoning("ann");
   const ansEl = appendPendingNode(q);
   let url, body;
+  const answerAnchorNode = currentAnnotation.node_id && !currentAnnotation.id ? currentAnnotation.node_id : null;
   if (!currentAnnotation.id) {
-    url = "/api/annotate";
-    body = { block_id: currentAnnotation.block_id, quote: currentAnnotation.quote, question: q, mode: annMode };
+    if (answerAnchorNode) {
+      // 回答批注：锚定该回答所在节点，新问答成为它的子节点
+      url = "/api/annotate/answer";
+      body = {
+        node_id: answerAnchorNode,
+        quote: currentAnnotation.quote,
+        quote_tex: currentAnnotation.quote_tex || null,
+        question: q,
+        mode: annMode,
+      };
+    } else {
+      url = "/api/annotate";
+      body = {
+        block_id: currentAnnotation.block_id,
+        quote: currentAnnotation.quote,
+        quote_tex: currentAnnotation.quote_tex || null,
+        question: q,
+        mode: annMode,
+      };
+    }
   } else {
     const nodeId = annSelectedNode;
-    if (!nodeId) { $("ann-send").disabled = false; $("ann-progress").textContent = ""; return; }
+    if (!nodeId) { $("ann-send").disabled = false; setAnnProgress(""); return; }
     url = "/api/annotate/reply";
     body = { node_id: nodeId, question: q, mode: annMode };
   }
@@ -1403,18 +1800,23 @@ async function sendAnnotation() {
         appendConsole("⏹ 已中止", "warn");
         ansEl.textContent = "（已中止）";
       } else if (name === "token") {
-        if (!streamed) showBar("ann-bar", false); // 有内容流出即收起进度条
+        if (!streamed) {
+          showBar("ann-bar", false); // 有内容流出即收起进度条与计时
+          setAnnProgress("");
+        }
         streamed += text;
         ansEl.textContent = streamed;
         $("ann-thread").scrollTop = $("ann-thread").scrollHeight;
+      } else if (name === "reasoning") {
+        appendReasoning("ann", text);
       } else if (name === "stdout") {
         appendConsole(text);
       } else if (name === "stderr") {
         appendConsole(text, "err");
       } else if (name === "progress") {
-        $("ann-progress").textContent = text;   // 进度显示在弹窗右上角
+        setAnnProgress(text);   // 进度显示在弹窗右上角（自动带计时）
       } else if (name === "progress_done") {
-        $("ann-progress").textContent = "";
+        setAnnProgress("");
       }
     }, { signal: controller.signal });
   } catch (e) {
@@ -1430,22 +1832,52 @@ async function sendAnnotation() {
   showBar("ann-bar", false);
   $("ann-stop").classList.add("hidden");
   $("ann-send").disabled = false;
-  $("ann-progress").textContent = "";
+  setAnnProgress("");
+  const rbox = $("ann-reasoning");
+  if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
   await refreshState();
   await refreshAnnotations();
   if (currentAnnotation.id) {
     const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
     if (ann) {
-      currentAnnotation = { id: ann.id, block_id: ann.block_id, quote: ann.quote };
+      currentAnnotation = {
+        id: ann.id,
+        block_id: ann.block_id,
+        node_id: ann.node_id || null,
+        quote: ann.quote,
+        quote_tex: ann.quote_tex || ann.quote,
+      };
       renderAnnThread(ann.thread);
     }
   } else {
-    // 新建：匹配最新一条（同块同引用）
+    // 新建：匹配最新一条（同块/同节点 + 同引用）
     const latest = annotationsCache[annotationsCache.length - 1];
-    if (latest && latest.block_id === currentAnnotation.block_id && latest.quote === currentAnnotation.quote) {
-      currentAnnotation = { id: latest.id, block_id: latest.block_id, quote: latest.quote };
+    const sameAnchor = latest &&
+      (latest.block_id || "") === (currentAnnotation.block_id || "") &&
+      (latest.node_id || "") === (currentAnnotation.node_id || "");
+    if (sameAnchor && latest.quote === currentAnnotation.quote) {
+      currentAnnotation = {
+        id: latest.id,
+        block_id: latest.block_id,
+        node_id: latest.node_id || null,
+        quote: latest.quote,
+        quote_tex: latest.quote_tex || latest.quote,
+      };
       annSelectedNode = latest.thread ? latest.thread.node_id : null;
       renderAnnThread(latest.thread);
+    }
+  }
+  // 回答批注：在父线程里选中并滚动到刚创建的子节点
+  if (answerAnchorNode) {
+    const latest = [...annotationsCache].reverse().find((a) => a.node_id === answerAnchorNode);
+    if (latest) {
+      annSelectedNode = latest.root_node_id;
+      const parent = currentAnnotation.id
+        ? annotationsCache.find((a) => a.id === currentAnnotation.id)
+        : null;
+      if (parent) renderAnnThread(parent.thread);
+      const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${latest.root_node_id}"]`);
+      if (el) el.scrollIntoView({ block: "center" });
     }
   }
   reloadNote(null, true);
@@ -2149,14 +2581,39 @@ document.addEventListener("DOMContentLoaded", () => {
   // 批注弹窗
   $("ann-close").onclick = closeAnnPopup;
   $("ann-send").onclick = sendAnnotation;
+  // 弹窗线程内：选中回答文字浮出「提问」；回答里的高亮可点击/右键
+  document.addEventListener("mouseup", () => setTimeout(showAnnSelButton, 0));
+  $("ann-thread").addEventListener("click", (e) => {
+    const mark = e.target.closest ? e.target.closest("mark.ann-mark") : null;
+    if (!mark) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const ann = annotationsCache.find((a) => a.id === mark.dataset.annId);
+    if (!ann) return;
+    annSelectedNode = ann.root_node_id;
+    if (renderedThreadRoot) renderAnnThread(renderedThreadRoot);
+    const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${ann.root_node_id}"]`);
+    if (el) el.scrollIntoView({ block: "center" });
+  });
+  $("ann-thread").addEventListener("contextmenu", (e) => {
+    const mark = e.target.closest ? e.target.closest("mark.ann-mark") : null;
+    if (!mark) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showAnnMarkMenu(mark.dataset.annId, e.clientX, e.clientY);
+  });
   $("ann-mode").onclick = () => {
     annMode = annMode === "ask" ? "check" : "ask";
     $("ann-mode").textContent = annMode;
     $("ann-mode").classList.toggle("check", annMode === "check");
   };
   $("ann-q").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); sendAnnotation(); }
+    // Enter 发送；Shift+Enter 换行；中文输入法组词中的回车不发送
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendAnnotation(); }
   });
+  $("ann-q").addEventListener("input", annInputGrow);
+  setupAnnInputResize();
+  setupAnnResize();
   $("btn-config").onclick = openConfig;
   $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
   $("btn-config-test").onclick = testConfig;

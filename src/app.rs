@@ -505,7 +505,7 @@ impl App {
             role: "user".into(),
             content: prompt,
         }];
-        match llm::chat(&self.client, &self.config.llm, &msgs, false, false, &mut |_| {}).await {
+        match llm::chat(&self.client, &self.config.llm, &msgs, false, false, &mut |_| {}, None).await {
             Ok(res) => {
                 let name = res.content.trim().to_string();
                 if name.is_empty() {
@@ -984,7 +984,7 @@ PaperHelper 命令：
                 first_token = false;
             }
             emitter.token(t);
-        }).await;
+        }, Some(&mut |r| emitter.reasoning(r))).await;
         if first_token || web {
             emitter.progress_done();
         }
@@ -1155,7 +1155,12 @@ PaperHelper 命令：
         // 流式调用 LLM
         let emitter = self.emitter.clone();
         let mut first_token = true;
-        emitter.progress(if is_check { "核对中…" } else { "思考中…" });
+        // 等首个 token 前也能看到进度：给出上下文规模 + 计时（前端每秒刷新）
+        let approx = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
+        emitter.progress(&format!(
+            "{}（上下文约 {approx} token）",
+            if is_check { "核对中…" } else { "思考中…" }
+        ));
         let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |t| {
             if first_token {
                 emitter.progress_done();
@@ -1163,7 +1168,7 @@ PaperHelper 命令：
                 emitter.token("\n");
             }
             emitter.token(t);
-        }).await;
+        }, Some(&mut |r| emitter.reasoning(r))).await;
         if first_token {
             emitter.progress_done();
         }
@@ -1520,6 +1525,7 @@ PaperHelper 命令：
         &mut self,
         block_id: &str,
         quote: &str,
+        quote_tex: Option<&str>,
         question: &str,
         is_check: bool,
     ) -> Result<(String, String, Option<String>)> {
@@ -1547,7 +1553,9 @@ PaperHelper 命令：
         };
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
-        let (node_id, expl_id) = match self.ask_core(question, insert_block, is_check, Some(quote)).await {
+        // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
+        let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
+        let (node_id, expl_id) = match self.ask_core(question, insert_block, is_check, Some(ctx)).await {
             Ok(v) => v,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -1559,6 +1567,8 @@ PaperHelper 命令：
             id: ann_id.clone(),
             block_id: block_id.to_string(),
             quote: quote.to_string(),
+            quote_tex: quote_tex.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
+            node_id: None,
             root_node_id: node_id.clone(),
             created_at: Utc::now().to_rfc3339(),
         });
@@ -1583,6 +1593,46 @@ PaperHelper 命令：
             self.session.conversation.current = saved;
         }
         res
+    }
+
+    /// 回答批注（Web）：在某个回答里选中文字提问。
+    /// 与笔记批注的区别：锚点是对话节点（`node_id`）而不是笔记块，
+    /// 新问答挂在选中节点下（成为其子节点），前端在回答里高亮该段文字。
+    pub async fn annotate_answer(
+        &mut self,
+        node_id: &str,
+        quote: &str,
+        quote_tex: Option<&str>,
+        question: &str,
+        is_check: bool,
+    ) -> Result<(String, String)> {
+        if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
+            bail!("找不到对话节点");
+        }
+        // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
+        let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
+        let fallback_block = self.annotation_block_for_node(node_id);
+        let saved = self.session.conversation.current.clone();
+        self.session.conversation.current = Some(node_id.to_string());
+        let (new_id, _expl) =
+            match self.ask_core(question, fallback_block, is_check, Some(ctx)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.session.conversation.current = saved;
+                    return Err(e);
+                }
+            };
+        let ann_id = uuid::Uuid::new_v4().to_string();
+        self.session.annotations.push(Annotation {
+            id: ann_id.clone(),
+            block_id: String::new(),
+            quote: quote.to_string(),
+            quote_tex: quote_tex.filter(|s| !s.trim().is_empty()).map(|s| s.to_string()),
+            node_id: Some(node_id.to_string()),
+            root_node_id: new_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
+        });
+        Ok((ann_id, new_id))
     }
 
     /// 找到包含指定节点的批注，返回其 block_id（批注内追问的兜底定位）。
@@ -1684,7 +1734,7 @@ PaperHelper 命令：
         ];
 
         self.emitter.progress("概括总结中…");
-        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}).await;
+        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}, None).await;
         self.emitter.progress_done();
         let res = res?;
         self.record_usage(res.input_tokens, res.output_tokens);
@@ -1774,8 +1824,18 @@ PaperHelper 命令：
             }
         }
         let removed = self.session.conversation.remove_subtree(&cur);
+        // 批注线程的根若在被删子树里，批注记录一并清理（否则会悬空）
+        let removed_set: std::collections::HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
+        let before = self.session.annotations.len();
+        self.session.annotations.retain(|a| !removed_set.contains(a.root_node_id.as_str()));
+        let ann_removed = before - self.session.annotations.len();
         self.update_completions();
-        outln!(self, "✓ 已删除 {} 个对话节点（可用 `undo` 撤销）", removed.len());
+        outln!(
+            self,
+            "✓ 已删除 {} 个对话节点{}（可用 `undo` 撤销）",
+            removed.len(),
+            if ann_removed > 0 { format!("、{ann_removed} 条批注") } else { String::new() }
+        );
         Ok(())
     }
 
@@ -1926,7 +1986,7 @@ PaperHelper 命令：
         let mut q_final = String::new();
         if let Some(qt) = quote {
             if !qt.trim().is_empty() {
-                q_final.push_str("【用户选中的笔记原文】\n");
+                q_final.push_str("【用户选中的原文】\n");
                 q_final.push_str(qt.trim());
                 q_final.push_str("\n【问题】\n");
             }

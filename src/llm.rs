@@ -80,6 +80,9 @@ struct Choice {
 #[derive(Deserialize)]
 struct Delta {
     content: Option<String>,
+    /// 部分推理模型（如 DeepSeek/paratera）在流里单独回传思考过程。
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +267,7 @@ pub async fn chat(
     json_mode: bool,
     thinking: bool,
     on_token: &mut impl FnMut(&str),
+    on_reasoning: Option<&mut (dyn FnMut(&str) + Send)>,
 ) -> Result<LlmResult> {
     let started = std::time::Instant::now();
     logging::info(format!(
@@ -300,6 +304,7 @@ pub async fn chat(
     let mut usage: Option<Usage> = None;
     let mut finish_reason: Option<String> = None;
     let mut buf = String::new();
+    let mut on_reasoning = on_reasoning;
     let mut stream = resp.bytes_stream();
     loop {
         if interrupt::is_interrupted() {
@@ -338,6 +343,13 @@ pub async fn chat(
                         finish_reason = Some(fr);
                     }
                     if let Some(d) = ch.delta {
+                        if let Some(r) = d.reasoning_content {
+                            if !r.is_empty() {
+                                if let Some(cb) = on_reasoning.as_deref_mut() {
+                                    cb(&r);
+                                }
+                            }
+                        }
                         if let Some(t) = d.content {
                             if !t.is_empty() {
                                 on_token(&t);
@@ -520,5 +532,22 @@ mod tests {
     fn normal_error_is_not_treated_as_interrupt() {
         let e = anyhow::anyhow!("普通错误");
         assert!(!is_interrupted_error(&e));
+    }
+
+    #[test]
+    fn chunk_parses_reasoning_content_and_plain_content() {
+        // 推理模型：同一帧里可能只有 reasoning_content（还没有正文）
+        let raw = r#"{"choices":[{"delta":{"reasoning_content":"先想一下","content":null},"finish_reason":null}]}"#;
+        let ch: Chunk = serde_json::from_str(raw).unwrap();
+        let d = ch.choices[0].delta.as_ref().unwrap();
+        assert_eq!(d.reasoning_content.as_deref(), Some("先想一下"));
+        assert!(d.content.is_none());
+
+        // 普通模型/普通帧：没有 reasoning_content 字段也能解析
+        let raw2 = r#"{"choices":[{"delta":{"content":"答"},"finish_reason":"stop"}]}"#;
+        let ch2: Chunk = serde_json::from_str(raw2).unwrap();
+        let d2 = ch2.choices[0].delta.as_ref().unwrap();
+        assert_eq!(d2.content.as_deref(), Some("答"));
+        assert!(d2.reasoning_content.is_none());
     }
 }
