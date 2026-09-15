@@ -18,6 +18,10 @@ pub struct ConvNode {
     pub id: String,
     pub parent: Option<String>,
     pub question: String,
+    /// 提问时引用的原文/回答片段（笔记或回答批注的选中文字），
+    /// 让回看时能看出“问的是哪一段”。
+    #[serde(default)]
+    pub quote: Option<String>,
     pub answer: String,
     #[serde(default)]
     pub block_id: Option<String>,
@@ -167,6 +171,12 @@ impl Conversation {
                 String::new()
             };
             out.push_str(&format!("{}[{}] {}{}{}\n", head, n_num, node.label, mark, tok));
+            if let Some(q) = &node.quote {
+                let q: String = q.chars().take(40).collect();
+                if !q.trim().is_empty() {
+                    out.push_str(&format!("{}      ↳ 针对：{}\n", head, q.trim()));
+                }
+            }
             // 下一层前缀：本层若不是最后一个孩子，则画竖线；否则留空
             let child_entry: &'static str = if is_last { "    " } else { "│   " };
             prefix.push(child_entry);
@@ -240,6 +250,7 @@ mod tests {
             id: id.into(),
             parent: parent.map(String::from),
             question: format!("Q{id}"),
+            quote: None,
             answer: format!("A{id}"),
             block_id: None,
             explanation_id: None,

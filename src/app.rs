@@ -814,6 +814,7 @@ PaperHelper 命令：
         if let Some(id) = rest.strip_prefix("show ") {
             let (meta, prompt) = crate::prompts::style_prompt(id.trim())?;
             outln!(self, "# {}（{}） scope={}\n{}", meta.id, meta.label, meta.scope, prompt);
+            outln!(self, "（固定的输出格式要求由程序自动附加，不在此显示）");
             return Ok(());
         }
         let styles = crate::prompts::list_styles()?;
@@ -984,8 +985,8 @@ PaperHelper 命令：
         if !budget_ok {
             bail!("已达 token 预算，无法继续。用 `budget <n>` 调整。");
         }
-        // 提示词模板：按风格查注册表（styles.toml + styles/<id>.txt），{raw_text} 为占位符
-        let (meta, template) = crate::prompts::style_prompt(&style)?;
+        // 风格查注册表（styles.toml + styles/<id>.txt）；固定输出契约由程序自动前置
+        let (meta, _template) = crate::prompts::style_prompt(&style)?;
         crate::logging::info(format!(
             "生成笔记：风格={}（{}），scope={}",
             meta.id, meta.label, meta.scope
@@ -1002,10 +1003,7 @@ PaperHelper 命令：
                 }
             }
         };
-        let mut prompt = template.replace("{raw_text}", &raw_text);
-        if !extra.trim().is_empty() {
-            prompt.push_str(&format!("\n\n【本次额外要求】\n{}", extra.trim()));
-        }
+        let prompt = crate::prompts::compose_style_prompt(&style, &raw_text, &extra)?;
         let msgs = vec![
             Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
             Message { role: "user".into(), content: prompt },
@@ -1027,7 +1025,10 @@ PaperHelper 命令：
                 }
                 first_token = false;
             }
+            // 流式笔记文本：CLI 直接打印，Web 送到「笔记区」的生成中预览
+            emitter.token(t);
             if web {
+                // 同时节流上报总字数，供顶部进度条显示
                 let n = t.chars().count() as u64;
                 gen_chars += n;
                 pending_chars += n;
@@ -1036,15 +1037,8 @@ PaperHelper 命令：
                     pending_chars = 0;
                     last_emit = std::time::Instant::now();
                 }
-            } else {
-                emitter.token(t);
             }
-        }, Some(&mut |r| {
-            // Web 导入时思考过程不进控制台（顶部有进度与计时）；CLI 暗色打印
-            if !web {
-                emitter.reasoning(r);
-            }
-        })).await;
+        }, Some(&mut |r| emitter.reasoning(r))).await;
         if web {
             emitter.chars(gen_chars);
         }
@@ -1161,6 +1155,7 @@ PaperHelper 命令：
             id: root_id.clone(),
             parent: None,
             question: format!("（已导入《{}》，{} 个结构块）", title, nblocks),
+            quote: None,
             answer: String::new(),
             block_id: None,
             explanation_id: None,
@@ -1217,7 +1212,7 @@ PaperHelper 命令：
     ///    （进度条+实时打印，Ctrl-C 可打断，token 精确统计）；
     /// 3. 回答写入会话：定位 explanation 父（当前对话节点的 explanation_id），
     ///    在笔记树对应位置插入/嵌套 Explanation，block_id/explanation_id 落到新对话节点；
-    /// 4. 回答自动提取概念（`extract_concept`，解析 [[概念: …]] 或按问题名兜底）
+    /// 4. 回答自动提取概念（`extract_concept`，只认模型标注的 [[概念: …]]）
     ///    存入知识库；自动导出笔记到 export_path。
     async fn cmd_ask(&mut self, args: &str) -> Result<()> {
         let args = args.trim();
@@ -1229,9 +1224,17 @@ PaperHelper 命令：
             outln!(self, "例:");
             outln!(self, "  ask 3.2 BERTScore的公式里max_k是什么意思");
             outln!(self, "  ask 2.1 灰盒方法为什么对黑盒不适用");
+            outln!(self, "  ask --no-concept 3.2 这里的符号指什么   （本次不写入「已学概念」）");
             outln!(self, "说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
             return Ok(());
         }
+        // `--no-concept`：本次回答不写入「已学概念」（适合“这段什么意思”这类操作性提问）
+        let (record_concept, args) = if let Some(rest) = strip_flag(args, "--no-concept") {
+            (false, rest)
+        } else {
+            (true, args.to_string())
+        };
+        let args = args.trim();
         let (block_num, question) = parse_ask_args(args);
         let question = question.trim();
         if question.is_empty() {
@@ -1244,7 +1247,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, false, None).await?;
+        self.ask_core(question, block_id, false, None, record_concept).await?;
         Ok(())
     }
 
@@ -1270,7 +1273,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, true, None).await?;
+        self.ask_core(question, block_id, true, None, false).await?;
         Ok(())
     }
 
@@ -1294,6 +1297,7 @@ PaperHelper 命令：
         block_id: Option<String>,
         is_check: bool,
         quote: Option<&str>,
+        record_concept: bool,
     ) -> Result<(String, Option<String>)> {
         interrupt::reset();
         let budget_ok = self.check_budget()?;
@@ -1328,7 +1332,9 @@ PaperHelper 命令：
         self.emitter.stdout("");
 
         self.record_usage(res.input_tokens, res.output_tokens);
-        let (clean_answer, concept_name) = extract_concept(&res.content, question);
+        let (clean_answer, concept) = extract_concept(&res.content);
+        // 节点标题：模型给出了概念就用它，否则用问题前若干字（仅作显示）
+        let concept_label = concept.clone().unwrap_or_else(|| derive_concept(question));
         let now = Utc::now().to_rfc3339();
 
         let mut explanation_id: Option<String> = None;
@@ -1350,7 +1356,7 @@ PaperHelper 命令：
                             id: expl_id.clone(),
                             question: question.to_string(),
                             answer: clean_answer.clone(),
-                            concept: concept_name.clone(),
+                            concept: concept_label.clone(),
                             created_at: now.clone(),
                             children: Vec::new(),
                             summary: None,
@@ -1376,7 +1382,7 @@ PaperHelper 命令：
                                 id: expl_id.clone(),
                                 question: question.to_string(),
                                 answer: clean_answer.clone(),
-                                concept: concept_name.clone(),
+                                concept: concept_label.clone(),
                                 created_at: now.clone(),
                                 children: Vec::new(),
                                 summary: None,
@@ -1388,23 +1394,25 @@ PaperHelper 命令：
             }
             explanation_id = Some(expl_id);
 
-            // 加入知识库概念
-            let (pid, ptitle) = self
-                .session
-                .current_paper_id
-                .clone()
-                .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
-                .unwrap_or_default();
-            self.kb.add_concept(Concept {
-                name: concept_name.clone(),
-                definition: clean_answer.chars().take(200).collect(),
-                paper_id: pid,
-                paper_title: ptitle,
-                block_id: if is_nested { None } else { block_id.clone() },
-                created_at: now.clone(),
-                pinned: false,
-            });
-            self.kb.save()?;
+            // 加入知识库概念：只在用户允许、且模型明确标注了知识点时记录
+            if let (true, Some(concept_name)) = (record_concept, concept.as_ref()) {
+                let (pid, ptitle) = self
+                    .session
+                    .current_paper_id
+                    .clone()
+                    .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
+                    .unwrap_or_default();
+                self.kb.add_concept(Concept {
+                    name: concept_name.clone(),
+                    definition: clean_answer.chars().take(200).collect(),
+                    paper_id: pid,
+                    paper_title: ptitle,
+                    block_id: if is_nested { None } else { block_id.clone() },
+                    created_at: now.clone(),
+                    pinned: false,
+                });
+                self.kb.save()?;
+            }
 
             // 自动同步导出
             self.sync_export(block_id_for_hint.as_deref())?;
@@ -1417,6 +1425,7 @@ PaperHelper 命令：
             id: node_id.clone(),
             parent,
             question: question.to_string(),
+            quote: quote.map(|s| s.to_string()),
             answer: clean_answer.clone(),
             block_id: if is_check || is_nested { None } else { block_id.clone() },
             explanation_id: explanation_id.clone(),
@@ -1425,7 +1434,7 @@ PaperHelper 命令：
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
                 + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
             created_at: now.clone(),
-            label: if is_check { format!("[核对] {}", concept_name) } else { concept_name.clone() },
+            label: if is_check { format!("[核对] {}", concept_label) } else { concept_label.clone() },
         });
         self.session.conversation.current = Some(node_id.clone());
 
@@ -1671,6 +1680,49 @@ PaperHelper 命令：
         Ok(vec![Message { role: "user".into(), content: prompt }])
     }
 
+    /// 「按风格重写全文」的提示词：以论文原文（若有）或当前笔记为素材，
+    /// 套用所选笔记风格（程序会自动前置固定输出契约）。
+    pub fn restyle_messages(&self, style: &str, extra: &str) -> Result<Vec<Message>> {
+        let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
+        let material = if note.raw_text.trim().is_empty() {
+            note.to_markdown()
+        } else {
+            note.raw_text.clone()
+        };
+        let prompt = crate::prompts::compose_style_prompt(style, &material, extra)?;
+        Ok(vec![
+            Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
+            Message { role: "user".into(), content: prompt },
+        ])
+    }
+
+    /// 用「按风格重写」的结果替换整篇笔记（重建全部块 id）。
+    /// 会清空现有批注（块锚点已失效），并入撤销栈供「撤销」恢复。
+    pub fn apply_restyle(&mut self, markdown: &str) -> Result<()> {
+        if markdown.trim().is_empty() {
+            bail!("内容为空");
+        }
+        let Some(old) = self.session.notes.as_ref() else {
+            bail!("还没有笔记");
+        };
+        let raw_text = old.raw_text.clone();
+        let paper_id = old.paper_id.clone();
+        let material_kind = old.material_kind.clone();
+        let math_macros = old.math_macros.clone();
+        self.push_undo();
+        let mut note = notes::parse_markdown_note(markdown, &raw_text);
+        note.paper_id = paper_id;
+        note.material_kind = material_kind;
+        if note.math_macros.is_none() && math_macros.is_some() {
+            note.math_macros = math_macros;
+        }
+        self.session.annotations.clear(); // 旧批注锚定在旧块上，整篇重建后失效
+        self.session.notes = Some(note);
+        self.update_completions();
+        self.after_note_change();
+        Ok(())
+    }
+
     /// 新建批注（Web）：在 block_id 处针对选中文字提问，作为独立线程的根节点。
     /// 返回 `(批注 id, 根节点 id, 解释 id 或 None)`。
     pub async fn annotate(
@@ -1680,6 +1732,7 @@ PaperHelper 命令：
         quote_tex: Option<&str>,
         question: &str,
         is_check: bool,
+        record_concept: bool,
     ) -> Result<(String, String, Option<String>)> {
         // 全文提问：block_id 用哨兵 __title__，解释挂到首个块（保证追问嵌套），
         // 但批注仍记录 __title__ 供前端高亮标题。
@@ -1707,7 +1760,8 @@ PaperHelper 命令：
         self.session.conversation.current = None; // 独立线程：新根
         // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
         let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
-        let (node_id, expl_id) = match self.ask_core(question, insert_block, is_check, Some(ctx)).await {
+        let (node_id, expl_id) =
+            match self.ask_core(question, insert_block, is_check, Some(ctx), record_concept).await {
             Ok(v) => v,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -1733,6 +1787,7 @@ PaperHelper 命令：
         node_id: &str,
         question: &str,
         is_check: bool,
+        record_concept: bool,
     ) -> Result<(String, Option<String>)> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
@@ -1740,7 +1795,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let res = self.ask_core(question, fallback_block, is_check, None).await;
+        let res = self.ask_core(question, fallback_block, is_check, None, record_concept).await;
         if res.is_err() {
             self.session.conversation.current = saved;
         }
@@ -1757,6 +1812,7 @@ PaperHelper 命令：
         quote_tex: Option<&str>,
         question: &str,
         is_check: bool,
+        record_concept: bool,
     ) -> Result<(String, String)> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
@@ -1766,14 +1822,16 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let (new_id, _expl) =
-            match self.ask_core(question, fallback_block, is_check, Some(ctx)).await {
-                Ok(v) => v,
-                Err(e) => {
-                    self.session.conversation.current = saved;
-                    return Err(e);
-                }
-            };
+        let (new_id, _expl) = match self
+            .ask_core(question, fallback_block, is_check, Some(ctx), record_concept)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.session.conversation.current = saved;
+                return Err(e);
+            }
+        };
         let ann_id = uuid::Uuid::new_v4().to_string();
         self.session.annotations.push(Annotation {
             id: ann_id.clone(),
@@ -2303,6 +2361,17 @@ fn take_bool_arg(rest: &str, name: &str) -> (bool, String) {
     (found, out.join(" "))
 }
 
+/// 从参数串里去掉一个布尔开关（任意位置，支持引号），返回剩余参数；
+/// 没有该开关时返回 None。用于 `ask --no-concept` 这类可选项。
+fn strip_flag(rest: &str, flag: &str) -> Option<String> {
+    let toks = split_args_quoted(rest);
+    if !toks.iter().any(|t| t == flag) {
+        return None;
+    }
+    let out: Vec<String> = toks.into_iter().filter(|t| t != flag).collect();
+    Some(out.join(" "))
+}
+
 /// 收集块及其全部子块的 id（删除块后清理相关批注用）。
 fn collect_block_ids(b: &notes::Block, out: &mut Vec<String>) {
     out.push(b.id.clone());
@@ -2368,10 +2437,11 @@ fn derive_concept(q: &str) -> String {
 }
 
 /// 从 LLM 回答末尾解析 [[概念: XXX]] 行，返回 (去掉该行的正文, 概念名)。
-/// 若未找到概念行，concept 用 derive_concept(question) 兜底。
-fn extract_concept(content: &str, question: &str) -> (String, String) {
+/// 模型没标注（或标注为空）时返回 `None`：**不再用问题文本兜底**，
+/// 避免把“这段什么意思”这类非知识点提问也记成“已学概念”。
+fn extract_concept(content: &str) -> (String, Option<String>) {
     // 找最后一行含 [[概念: ...]] 的
-    let mut concept = None;
+    let mut concept: Option<String> = None;
     let mut clean_lines = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -2385,7 +2455,6 @@ fn extract_concept(content: &str, question: &str) -> (String, String) {
         clean_lines.push(line);
     }
     let clean_answer = clean_lines.join("\n").trim_end().to_string();
-    let concept = concept.unwrap_or_else(|| derive_concept(question));
     (clean_answer, concept)
 }
 
@@ -2402,7 +2471,7 @@ pub fn mask_key(k: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_concept, normalize_path_arg, take_bool_arg, take_style_arg, take_value_arg,
+        extract_concept, normalize_path_arg, strip_flag, take_bool_arg, take_style_arg, take_value_arg,
         CommandCompleter,
     };
     use rustyline::completion::Completer;
@@ -2451,17 +2520,25 @@ mod tests {
     #[test]
     fn extract_concept_from_answer() {
         let content = "BERTScore是相似度指标。\n\n[[概念: BERTScore]]";
-        let (clean, concept) = extract_concept(content, "什么是BERTScore");
+        let (clean, concept) = extract_concept(content);
         assert!(!clean.contains("[[概念"), "clean 应去掉概念行: {clean}");
-        assert_eq!(concept, "BERTScore");
+        assert_eq!(concept.as_deref(), Some("BERTScore"));
     }
 
     #[test]
-    fn extract_concept_fallback() {
+    fn extract_concept_without_marker_is_none() {
+        // 没有 [[概念: …]] 时不再用问题文本兜底（“这段什么意思”不该成为已学概念）
         let content = "这个方法叫注意力机制。";
-        let (clean, concept) = extract_concept(content, "注意力机制是什么");
+        let (clean, concept) = extract_concept(content);
         assert_eq!(clean, content);
-        assert!(!concept.is_empty());
+        assert!(concept.is_none());
+    }
+
+    #[test]
+    fn strip_flag_removes_option() {
+        assert_eq!(strip_flag("3.2 什么是X --no-concept", "--no-concept").as_deref(), Some("3.2 什么是X"));
+        assert_eq!(strip_flag("--no-concept 什么是X", "--no-concept").as_deref(), Some("什么是X"));
+        assert!(strip_flag("3.2 什么是X", "--no-concept").is_none());
     }
 
     fn make_completer() -> CommandCompleter {

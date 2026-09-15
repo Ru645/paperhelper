@@ -73,6 +73,20 @@
     <div class="panes" id="panes">
       <div id="pane-note" class="pane active" data-key="note">
         <iframe id="note-frame" src="/api/note?format=html" title="笔记"></iframe>
+        <!-- 导入/生成笔记时的实时反馈（阶段、思考过程、流式笔记文本） -->
+        <div id="note-gen" class="note-gen hidden">
+          <div class="ng-head">
+            <span class="ng-title" id="note-gen-title">正在生成笔记…</span>
+            <span class="ng-meta" id="note-gen-meta"></span>
+            <button id="note-gen-stop" class="mini ghost">⏹ 停止</button>
+          </div>
+          <div id="note-gen-log" class="ng-log"></div>
+          <details id="note-gen-reasoning" class="reasoning hidden">
+            <summary>思考过程</summary>
+            <div id="note-gen-reasoning-text" class="reasoning-text"></div>
+          </details>
+          <pre id="note-gen-stream" class="note-gen-stream"></pre>
+        </div>
         <div id="note-empty" class="note-empty hidden">
           <div class="ne-icon">▤</div>
           <h2>还没有笔记</h2>
@@ -111,18 +125,33 @@
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>
   <div id="ann-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
-  <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div></details>
+  <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div><div class="reasoning-resize" data-target="ann-reasoning-text" title="拖动调整思考区高度"></div></details>
   <div class="ann-thread" id="ann-thread"></div>
   <div id="ann-input-resize" class="ann-input-resize" title="拖动调整输入栏高度"></div>
   <div class="ann-input">
+    <div id="ann-subquote" class="ann-subquote hidden">
+      <span class="ann-subquote-label">引用</span>
+      <span id="ann-subquote-text" class="ann-subquote-text"></span>
+      <button id="ann-subquote-clear" class="mini ghost" title="不引用这段">×</button>
+    </div>
     <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
     <div class="ann-input-row">
       <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
+      <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
+        <input type="checkbox" id="ann-record" checked> 记概念
+      </label>
       <span class="ann-input-spacer"></span>
       <button id="ann-send" class="mini primary">发送</button>
     </div>
   </div>
-  <div id="ann-resize" class="ann-resize" title="拖动调整弹窗大小"></div>
+  <div class="ann-rz n" data-dir="n"></div>
+  <div class="ann-rz s" data-dir="s"></div>
+  <div class="ann-rz e" data-dir="e"></div>
+  <div class="ann-rz w" data-dir="w"></div>
+  <div class="ann-rz ne" data-dir="ne"></div>
+  <div class="ann-rz nw" data-dir="nw"></div>
+  <div class="ann-rz se" data-dir="se" title="拖动调整大小（双击恢复默认）"></div>
+  <div class="ann-rz sw" data-dir="sw"></div>
 </div>
 
 <!-- 导入：论文生成笔记 / 笔记·讲义导入（风格可选，支持临时额外要求） -->
@@ -159,11 +188,12 @@
 <div id="styles-modal" class="modal hidden">
   <div class="modal-box styles-box">
     <h2>笔记风格管理</h2>
-    <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除；文件在 <code>.paperhelper/styles/</code>。</p>
+    <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除、可改 id（会同时改文件名）；文件在 <code>.paperhelper/styles/</code>。</p>
+    <p class="muted">下面只填「内容与结构」要求即可：<b>格式要求（<code>#</code> 标题、<code>##</code> 分节、<code>$公式$</code>、Markdown 表格等）由程序自动附加，不用也不应写在这里</b>。</p>
     <div class="styles-layout">
       <div class="styles-list" id="styles-list"></div>
       <div class="styles-edit">
-        <label>id（文件名，创建后不可改）<input id="style-id" type="text" placeholder="my-style"></label>
+        <label>id（文件名；自定义风格可改，内置固定）<input id="style-id" type="text" placeholder="my-style"></label>
         <label>名称<input id="style-label" type="text" placeholder="我的风格"></label>
         <label>说明<input id="style-desc" type="text" placeholder="一句话说明这个风格生成什么笔记"></label>
         <label>适用
@@ -198,6 +228,10 @@
       <button class="edit-tab active" data-mode="manual">手动编辑</button>
       <button class="edit-tab" data-mode="rewrite">AI 重写</button>
       <button class="edit-tab" data-mode="append">AI 补充</button>
+      <button class="edit-tab hidden" data-mode="restyle" id="edit-tab-restyle">按风格重写全文</button>
+    </div>
+    <div id="edit-style-row" class="edit-ai-row hidden">
+      <select id="edit-style" title="按该笔记风格重写整篇"></select>
     </div>
     <div id="edit-ai-row" class="edit-ai-row hidden">
       <input id="edit-instruction" type="text" placeholder="告诉 AI 怎么改，如：补充这个方法的直觉解释 / 重写得更有条理" autocomplete="off">
@@ -205,7 +239,7 @@
       <button id="btn-edit-stop" class="mini ghost hidden">停止</button>
     </div>
     <div id="edit-ai-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
-    <details id="edit-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="edit-reasoning-text" class="reasoning-text"></div></details>
+    <details id="edit-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="edit-reasoning-text" class="reasoning-text"></div><div class="reasoning-resize" data-target="edit-reasoning-text" title="拖动调整思考区高度"></div></details>
     <textarea id="edit-text" rows="14" placeholder="支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节"></textarea>
     <div class="edit-tools">
       <button id="btn-edit-insert" class="mini ghost">插入到该块后</button>
@@ -250,13 +284,14 @@
       <li><b>论文 / 讲义模式</b>：论文走「论文 → 生成笔记」；自己的笔记或课程讲义走「笔记 / 讲义 → 导入」，可「原样导入（不调模型、0 token）」或选一种风格生成。</li>
       <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「管理…」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
       <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除；MathJax 的 <code>\newcommand</code> 宏定义会自动注册，公式里的自定义宏也能渲染）。</li>
-      <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。所有编辑/删除都能用顶栏「撤销」回退。</li>
+      <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。编辑**主标题**时多一个「按风格重写全文」：选一种笔记风格（可加额外要求）让 AI 重写整篇（会重建块 id、清空批注，可用「撤销」恢复）。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
-      <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。</li>
+      <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。选区不会被清掉，输入框上方还有「引用」附件条显示这次问的是哪一段；「记概念」勾选框可决定是否把知识点写进「已学概念」。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
-      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动、右下角拖拽缩放（尺寸记忆，无上限；双击把手恢复默认），输入栏在底部、可拖上缘调整高度。</li>
+      <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动，<b>四条边 + 四个角</b>都能拖拽缩放（尺寸记忆、无上限；双击把手恢复默认），输入栏在底部、可拖上缘调整高度，「思考过程」区也可拖下缘调高度。</li>
       <li><b>进度与思考</b>：等待模型时显示上下文规模与计时；推理模型的思考过程会流式显示在「思考过程」折叠区。</li>
+      <li><b>导入反馈在笔记区</b>：导入/生成笔记时不再刷控制台——「笔记」页会实时显示阶段（解析 PDF / 文本已就绪 / 生成中）、思考过程与正在生成的笔记文本；控制台只在出错时自动打开。</li>
       <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>
       <li><b>配置</b>：点「配置」修改 API 端点/密钥/模型/价格/预算。</li>

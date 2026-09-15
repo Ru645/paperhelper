@@ -190,6 +190,25 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .panes { flex: 1; min-height: 0; display: flex; }
 .pane { flex: 1; min-height: 0; display: none; }
 .pane.active { display: flex; }
+#pane-note { position: relative; }
+/* 导入/生成笔记的实时反馈层（覆盖笔记区：阶段 + 思考过程 + 流式文本） */
+.note-gen {
+  position: absolute; inset: 0; z-index: 5; background: #fff;
+  display: flex; flex-direction: column; gap: 8px; padding: 18px 22px; overflow: hidden;
+}
+.note-gen.hidden { display: none; }
+.note-gen .ng-head { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.note-gen .ng-title { font-size: 15px; font-weight: 600; color: #333; }
+.note-gen .ng-meta { font-size: 13px; color: var(--muted); flex: 1; }
+.note-gen .ng-log { flex: 0 0 auto; font-size: 12.5px; color: #555; }
+.note-gen .ng-log div { margin: 2px 0; }
+.note-gen .ng-log .err { color: var(--danger); }
+.note-gen-stream {
+  flex: 1; min-height: 0; overflow-y: auto; margin: 0; padding: 12px 14px;
+  background: #fafafa; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: #333;
+}
 #note-frame { flex: 1; border: none; width: 100%; background: #fff; }
 #note-frame.hidden { display: none; }
 
@@ -425,6 +444,12 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .ann-node.selected { border-left-color: var(--blue); background: var(--blue-light); }
 .ann-node.check { border-left-color: #f59e0b; }
 .ann-q { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+/* 节点引文：提问针对的原文/回答片段 */
+.ann-q-quote {
+  font-size: 11px; color: #8a6d3b; background: #fffbea; border-left: 2px solid #f0d58c;
+  padding: 2px 6px; margin-bottom: 4px; border-radius: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .ann-a { font-size: 13px; line-height: 1.6; color: #333; }
 .ann-a p { margin: 4px 0; }
 .ann-a .katex-display { overflow-x: auto; overflow-y: hidden; }
@@ -449,21 +474,50 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .ann-input textarea:focus { outline: none; border-color: var(--blue); }
 /* 按钮都放底边：ask 靠左，发送靠右，宽度全让给输入框 */
 .ann-input-row { display: flex; align-items: center; gap: 6px; }
+.ann-opt {
+  display: flex; align-items: center; gap: 4px; font-size: 12px;
+  color: #666; cursor: pointer; user-select: none; white-space: nowrap;
+}
+.ann-opt input { margin: 0; }
+/* 「记概念」开关 */
+.ann-opt {
+  display: flex; align-items: center; gap: 4px; font-size: 12px;
+  color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap;
+}
+.ann-opt input { margin: 0; }
 .ann-input-spacer { flex: 1; }
+/* 引用附件条：提问所针对的选中文字（保留选区不便时，用它展示上下文） */
+.ann-subquote {
+  display: flex; align-items: center; gap: 6px; padding: 4px 8px;
+  background: #fffbea; border: 1px solid #f0d58c; border-radius: 6px;
+  font-size: 12px; color: #8a6d3b;
+}
+.ann-subquote.hidden { display: none; }
+.ann-subquote-label { flex: 0 0 auto; opacity: .75; }
+.ann-subquote-text {
+  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* 拖拽期间：禁止选中、禁掉笔记 iframe 抢指针（否则会丢 pointerup） */
 body.dragging { user-select: none; }
 body.dragging #note-frame { pointer-events: none; }
-/* 右下角缩放把手 */
-.ann-resize {
-  position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;
-  cursor: nwse-resize; touch-action: none; z-index: 2;
-}
-.ann-resize::after {
+/* 八向缩放把手：四条边 + 四个角（无上限，可超出视口再拖回来） */
+.ann-rz { position: absolute; z-index: 3; touch-action: none; }
+.ann-rz.n { top: -3px; left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
+.ann-rz.s { bottom: -3px; left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
+.ann-rz.e { right: -3px; top: 10px; bottom: 10px; width: 8px; cursor: ew-resize; }
+.ann-rz.w { left: -3px; top: 10px; bottom: 10px; width: 8px; cursor: ew-resize; }
+.ann-rz.ne { top: -3px; right: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+.ann-rz.nw { top: -3px; left: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.ann-rz.se { bottom: -3px; right: -3px; width: 15px; height: 15px; cursor: nwse-resize; }
+.ann-rz.sw { bottom: -3px; left: -3px; width: 15px; height: 15px; cursor: nesw-resize; }
+/* 右下角给一个可见的斜纹提示 */
+.ann-rz.se::after {
   content: ""; position: absolute; right: 3px; bottom: 3px; width: 9px; height: 9px;
   border-right: 2px solid var(--line); border-bottom: 2px solid var(--line);
   border-bottom-right-radius: 3px;
+  pointer-events: none;
 }
-.ann-resize:hover::after { border-color: var(--blue); }
+.ann-rz.se:hover::after { border-color: var(--blue); }
 .ann-popup.resizing { box-shadow: 0 16px 54px rgba(0,0,0,.34); }
 #ann-mode.check { background: #f59e0b; color: #fff; border-color: #f59e0b; }
 
@@ -506,10 +560,17 @@ mark.ann-mark:hover { background: #ffe066; }
 .reasoning.hidden { display: none; }
 .reasoning summary { cursor: pointer; color: var(--blue); user-select: none; }
 .reasoning-text {
-  max-height: 120px; overflow-y: auto; margin-top: 4px; padding: 6px 8px;
+  height: 120px; box-sizing: border-box; overflow-y: auto; margin-top: 4px; padding: 6px 8px;
   background: #f7f7f8; border-radius: 6px; white-space: pre-wrap; word-break: break-word;
   font-size: 12px; line-height: 1.5;
 }
+/* 思考区高度拖动条 */
+.reasoning-resize { height: 7px; cursor: row-resize; touch-action: none; position: relative; }
+.reasoning-resize::after {
+  content: ""; position: absolute; left: 50%; top: 3px; width: 36px; height: 2px;
+  margin-left: -18px; background: var(--line); border-radius: 2px;
+}
+.reasoning-resize:hover::after { background: var(--blue); }
 .ann-node.pending { border-left-color: var(--muted); opacity: .9; }
 .ann-node.pending .ann-a { color: var(--muted); }
 

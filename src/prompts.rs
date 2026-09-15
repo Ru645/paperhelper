@@ -36,6 +36,13 @@ pub fn ensure_prompt_files() -> Result<()> {
             fs::write(&p, content)?;
         }
     }
+    // ask.txt：如果内容还是旧版默认（用户没改过），升级为“按需标注概念”的新版
+    let ask = dir.join("ask.txt");
+    if let Ok(cur) = fs::read_to_string(&ask) {
+        if cur.trim() == LEGACY_ASK_PROMPT.trim() {
+            let _ = fs::write(&ask, DEFAULT_ASK_PROMPT);
+        }
+    }
     Ok(())
 }
 
@@ -52,22 +59,26 @@ pub const DEFAULT_ASK_PROMPT: &str = "你是一位耐心的学习助手（适用
 
 **数学公式必须用定界符包裹**：行内公式（变量、下标/上标、符号、希腊字母、LaTeX 命令）一律写成 `$...$`，如 `$p_{ij}$`、`$S_n$`、`$\\tilde p_{ij}$`；行间公式写成 `$$...$$`。不要写裸的 `p_ij` 或 `\\sum`。
 
+当这次回答确实围绕一个**明确的知识点/概念**时（如 BERTScore、语义熵、NP 完全），在末尾另起一行写 [[概念: 概念名]]，概念名是 1-8 个词的短语；如果只是操作性/指代性提问（如「这段是什么意思」「这里的符号指什么」），**不要**写这一行。";
+
+/// 旧版 ask.txt 的默认内容：仅用于 `ensure_prompt_files` 判断用户是否改过，
+/// 没改过就自动升级成新版（“按需标注概念”）。
+const LEGACY_ASK_PROMPT: &str = "你是一位耐心的学习助手（适用于论文、课程讲义等资料）。用户会给你一份资料的原文（可能没有）、已生成的结构化笔记，以及（可能的）历史问答。请基于这些回答用户问题，简洁清晰（300字以内），尽量和笔记的章节结构对齐。若涉及已学概念，点明它们的联系。
+
+**数学公式必须用定界符包裹**：行内公式（变量、下标/上标、符号、希腊字母、LaTeX 命令）一律写成 `$...$`，如 `$p_{ij}$`、`$S_n$`、`$\\tilde p_{ij}$`；行间公式写成 `$$...$$`。不要写裸的 `p_ij` 或 `\\sum`。
+
 回答完毕后，另起一行写 [[概念: 概念名]]，概念名是1-8个词的短语，概括本次问答涉及的核心知识点（如\"BERTScore\"、\"MQAG框架\"、\"语义熵\"）。";
 
 /// 笔记生成模板：{raw_text} 会被替换为论文全文。
 pub const DEFAULT_NOTE_PROMPT: &str = r#"请阅读以下论文全文，生成一份**详细**的学习笔记 Markdown，遵循固定四段架构。
 
 架构与分块规则：
-- 第一行 `# 论文标题`。
 - 用四个一级章节 `## 一、要解决的问题` `## 二、前人方案及其不足` `## 三、本文方案及其优点` `## 四、前景与发展方向`。
 - 每个一级章节下，用 `###` 三级小标题细分。例如：
   - 「二、前人方案」下，每个前人方案一个 `###` 小标题，说清做法与不足；
   - 「三、本文方案」下，若论文提出多个方案/变体（如 5 种变体），**每个变体单独一个 `###` 小标题**，详细说明做法、公式、数据、直觉、优缺点；
   - 「四、前景」下，每个方向一个 `###` 小标题。
-- 每个 `###` 小标题下的内容（含多段落、公式、表格）合并为一块，不要为每句话单独成块。
-- **所有数学都必须用定界符包裹**：行内公式（变量、下标/上标、符号、希腊字母、LaTeX 命令）一律写成 `$...$`，例如 `$p_{ij}$`、`$S_n$`、`$s^n_k$`、`$\\tilde p_{ij}$`、`$\\sum_j$`、`$R$`、`$J$`；行间公式用 `$$...$$`。**绝不要**写成裸的 `p_ij`、`S_n` 或 `\\sum`。
-- 要详细：保留论文中的关键公式、数值结果、对比表格（用 markdown 表格）、算法步骤。不要泛泛概括，要展开具体内容。
-- 不要输出额外说明，直接给 Markdown。
+- 要详细：保留论文中的关键公式、数值结果、对比表格、算法步骤。不要泛泛概括，要展开具体内容。
 
 论文全文：
 {raw_text}"#;
@@ -76,11 +87,22 @@ pub const DEFAULT_NOTE_PROMPT: &str = r#"请阅读以下论文全文，生成一
 pub const DEFAULT_TRANSLATE_PROMPT: &str = r#"请把以下资料**忠实翻译**成中文，生成一份「原文照搬式」的笔记 Markdown。
 
 要求：
-- 第一行输出 `# 标题`（标题翻译成中文）。
-- 尽量忠实：逐段翻译，保留原文的章节结构、段落顺序与层级。原文的章节标题用 `##`/`###` 表示，不要合并、省略或重排。
-- 公式保持原样（行内 `$...$`、行间 `$$...$$`）；模型名、数据集名、指标名等专有名词保留英文。
-- 不要总结、不要发挥、不要添加原文没有的内容，也不要输出额外的说明文字。
-- 直接输出完整 Markdown。
+- 标题翻译成中文。
+- 尽量忠实：逐段翻译，保留原文的章节结构、段落顺序与层级，不要合并、省略或重排。
+- 模型名、数据集名、指标名等专有名词保留英文；公式本身不翻译。
+- 不要总结、不要发挥、不要添加原文没有的内容。
+
+资料全文：
+{raw_text}"#;
+
+/// 中英对照翻译模板。
+pub const DEFAULT_TRANSLATE_BI_PROMPT: &str = r#"请把以下资料**逐段翻译**成中文，生成一份「原文 + 译文」对照的 Markdown 笔记。
+
+要求：
+- 标题中英都写。
+- 保留原文的章节结构；每个段落先给原文、再给译文（译文用 `> ` 引用块，或另起一段，全文保持一致）。
+- 公式本身不翻译；专有名词保留英文（首次出现可在括号内注中文）。
+- 不要总结、不要发挥、不要添加原文没有的内容。
 
 资料全文：
 {raw_text}"#;
@@ -95,12 +117,9 @@ pub const DEFAULT_FREE_PROMPT: &str = r#"请阅读以下资料，生成一份你
 pub const DEFAULT_VERBATIM_PROMPT: &str = r#"请把以下资料整理成一份**忠实照抄式**的 Markdown 笔记：内容与顺序尽量保持原样，只做必要的结构化。
 
 要求：
-- 第一行输出 `# 标题`（优先用资料自身的标题；没有就用文件名的意思）。
-- 保留原文的章节结构：章节标题用 `##`/`###` 表示，不要合并、省略或重排；段落文字不删改、不总结、不发挥。
-- 所有数学公式都要用定界符包裹：行内 `$...$`、行间 `$$...$$`（原文若写成裸的 `p_ij`、`\sum` 也要补上）。
-- 表格转成 Markdown 表格；图表位置用一句话说明占位（如 `![图：…](图)`），不要凭空编造内容。
+- 保留原文的章节结构：不要合并、省略或重排；段落文字不删改、不总结、不发挥。
+- 图表位置用一句话说明占位（如 `![图：…](图)`），不要凭空编造内容。
 - 扫描/OCR 可能有错字：只修正明显的断行、连字符与乱码，不做语义改写。
-- 不要输出额外说明，直接给 Markdown。
 
 资料全文：
 {raw_text}"#;
@@ -109,28 +128,11 @@ pub const DEFAULT_VERBATIM_PROMPT: &str = r#"请把以下资料整理成一份**
 pub const DEFAULT_LECTURE_PROMPT: &str = r#"请阅读以下课程讲义/教学材料，生成一份**复习提纲式**的学习笔记 Markdown。
 
 要求：
-- 第一行 `# 讲义标题`（用材料标题或文件名的意思）。
 - 用 `##` 按**知识点/主题**分节（不要按页码分）；每个知识点下用 `###` 细分（定义、定理/公式、推导、例子、易错点），按材料实际内容取舍。
-- 每个 `###` 小标题下的内容（含多段落、公式、表格）合并为一块，不要为每句话单独成块。
 - 保留关键定义、定理、公式与推导、例题结论；省略寒暄、课程通知与重复内容。
-- 数学公式一律用 `$...$` / `$$...$$`；表格用 Markdown 表格。
 - 结尾加一节 `## 复习提纲`，用要点列出需要掌握的概念与题型。
-- 不要输出额外说明，直接给 Markdown。
 
 讲义全文：
-{raw_text}"#;
-
-/// 中英对照翻译模板。
-pub const DEFAULT_TRANSLATE_BI_PROMPT: &str = r#"请把以下资料**逐段翻译**成中文，生成一份「原文 + 译文」对照的 Markdown 笔记。
-
-要求：
-- 第一行输出 `# 标题`（中英标题都写）。
-- 保留原文的章节结构：章节标题用 `##`/`###`；每个段落先给原文、再给译文（译文用 `> ` 引用块，或另起一段，全文保持一致）。
-- 公式保持原样（行内 `$...$`、行间 `$$...$$`），公式本身不翻译。
-- 专有名词保留英文（首次出现可在括号内注中文）；不要总结、不要发挥、不要添加原文没有的内容。
-- 不要输出额外说明，直接给 Markdown。
-
-资料全文：
 {raw_text}"#;
 
 /// AI 改写 / 补充模板。占位符：{paper} {note} {target} {instruction} {task}
@@ -350,6 +352,31 @@ pub fn style_prompt_text(meta: &NoteStyle) -> String {
     text
 }
 
+/// **固定输出契约**：让笔记能被程序解析成树（标题层级、公式定界符等）。
+/// 由程序自动前置到每个风格提示词之前；UI 不展示、用户无需填写。
+pub const STYLE_CONTRACT: &str = "【输出格式（程序解析笔记所必需，必须严格遵守）】
+- 只输出 Markdown 正文；不要解释、前言、后记，不要用代码围栏包裹整篇。
+- 第一行必须是 `# 标题`（整篇笔记的标题）。
+- 章节标题用 `##`、子节用 `###`（可继续细分），不要跳级。
+- 行内公式用 `$...$`，行间公式用 `$$...$$`；表格用 Markdown 表格。
+- 每个标题与其下正文合并为一块，不要为每句话单独成行。
+
+";
+
+/// 组装完整的笔记生成提示词：固定契约 + 风格（用户可编辑部分）+ 额外要求 + 资料全文。
+/// 风格文件里若没有 `{raw_text}` 占位符，程序会在末尾补上资料全文。
+pub fn compose_style_prompt(style: &str, raw_text: &str, extra: &str) -> Result<String> {
+    let (_, body) = style_prompt(style)?;
+    let mut prompt = format!("{STYLE_CONTRACT}{body}");
+    if !body.contains("{raw_text}") {
+        prompt.push_str("\n\n资料全文：\n{raw_text}");
+    }
+    if !extra.trim().is_empty() {
+        prompt.push_str(&format!("\n\n【本次额外要求】\n{}", extra.trim()));
+    }
+    Ok(prompt.replace("{raw_text}", raw_text))
+}
+
 /// 风格 id 合法性：1~40 个 ASCII 字母/数字/`-`/`_`，且以字母或数字开头。
 pub fn valid_style_id(id: &str) -> bool {
     let id = id.trim();
@@ -410,6 +437,42 @@ pub fn save_style(meta: &NoteStyle, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+/// 重命名**自定义**风格：同步改 `<id>.txt` 文件名与清单里的 id/file。
+/// 内置风格的 id 固定（`--style four` 等示例与「恢复默认」依赖它），只能改名称/说明/提示词。
+pub fn rename_style(old_id: &str, new_id: &str) -> Result<()> {
+    let old_id = old_id.trim();
+    let new_id = new_id.trim();
+    if !valid_style_id(new_id) {
+        bail!("风格 id 不合法（1~40 个字母/数字/-/_，且以字母或数字开头）");
+    }
+    if old_id == new_id {
+        return Ok(());
+    }
+    ensure_styles()?;
+    let mut file = read_styles_file()?;
+    let Some(pos) = file.style.iter().position(|s| s.id == old_id) else {
+        bail!("找不到风格 `{old_id}`");
+    };
+    if file.style[pos].builtin {
+        bail!("内置风格的 id 不可修改（可改名称/说明/提示词）");
+    }
+    if file.style.iter().any(|s| s.id == new_id) {
+        bail!("风格 id `{new_id}` 已存在");
+    }
+    let old_file = style_file_name(&file.style[pos]);
+    let new_file = format!("{new_id}.txt");
+    if old_file != new_file {
+        let src = styles_dir().join(&old_file);
+        if src.exists() {
+            fs::rename(&src, styles_dir().join(&new_file))?;
+        }
+    }
+    file.style[pos].id = new_id.to_string();
+    file.style[pos].file = new_file;
+    fs::write(styles_toml_path(), toml::to_string_pretty(&file)?)?;
+    Ok(())
+}
+
 /// 删除自定义风格（内置不可删）。同时删除其提示词文件。
 pub fn delete_style(id: &str) -> Result<()> {
     let id = id.trim();
@@ -459,6 +522,16 @@ mod tests {
         for (m, prompt) in builtin_styles() {
             assert!(prompt.contains("{raw_text}"), "风格 {} 的提示词缺少 {{raw_text}}", m.id);
         }
+    }
+
+    #[test]
+    fn compose_style_prompt_has_contract_and_material() {
+        let p = compose_style_prompt("four", "【资料】这里是一段论文", "只保留公式").unwrap();
+        assert!(p.contains("【输出格式"), "应前置固定契约");
+        assert!(p.contains("## 一、要解决的问题"), "应包含风格内容");
+        assert!(p.contains("【资料】这里是一段论文"), "应替换 raw_text 占位符");
+        assert!(p.contains("【本次额外要求】\n只保留公式"), "应追加额外要求");
+        assert!(!p.contains("{raw_text}"), "占位符应被替换");
     }
 
     #[test]

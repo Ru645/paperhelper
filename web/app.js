@@ -227,6 +227,51 @@ function appendReasoning(which, text) {
   el.scrollTop = el.scrollHeight;
 }
 
+// ===== 笔记区「生成中」覆盖层（导入/生成笔记的实时反馈） =====
+let noteGenTimer = null, noteGenStart = 0, noteGenChars = 0;
+
+function noteGenReset() {
+  $("note-gen-stream").textContent = "";
+  $("note-gen-log").innerHTML = "";
+  $("note-gen-title").textContent = "正在生成笔记…";
+  $("note-gen-meta").textContent = "";
+  resetReasoning("note-gen");
+  if (noteGenTimer) { clearInterval(noteGenTimer); noteGenTimer = null; }
+  noteGenStart = Date.now();
+  noteGenChars = 0;
+  noteGenTimer = setInterval(() => {
+    const secs = Math.round((Date.now() - noteGenStart) / 1000);
+    const parts = [secs + "s"];
+    if (noteGenChars > 0) parts.unshift(noteGenChars.toLocaleString() + " 字");
+    $("note-gen-meta").textContent = parts.join(" · ");
+  }, 500);
+  $("note-gen").classList.remove("hidden");
+}
+
+function noteGenHide() {
+  $("note-gen").classList.add("hidden");
+  if (noteGenTimer) { clearInterval(noteGenTimer); noteGenTimer = null; }
+}
+
+function noteGenPhase(text) {
+  if (text) $("note-gen-title").textContent = text;
+}
+
+function noteGenLog(text, cls) {
+  if (text === "" || text === undefined) return;
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = text;
+  $("note-gen-log").appendChild(d);
+}
+
+function noteGenToken(text) {
+  const pre = $("note-gen-stream");
+  pre.textContent += text;
+  pre.scrollTop = pre.scrollHeight;
+  noteGenChars += text.length;
+}
+
 function resetReasoning(which) {
   const box = $(which + "-reasoning");
   const el = $(which + "-reasoning-text");
@@ -330,8 +375,29 @@ function parseFrame(frame) {
   return { name, text };
 }
 
-function handleFrame(frame) {
+function handleFrame(frame, opts = {}) {
   const { name, text } = parseFrame(frame);
+  // 导入/生成笔记：反馈都进「笔记区」覆盖层（控制台只在出错时用）
+  if (opts.ui === "import") {
+    switch (name) {
+      case "stdout": noteGenLog(text); return;
+      case "stderr": noteGenLog(text, "err"); return;
+      case "token": noteGenToken(text); return;
+      case "chars": {
+        noteGenChars = Math.max(0, parseInt(text, 10) || 0);
+        progressChars = noteGenChars;
+        updateProgressText();
+        return;
+      }
+      case "reasoning": appendReasoning("note-gen", text); return;
+      case "progress": noteGenPhase(text); setProgress(text); return;
+      case "progress_done": setProgress(""); return;
+      case "aborted": noteGenLog("⏹ 已中止", "err"); setProgress(""); return;
+      case "error": renderError(text); return;
+      case "done": noteGenLog("✓ 完成"); setProgress(""); return;
+      default: if (text) noteGenLog(text); return;
+    }
+  }
   switch (name) {
     case "stdout": appendConsole(text); break;
     case "stderr": appendConsole(text, "err"); break;
@@ -391,7 +457,7 @@ async function runCommand(command, opts = {}) {
   if (running) return;
   if (!command || !command.trim()) return;
   setRunning(true);
-  appendConsole("> " + command, "ok");
+  if (!opts.quiet) appendConsole("> " + command, "ok");
   // 不自动跳控制台；仅出错时（handleFrame 的 error）切过去
   const controller = new AbortController();
   currentAbort = controller;
@@ -418,7 +484,7 @@ async function runCommand(command, opts = {}) {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const frame = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        if (frame.trim()) handleFrame(frame);
+        if (frame.trim()) handleFrame(frame, opts);
       }
     }
   } catch (e) {
@@ -438,6 +504,7 @@ async function runCommand(command, opts = {}) {
     } else {
       reloadNote(opts.scrollAnchor, opts.keepScroll);
     }
+    if (opts.ui === "import") noteGenHide();
   }
 }
 
@@ -1206,7 +1273,7 @@ function showAnnSelButton() {
     if (!r) return;
     const info = extractQuoteContext(document, r);
     if (!info.quote) return;
-    sel.removeAllRanges();
+    // 不清除选区：让用户仍能看到选中的位置；引文另有附件条展示（见 openAnnotationCreate）
     openAnnotationCreate({
       node_id: nodeEl.dataset.nodeId,
       quote: info.quote,
@@ -1280,7 +1347,24 @@ function setEditTab(mode) {
     t.classList.toggle("active", t.dataset.mode === mode)
   );
   $("edit-ai-row").classList.toggle("hidden", mode === "manual");
+  $("edit-style-row").classList.toggle("hidden", mode !== "restyle");
   $("btn-edit-apply").textContent = mode === "append" ? "插入" : "应用";
+}
+
+/// 填充「按风格重写」的风格下拉（来自风格注册表）。
+function populateEditStyles() {
+  const sel = $("edit-style");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  for (const st of stylesCache) {
+    const o = document.createElement("option");
+    o.value = st.id;
+    o.textContent = st.label + (st.builtin ? "" : "（自定义）");
+    o.title = st.desc || "";
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  else if ([...sel.options].some((o) => o.value === "four")) sel.value = "four";
 }
 
 async function openEditModal(id) {
@@ -1298,6 +1382,17 @@ async function openEditModal(id) {
     const b = await res.json();
     const isTitle = id === "__title__";
     editBlockKind = isTitle ? "title" : b.kind;
+    // 标题：提供「按风格重写全文」；不支持 AI 补充
+    $("edit-tab-restyle").classList.toggle("hidden", !isTitle);
+    document.querySelector('.edit-tab[data-mode="append"]').classList.toggle("hidden", isTitle);
+    $("edit-instruction").placeholder = isTitle
+      ? "额外要求（可选）：如只保留公式与结论 / 更口语化"
+      : "告诉 AI 怎么改，如：补充这个方法的直觉解释 / 重写得更有条理";
+    if (isTitle) {
+      setEditTab("restyle");
+      refreshStyles().then(populateEditStyles);
+      $("edit-hint").textContent = "按所选笔记风格重写整篇（以原文或当前笔记为素材）；应用后会重建全部结构块，现有批注将失效，可用「撤销」恢复。";
+    }
     // 章节：编辑框展示「标题 + 全部子块」；段落/标题：只有自身文字
     $("edit-text").value = editBlockKind === "section" && b.markdown ? b.markdown : (b.text || "");
     const kind = isTitle ? "标题" : b.kind === "section" ? `章节 ${b.number || ""}`.trim() : "段落";
@@ -1336,13 +1431,14 @@ async function generateEdit() {
   if (!editBlockId) return;
   const instruction = $("edit-instruction").value.trim();
   const st = $("edit-status");
-  if (!instruction) {
+  const isRestyle = editMode === "restyle";
+  if (!instruction && !isRestyle) {
     st.textContent = "请先填写要求，如「补充直觉解释」";
     st.className = "status err";
     return;
   }
   const mode = editMode === "append" ? "append" : "rewrite";
-  setEditProgress("AI 生成中…");
+  setEditProgress(isRestyle ? "按风格重写中…" : "AI 生成中…");
   resetReasoning("edit");
   $("edit-text").value = "";
   $("btn-edit-gen").disabled = true;
@@ -1352,7 +1448,11 @@ async function generateEdit() {
   editAbort = ctrl;
   let acc = "";
   try {
-    await postSse("/api/note/ai", { block_id: editBlockId, instruction, mode }, ({ name, text }) => {
+    const url = isRestyle ? "/api/note/restyle" : "/api/note/ai";
+    const body = isRestyle
+      ? { style: $("edit-style").value, extra: instruction }
+      : { block_id: editBlockId, instruction, mode };
+    await postSse(url, body, ({ name, text }) => {
       if (name === "token") {
         if (!acc) {
           showBar("edit-ai-bar", false); // 有内容流出即收起进度条与计时
@@ -1416,6 +1516,24 @@ async function applyEdit(forceInsert) {
   if (!text) {
     st.textContent = "内容不能为空";
     st.className = "status err";
+    return;
+  }
+  // 按风格重写：整篇替换（警告会清批注），单独走一个端点
+  if (editMode === "restyle") {
+    if (!confirm("按风格重写会重建整篇笔记：现有批注将失效（可用「撤销」恢复）。确定应用？")) return;
+    st.textContent = "保存中…";
+    st.className = "status";
+    try {
+      await postJson("/api/note/restyle/apply", { text });
+      st.textContent = "✓ 已保存";
+      st.className = "status ok";
+      closeEditModal();
+      await refreshState();
+      reloadNote(null, true);
+    } catch (e) {
+      st.textContent = "❌ " + e.message;
+      st.className = "status err";
+    }
     return;
   }
   let url = "/api/note/edit";
@@ -1535,12 +1653,12 @@ function setupAnnDrag() {
 
 const ANN_SIZE_KEY = "ph.ann.size";
 
-/// 批注弹窗右下角把手：拖拽调整大小（无上限），尺寸存 localStorage，双击恢复默认。
-/// 位置仍不记忆——每次打开由 positionPopup 定位。
+/// 批注弹窗缩放：四条边 + 四个角都能拖（无上限，可超出视口再拖回来），
+/// 尺寸存 localStorage，双击任意把手恢复默认。
 function setupAnnResize() {
   const popup = $("ann-popup");
-  const handle = $("ann-resize");
-  if (!handle) return;
+  const handles = [...popup.querySelectorAll(".ann-rz")];
+  if (!handles.length) return;
   const MIN_W = 300, MIN_H = 240;
   try {
     const s = JSON.parse(localStorage.getItem(ANN_SIZE_KEY) || "null");
@@ -1549,33 +1667,80 @@ function setupAnnResize() {
       popup.style.height = s.h + "px";
     }
   } catch (e) { /* 忽略损坏的存储 */ }
-  handle.addEventListener("pointerdown", (e) => {
+
+  const saveSize = () => {
     const r = popup.getBoundingClientRect();
-    const start = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
-    popup.classList.add("resizing");
-    startPointerDrag(handle, e, {
-      cursor: "nwse-resize",
-      onMove: (ev) => {
-        // 只设最小值，不设上限：想拖多大都行（超出视口可再拖回来）
-        const w = Math.max(MIN_W, start.w + (ev.clientX - start.x));
-        const h = Math.max(MIN_H, start.h + (ev.clientY - start.y));
-        popup.style.width = Math.round(w) + "px";
-        popup.style.height = Math.round(h) + "px";
-      },
-      onEnd: () => {
-        popup.classList.remove("resizing");
-        const r2 = popup.getBoundingClientRect();
-        try {
-          localStorage.setItem(ANN_SIZE_KEY, JSON.stringify({ w: Math.round(r2.width), h: Math.round(r2.height) }));
-        } catch (err) { /* 忽略 */ }
-      },
-    });
-  });
-  // 双击恢复默认大小
-  handle.addEventListener("dblclick", () => {
+    try {
+      localStorage.setItem(ANN_SIZE_KEY, JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height) }));
+    } catch (err) { /* 忽略 */ }
+  };
+  const resetSize = () => {
     popup.style.width = "";
     popup.style.height = "";
     try { localStorage.removeItem(ANN_SIZE_KEY); } catch (e) { /* 忽略 */ }
+  };
+
+  for (const handle of handles) {
+    const dir = handle.dataset.dir || "se";
+    handle.addEventListener("pointerdown", (e) => {
+      const r = popup.getBoundingClientRect();
+      const start = { x: e.clientX, y: e.clientY, l: r.left, t: r.top, w: r.width, h: r.height };
+      const cursor = getComputedStyle(handle).cursor || "nwse-resize";
+      popup.classList.add("resizing");
+      startPointerDrag(handle, e, {
+        cursor,
+        onMove: (ev) => {
+          const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
+          let l = start.l, t = start.t, w = start.w, h = start.h;
+          if (dir.includes("e")) w = Math.max(MIN_W, start.w + dx);
+          if (dir.includes("s")) h = Math.max(MIN_H, start.h + dy);
+          if (dir.includes("w")) {
+            w = Math.max(MIN_W, start.w - dx);
+            l = start.l + (start.w - w); // 左/右边固定，向右扩展
+          }
+          if (dir.includes("n")) {
+            h = Math.max(MIN_H, start.h - dy);
+            t = start.t + (start.h - h); // 上/下边固定，向下扩展
+          }
+          popup.style.left = Math.round(l) + "px";
+          popup.style.top = Math.round(t) + "px";
+          popup.style.width = Math.round(w) + "px";
+          popup.style.height = Math.round(h) + "px";
+        },
+        onEnd: () => {
+          popup.classList.remove("resizing");
+          saveSize();
+        },
+      });
+    });
+    handle.addEventListener("dblclick", resetSize);
+  }
+}
+
+/// 思考过程区高度：底部拖动条调整（按面板存 localStorage）。
+function setupReasoningResize() {
+  document.querySelectorAll(".reasoning-resize").forEach((handle) => {
+    const target = document.getElementById(handle.dataset.target || "");
+    if (!target) return;
+    const key = "ph.reasoning.h." + handle.dataset.target;
+    try {
+      const h = Number(localStorage.getItem(key) || 0);
+      if (h >= 60) target.style.height = h + "px";
+    } catch (e) { /* 忽略损坏的存储 */ }
+    handle.addEventListener("pointerdown", (e) => {
+      const start = { y: e.clientY, h: target.getBoundingClientRect().height };
+      startPointerDrag(handle, e, {
+        cursor: "row-resize",
+        onMove: (ev) => {
+          target.style.height = Math.max(60, Math.round(start.h + (ev.clientY - start.y))) + "px";
+        },
+        onEnd: () => {
+          try {
+            localStorage.setItem(key, String(Math.round(target.getBoundingClientRect().height)));
+          } catch (err) { /* 忽略 */ }
+        },
+      });
+    });
   });
 }
 
@@ -1609,6 +1774,20 @@ function setupAnnInputResize() {
   });
 }
 
+/// 引用附件条：展示本次提问针对的选中文字（可一键清除引用）。
+function showAnnSubquote(text) {
+  const t = (text || "").trim();
+  const box = $("ann-subquote");
+  if (!t) return clearAnnSubquote();
+  $("ann-subquote-text").textContent = t;
+  $("ann-subquote-text").title = t;
+  box.classList.remove("hidden");
+}
+function clearAnnSubquote() {
+  $("ann-subquote").classList.add("hidden");
+  $("ann-subquote-text").textContent = "";
+}
+
 /// 新建批注：anchor = { block_id?, node_id?, quote（可见文本）, context（给 LLM，公式为 TeX）, rect? }。
 /// 笔记批注：`block_id` 锚定笔记块；回答批注：`node_id` 锚定弹窗里的某条回答。
 async function openAnnotationCreate(anchor) {
@@ -1623,6 +1802,7 @@ async function openAnnotationCreate(anchor) {
   if (!isAnswer) annSelectedNode = null;
   await loadMathLibs();
   $("ann-quote").textContent = anchor.quote;
+  showAnnSubquote(anchor.quote);
   if (!isAnswer) {
     $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
   }
@@ -1654,6 +1834,7 @@ async function openAnnotationView(annId, opts = {}) {
   };
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
   await loadMathLibs();
+  clearAnnSubquote();
   $("ann-quote").textContent = cleanQuote(ann.quote);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
@@ -1695,6 +1876,17 @@ function onAnnNodeClick(el, fn) {
 
 let renderedThreadRoot = null; // 当前弹窗里渲染的线程根（点击回答高亮时需要重渲染）
 
+/// 节点引文行：提问所针对的原文/回答片段（回看时能看出“问的是哪一段”）。
+function annQuoteEl(quote) {
+  const text = (quote || "").trim();
+  if (!text) return null;
+  const el = document.createElement("div");
+  el.className = "ann-q-quote";
+  el.textContent = "针对：" + text;
+  el.title = text;
+  return el;
+}
+
 function renderAnnThread(root) {
   const box = $("ann-thread");
   box.innerHTML = "";
@@ -1709,6 +1901,8 @@ function renderAnnThread(root) {
     const q = document.createElement("div");
     q.className = "ann-q";
     q.textContent = (node.is_check ? "[核对] " : "") + node.question;
+    const quoteEl = annQuoteEl(node.quote);
+    if (quoteEl) div.appendChild(quoteEl);
     const a = document.createElement("div");
     a.className = "ann-a";
     a.innerHTML = renderMathMarkdown(node.answer || "");
@@ -1805,17 +1999,20 @@ async function afterAnnotationChange() {
 function closeAnnPopup() {
   $("ann-popup").classList.add("hidden");
   $("ann-sel-btn").classList.add("hidden");
+  clearAnnSubquote();
   currentAnnotation = null;
   annSelectedNode = null;
 }
 
 /// 乐观追加一个待回答节点（问题 + 思考中…），返回回答元素供流式填充。
-function appendPendingNode(question) {
+function appendPendingNode(question, quote) {
   const box = $("ann-thread");
   const muted = box.querySelector(".muted");
   if (muted) box.innerHTML = "";
   const div = document.createElement("div");
   div.className = "ann-node pending";
+  const quoteEl = annQuoteEl(quote);
+  if (quoteEl) div.appendChild(quoteEl);
   const q = document.createElement("div");
   q.className = "ann-q";
   q.textContent = question;
@@ -1829,15 +2026,23 @@ function appendPendingNode(question) {
   return a;
 }
 
+/// 「记概念」开关：读 DOM（缺省勾选），并发时保持一致。
+const ANN_RECORD_KEY = "ph.ann.recordConcept";
+function recordConceptOn() {
+  const el = $("ann-record");
+  return el ? !!el.checked : true;
+}
+
 async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
   $("ann-q").value = "";
   annInputGrow();
+  clearAnnSubquote();
   $("ann-send").disabled = true;
   setAnnProgress("思考中…");
   resetReasoning("ann");
-  const ansEl = appendPendingNode(q);
+  const ansEl = appendPendingNode(q, currentAnnotation.quote);
   let url, body;
   const answerAnchorNode = currentAnnotation.node_id && !currentAnnotation.id ? currentAnnotation.node_id : null;
   if (!currentAnnotation.id) {
@@ -1850,6 +2055,7 @@ async function sendAnnotation() {
         quote_tex: currentAnnotation.quote_tex || null,
         question: q,
         mode: annMode,
+        record_concept: recordConceptOn(),
       };
     } else {
       url = "/api/annotate";
@@ -1859,13 +2065,14 @@ async function sendAnnotation() {
         quote_tex: currentAnnotation.quote_tex || null,
         question: q,
         mode: annMode,
+        record_concept: recordConceptOn(),
       };
     }
   } else {
     const nodeId = annSelectedNode;
     if (!nodeId) { $("ann-send").disabled = false; setAnnProgress(""); return; }
     url = "/api/annotate/reply";
-    body = { node_id: nodeId, question: q, mode: annMode };
+    body = { node_id: nodeId, question: q, mode: annMode, record_concept: recordConceptOn() };
   }
   let streamed = "";
   const controller = new AbortController();
@@ -2500,10 +2707,13 @@ async function importFile(file) {
       isText = true;
     }
     setProgress("上传中…");
-    switchTab("console");
+    // 反馈全部进「笔记区」覆盖层（阶段/思考/流式笔记），不占用控制台
+    switchTab("note");
+    noteGenReset();
+    noteGenPhase("上传中…");
     const isRaw = opts.mode === "note" && opts.style === "__raw__";
     const modeLabel = opts.mode === "paper" ? "论文 → 生成笔记" : isRaw ? "原样导入" : "风格 " + opts.style;
-    appendConsole("> 导入文件: " + file.name + "（" + modeLabel + "）");
+    noteGenLog("导入文件：" + file.name + "（" + modeLabel + "）");
     const j = await uploadFile(uploadTarget, (p) => setUploadPct(p));
     setProgress("");
     const extra = (opts.extra || "").trim();
@@ -2514,10 +2724,12 @@ async function importFile(file) {
     const cmd = isRaw
       ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
       : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
-    await runCommand(cmd, { export: exportName });
+    await runCommand(cmd, { export: exportName, ui: "import", quiet: true });
   } catch (e) {
+    noteGenLog("❌ 导入失败: " + e.message, "err");
     appendConsole("❌ 导入失败: " + e.message, "err");
     setProgress("");
+    noteGenHide();
     switchTab("console");
   }
 }
@@ -2557,12 +2769,15 @@ function selectStyleForEdit(id) {
   if (!s) return;
   editingStyleId = id;
   $("style-id").value = s.id;
-  $("style-id").disabled = true;
+  // 内置风格的 id 固定（--style 示例/「恢复默认」依赖它）；自定义风格可改名
+  $("style-id").disabled = !!s.builtin;
   $("style-label").value = s.label;
   $("style-desc").value = s.desc || "";
   $("style-scope").value = s.scope || "any";
   $("style-prompt").value = s.prompt || "";
-  $("style-status").textContent = s.builtin ? "内置风格可编辑，点「恢复默认」可还原" : "自定义风格";
+  $("style-status").textContent = s.builtin
+    ? "内置风格：可改名称/说明/提示词，点「恢复默认」可还原（id 固定）"
+    : "自定义风格：可改 id（文件名会一起改）与全部内容";
   $("style-status").className = "status";
   renderStylesList();
 }
@@ -2596,8 +2811,10 @@ async function saveStyleFromForm() {
   const id = $("style-id").value.trim();
   const st = $("style-status");
   try {
+    const oldId = editingStyleId && editingStyleId !== id ? editingStyleId : null;
     await postJson("/api/styles/save", {
       id,
+      old_id: oldId,
       label: $("style-label").value.trim(),
       desc: $("style-desc").value.trim(),
       scope: $("style-scope").value,
@@ -2605,7 +2822,6 @@ async function saveStyleFromForm() {
     });
     await refreshStyles();
     editingStyleId = id;
-    $("style-id").disabled = true;
     selectStyleForEdit(id);
     st.textContent = "✓ 已保存";
     st.className = "status ok";
@@ -2986,6 +3202,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // 中止：进度条旁的停止按钮 / 批注弹窗停止按钮（等同 Ctrl-C）
   $("btn-stop").onclick = stopCurrent;
   $("ann-stop").onclick = stopCurrent;
+  $("note-gen-stop").onclick = stopCurrent;
 
   document.querySelectorAll(".tab[data-key]").forEach((t) => (t.onclick = () => switchTab(t.dataset.key)));
 
@@ -3042,6 +3259,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // 批注弹窗
   $("ann-close").onclick = closeAnnPopup;
+  {
+    const rec = $("ann-record");
+    rec.checked = localStorage.getItem(ANN_RECORD_KEY) !== "0";
+    rec.onchange = () => {
+      try { localStorage.setItem(ANN_RECORD_KEY, rec.checked ? "1" : "0"); } catch (e) { /* 忽略 */ }
+    };
+  }
+  $("ann-subquote-clear").onclick = () => clearAnnSubquote();
   $("ann-send").onclick = sendAnnotation;
   // 弹窗线程内：选中回答文字浮出「提问」；回答里的高亮可点击/右键
   document.addEventListener("mouseup", () => setTimeout(showAnnSelButton, 0));
@@ -3076,6 +3301,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("ann-q").addEventListener("input", annInputGrow);
   setupAnnInputResize();
   setupAnnResize();
+  setupReasoningResize();
   $("btn-config").onclick = openConfig;
   $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
   $("btn-config-test").onclick = testConfig;

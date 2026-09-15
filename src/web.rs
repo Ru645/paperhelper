@@ -57,6 +57,8 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/note/add", post(api_note_add))
         .route("/api/note/delete", post(api_note_delete))
         .route("/api/note/ai", post(api_note_ai))
+        .route("/api/note/restyle", post(api_note_restyle))
+        .route("/api/note/restyle/apply", post(api_note_restyle_apply))
         .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/config/test", post(api_config_test))
@@ -88,6 +90,11 @@ pub fn router(app: SharedApp) -> Router {
 
 /// 上传大小上限（200MB，与前端提示一致）。
 const MAX_UPLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+/// serde 默认值：字段缺省时按 true（保持旧前端/旧会话的原有行为）。
+fn default_true() -> bool {
+    true
+}
 
 /// 每个请求记一条日志：方法、路径、状态码、耗时。
 async fn log_requests(req: Request, next: Next) -> Response {
@@ -447,6 +454,9 @@ async fn api_styles() -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct StyleSaveReq {
     id: String,
+    /// 自定义风格改名时的旧 id（内置风格忽略）。
+    #[serde(default)]
+    old_id: Option<String>,
     label: String,
     #[serde(default)]
     desc: String,
@@ -468,6 +478,12 @@ async fn api_style_save(
         builtin: false,
         scope: if req.scope.trim().is_empty() { "any".into() } else { req.scope },
     };
+    if let Some(old) = req.old_id.as_deref() {
+        if !old.trim().is_empty() && old.trim() != meta.id {
+            crate::prompts::rename_style(old, &meta.id)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        }
+    }
     crate::prompts::save_style(&meta, &req.prompt)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true })))
@@ -668,6 +684,78 @@ async fn run_note_ai(a: &mut App, block_id: &str, instruction: &str, mode: &str)
     }
     a.record_usage(res.input_tokens, res.output_tokens);
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct RestyleReq {
+    style: String,
+    /// 额外要求（可选）。
+    #[serde(default)]
+    extra: String,
+}
+
+/// 按风格重写全文（SSE 流式）：只生成、不落地；用户确认后调 `/api/note/restyle/apply`。
+async fn api_note_restyle(
+    State(app): State<SharedApp>,
+    Json(req): Json<RestyleReq>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut guard = app2.lock().await;
+        guard.emitter = Emitter::channel(tx);
+        let t0 = std::time::Instant::now();
+        let result = run_restyle(&mut guard, &req.style, &req.extra).await;
+        emit_result(&guard.emitter, result, &format!("按风格重写（{}）", req.style), t0);
+        guard.emitter = Emitter::terminal();
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 调 LLM 按所选风格生成整篇重写（不改笔记；由前端确认后 apply）。
+async fn run_restyle(a: &mut App, style: &str, extra: &str) -> Result<()> {
+    let msgs = a.restyle_messages(style, extra)?;
+    interrupt::reset();
+    let emitter = a.emitter.clone();
+    let client = a.client.clone();
+    let cfg = a.config.llm.clone();
+    emitter.progress("按风格重写中…");
+    let mut first = true;
+    let res = llm::chat(&client, &cfg, &msgs, false, cfg.thinking_mode, &mut |t| {
+        if first {
+            emitter.progress_done();
+            first = false;
+        }
+        emitter.token(t);
+    }, Some(&mut |r| emitter.reasoning(r)))
+    .await;
+    if first {
+        emitter.progress_done();
+    }
+    let res = res?;
+    a.record_usage(res.input_tokens, res.output_tokens);
+    if res.truncated() {
+        emitter.stderr("⚠️ 输出达到上限（finish_reason=length），重写内容可能被截断".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RestyleApplyReq {
+    text: String,
+}
+
+/// 把「按风格重写」的生成结果落地为新的整篇笔记（会清空旧批注，可撤销）。
+async fn api_note_restyle_apply(
+    State(app): State<SharedApp>,
+    Json(req): Json<RestyleApplyReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut a = app.lock().await;
+    a.apply_restyle(&req.text).map_err(note_err)?;
+    let _ = a.auto_persist();
+    crate::logging::info("按风格重写整篇笔记".to_string());
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ===== 导出下载 =====
@@ -1206,6 +1294,9 @@ struct AnnotateReq {
     /// "ask"（默认，写入笔记解释）或 "check"（只进批注线程）。
     #[serde(default)]
     mode: Option<String>,
+    /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
+    #[serde(default = "default_true")]
+    record_concept: bool,
 }
 
 async fn api_annotate(
@@ -1220,7 +1311,14 @@ async fn api_annotate(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let t0 = std::time::Instant::now();
         let result = guard
-            .annotate(&req.block_id, &req.quote, req.quote_tex.as_deref(), &req.question, is_check)
+            .annotate(
+                &req.block_id,
+                &req.quote,
+                req.quote_tex.as_deref(),
+                &req.question,
+                is_check,
+                req.record_concept,
+            )
             .await
             .map(|_| ());
         if result.is_ok() {
@@ -1249,6 +1347,9 @@ struct AnnotateAnswerReq {
     question: String,
     #[serde(default)]
     mode: Option<String>,
+    /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
+    #[serde(default = "default_true")]
+    record_concept: bool,
 }
 
 /// 回答批注：在某个回答里选中文字提问（新问答挂在该节点下，回答里高亮引用）。
@@ -1264,7 +1365,14 @@ async fn api_annotate_answer(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let t0 = std::time::Instant::now();
         let result = guard
-            .annotate_answer(&req.node_id, &req.quote, req.quote_tex.as_deref(), &req.question, is_check)
+            .annotate_answer(
+                &req.node_id,
+                &req.quote,
+                req.quote_tex.as_deref(),
+                &req.question,
+                is_check,
+                req.record_concept,
+            )
             .await
             .map(|_| ());
         if result.is_ok() {
@@ -1288,6 +1396,9 @@ struct AnnotateReplyReq {
     question: String,
     #[serde(default)]
     mode: Option<String>,
+    /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
+    #[serde(default = "default_true")]
+    record_concept: bool,
 }
 
 async fn api_annotate_reply(
@@ -1302,7 +1413,7 @@ async fn api_annotate_reply(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let t0 = std::time::Instant::now();
         let result = guard
-            .annotate_reply(&req.node_id, &req.question, is_check)
+            .annotate_reply(&req.node_id, &req.question, is_check, req.record_concept)
             .await
             .map(|_| ());
         if result.is_ok() {
@@ -1403,6 +1514,7 @@ fn build_thread(
             "n": num_of.get(id).copied().unwrap_or(0),
             "node_id": n.id,
             "question": n.question,
+            "quote": n.quote,
             "answer": n.answer,
             "is_check": n.explanation_id.is_none(),
             "summary": summary,

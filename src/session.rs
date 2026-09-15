@@ -345,6 +345,7 @@ mod tests {
             id: "n1".into(),
             parent: None,
             question: "什么是X?".into(),
+            quote: None,
             answer: "X是…".into(),
             block_id: None,
             explanation_id: None,
