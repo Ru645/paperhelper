@@ -2777,17 +2777,9 @@ function shellQuote(p) {
   return '"' + String(p).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 }
 
-// ===== 风格管理弹窗 =====
+// ===== 风格管理（设置弹窗的「笔记风格」页签）=====
 
 let editingStyleId = null; // null = 新建
-
-async function openStylesModal() {
-  await refreshStyles();
-  if (!editingStyleId && stylesCache.length) editingStyleId = stylesCache[0].id;
-  renderStylesList();
-  if (editingStyleId) selectStyleForEdit(editingStyleId);
-  $("styles-modal").classList.remove("hidden");
-}
 
 function renderStylesList() {
   const box = $("styles-list");
@@ -3038,9 +3030,26 @@ function htmlToMarkdown(html) {
   };
 }
 
-// ===== 配置弹窗 =====
+// ===== 设置弹窗（模型设置 / 笔记风格）=====
 
-async function openConfig() {
+/// 切换设置页签。
+function setSettingsTab(tab) {
+  document.querySelectorAll("#settings-tabs .settings-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.tab === tab)
+  );
+  $("settings-model").classList.toggle("hidden", tab !== "model");
+  $("settings-style").classList.toggle("hidden", tab !== "style");
+}
+
+/// 载入「笔记风格」页签（列表 + 当前选中项）。
+async function loadStylesPane() {
+  await refreshStyles();
+  if (!editingStyleId && stylesCache.length) editingStyleId = stylesCache[0].id;
+  renderStylesList();
+  if (editingStyleId) selectStyleForEdit(editingStyleId);
+}
+
+async function openConfig(tab = "model") {
   try {
     const c = await (await fetch("/api/config")).json();
     $("cfg-endpoint").value = c.llm.api_endpoint || "";
@@ -3058,6 +3067,8 @@ async function openConfig() {
     showBar("cfg-test-bar", false);
     $("btn-config-test-stop").classList.add("hidden");
     $("btn-config-test").disabled = false;
+    if (tab === "style") await loadStylesPane();
+    setSettingsTab(tab);
     $("config-modal").classList.remove("hidden");
   } catch (e) {
     alert("读取配置失败: " + e);
@@ -3340,8 +3351,14 @@ document.addEventListener("DOMContentLoaded", () => {
   setupAnnInputResize();
   setupAnnResize();
   setupReasoningResize();
-  $("btn-config").onclick = openConfig;
-  $("btn-config-cancel").onclick = () => $("config-modal").classList.add("hidden");
+  $("btn-config").onclick = () => openConfig("model");
+  $("btn-settings-close").onclick = () => $("config-modal").classList.add("hidden");
+  document.querySelectorAll("#settings-tabs .settings-tab").forEach(
+    (t) => (t.onclick = () => {
+      setSettingsTab(t.dataset.tab);
+      if (t.dataset.tab === "style") loadStylesPane();
+    })
+  );
   $("btn-config-test").onclick = testConfig;
   $("btn-config-test-stop").onclick = stopConfigTest;
   $("btn-config-save").onclick = saveConfig;
@@ -3362,11 +3379,10 @@ document.addEventListener("DOMContentLoaded", () => {
     (t) => (t.onclick = () => setImportMode(t.dataset.mode))
   );
   $("import-style").onchange = updateImportStyleHint;
-  $("btn-style-manage").onclick = openStylesModal;
+  $("btn-style-manage").onclick = () => openConfig("style");
   $("btn-import-save-style").onclick = saveImportAsStyle;
 
-  // 风格管理弹窗
-  $("btn-styles-close").onclick = () => $("styles-modal").classList.add("hidden");
+  // 风格管理（设置 → 笔记风格）
   $("btn-style-new").onclick = newStyleForEdit;
   $("btn-style-copy").onclick = copyStyleForEdit;
   $("btn-style-save").onclick = saveStyleFromForm;

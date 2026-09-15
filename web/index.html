@@ -22,7 +22,7 @@
     </div>
     <button id="btn-undo" class="ghost" disabled title="撤销上一次编辑/删除">撤销</button>
     <button id="btn-help" class="ghost">帮助</button>
-    <button id="btn-config" class="ghost">配置</button>
+    <button id="btn-config" class="ghost">设置</button>
     <button id="btn-refresh" class="ghost">刷新</button>
   </div>
 </header>
@@ -187,41 +187,6 @@
   </div>
 </div>
 
-<!-- 笔记风格管理：列表 + 编辑（文件同源：.paperhelper/styles.toml + styles/<id>.txt） -->
-<div id="styles-modal" class="modal hidden">
-  <div class="modal-box styles-box">
-    <h2>笔记风格管理</h2>
-    <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除、可改 id（会同时改文件名）；文件在 <code>.paperhelper/styles/</code>。</p>
-    <p class="muted">下面只填「内容与结构」要求即可：<b>格式要求（<code>#</code> 标题、<code>##</code> 分节、<code>$公式$</code>、Markdown 表格等）由程序自动附加，不用也不应写在这里</b>。</p>
-    <div class="styles-layout">
-      <div class="styles-list" id="styles-list"></div>
-      <div class="styles-edit">
-        <label>id（文件名；自定义风格可改，内置固定）<input id="style-id" type="text" placeholder="my-style"></label>
-        <label>名称<input id="style-label" type="text" placeholder="我的风格"></label>
-        <label>说明<input id="style-desc" type="text" placeholder="一句话说明这个风格生成什么笔记"></label>
-        <label>适用
-          <select id="style-scope">
-            <option value="any">通用</option>
-            <option value="paper">论文</option>
-            <option value="note">笔记 / 讲义</option>
-          </select>
-        </label>
-        <label>提示词（<code>{raw_text}</code> 会被替换为资料全文）</label>
-        <textarea id="style-prompt" rows="12" placeholder="请阅读以下资料，生成…"></textarea>
-        <div class="styles-actions">
-          <button id="btn-style-new" class="mini ghost">新建</button>
-          <button id="btn-style-copy" class="mini ghost">复制</button>
-          <button id="btn-style-delete" class="mini ghost danger">删除</button>
-          <button id="btn-style-reset" class="mini ghost">恢复默认</button>
-          <button id="btn-style-save" class="mini primary">保存</button>
-        </div>
-        <p id="style-status" class="status"></p>
-      </div>
-    </div>
-    <div class="modal-actions"><button id="btn-styles-close" class="ghost">关闭</button></div>
-  </div>
-</div>
-
 <!-- 笔记块编辑：手动 / AI 重写 / AI 补充 -->
 <div id="edit-modal" class="modal hidden">
   <div class="modal-box edit-box">
@@ -256,26 +221,67 @@
   </div>
 </div>
 
+<!-- 设置：模型设置 + 笔记风格 -->
 <div id="config-modal" class="modal hidden">
-  <div class="modal-box">
-    <h2>模型与预算配置</h2>
-    <label>API Endpoint<input id="cfg-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
-    <label>API Key<input id="cfg-key" placeholder="留空则不修改（当前：—）"></label>
-    <label>模型<input id="cfg-model" placeholder="deepseek-v4-pro"></label>
-    <label>上下文长度（token）<input id="cfg-context" type="number"></label>
-    <label class="check"><input id="cfg-thinking" type="checkbox"> 思考模式</label>
-    <label>输入单价 / 1M token<input id="cfg-inprice" type="number" step="0.01"></label>
-    <label>输出单价 / 1M token<input id="cfg-outprice" type="number" step="0.01"></label>
-    <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
-    <div class="modal-actions">
-      <button id="btn-config-cancel" class="ghost">取消</button>
-      <button id="btn-config-test" class="ghost">测试连接</button>
-      <button id="btn-config-test-stop" class="ghost hidden">停止</button>
-      <button id="btn-config-save" class="primary">保存</button>
+  <div class="modal-box settings-box">
+    <h2>设置</h2>
+    <div class="settings-tabs" id="settings-tabs">
+      <button class="settings-tab active" data-tab="model">模型设置</button>
+      <button class="settings-tab" data-tab="style">笔记风格</button>
     </div>
-    <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
-    <div id="cfg-test-result" class="test-result hidden"></div>
-    <p id="cfg-status" class="status"></p>
+
+    <div id="settings-model" class="settings-pane">
+      <label>API Endpoint<input id="cfg-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
+      <label>API Key<input id="cfg-key" placeholder="留空则不修改（当前：—）"></label>
+      <label>模型<input id="cfg-model" placeholder="deepseek-v4-pro"></label>
+      <label>上下文长度（token）<input id="cfg-context" type="number"></label>
+      <label class="check"><input id="cfg-thinking" type="checkbox"> 思考模式</label>
+      <label>输入单价 / 1M token<input id="cfg-inprice" type="number" step="0.01"></label>
+      <label>输出单价 / 1M token<input id="cfg-outprice" type="number" step="0.01"></label>
+      <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
+      <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
+      <div id="cfg-test-result" class="test-result hidden"></div>
+      <p id="cfg-status" class="status"></p>
+      <div class="modal-actions">
+        <button id="btn-config-test" class="ghost">测试连接</button>
+        <button id="btn-config-test-stop" class="ghost hidden">停止</button>
+        <button id="btn-config-save" class="primary">保存</button>
+      </div>
+    </div>
+
+    <div id="settings-style" class="settings-pane hidden">
+      <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除、可改 id（会同时改文件名）；文件在 <code>.paperhelper/styles/</code>。</p>
+      <p class="muted">下面只填「内容与结构」要求即可：<b>格式要求（<code>#</code> 标题、<code>##</code> 分节、<code>$公式$</code>、Markdown 表格等）由程序自动附加，不用也不应写在这里</b>。</p>
+      <div class="styles-layout">
+      <div class="styles-list" id="styles-list"></div>
+      <div class="styles-edit">
+        <label>id（文件名；自定义风格可改，内置固定）<input id="style-id" type="text" placeholder="my-style"></label>
+        <label>名称<input id="style-label" type="text" placeholder="我的风格"></label>
+        <label>说明<input id="style-desc" type="text" placeholder="一句话说明这个风格生成什么笔记"></label>
+        <label>适用
+          <select id="style-scope">
+            <option value="any">通用</option>
+            <option value="paper">论文</option>
+            <option value="note">笔记 / 讲义</option>
+          </select>
+        </label>
+        <label>提示词（<code>{raw_text}</code> 会被替换为资料全文）</label>
+        <textarea id="style-prompt" rows="12" placeholder="请阅读以下资料，生成…"></textarea>
+        <div class="styles-actions">
+          <button id="btn-style-new" class="mini ghost">新建</button>
+          <button id="btn-style-copy" class="mini ghost">复制</button>
+          <button id="btn-style-delete" class="mini ghost danger">删除</button>
+          <button id="btn-style-reset" class="mini ghost">恢复默认</button>
+          <button id="btn-style-save" class="mini primary">保存</button>
+        </div>
+        <p id="style-status" class="status"></p>
+      </div>
+    </div>
+    </div>
+
+    <div class="modal-actions">
+      <button id="btn-settings-close" class="ghost">关闭</button>
+    </div>
   </div>
 </div>
 
@@ -285,7 +291,7 @@
     <ul class="help-list">
       <li><b>导入</b>：在「笔记」页点「＋ 导入资料」，或直接把文件拖进窗口（PDF / TXT / MD / HTML）。</li>
       <li><b>论文 / 讲义模式</b>：论文走「论文 → 生成笔记」；自己的笔记或课程讲义走「笔记 / 讲义 → 导入」，可「原样导入（不调模型、0 token）」或选一种风格生成。</li>
-      <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「管理…」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
+      <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「设置 → 笔记风格」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
       <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除；MathJax 的 <code>\newcommand</code> 宏定义会自动注册，公式里的自定义宏也能渲染）。</li>
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。编辑**主标题**时多一个「按风格重写全文」：选一种笔记风格（可加额外要求）让 AI 重写整篇（会重建块 id、清空批注，可用「撤销」恢复）。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
@@ -298,7 +304,7 @@
       <li><b>导入反馈在笔记区</b>：导入/生成笔记时不再刷控制台——「笔记」页会实时显示阶段（解析 PDF / 文本已就绪 / 生成中）、思考过程与正在生成的笔记文本；控制台只在出错时自动打开。</li>
       <li><b>导出</b>：点「导出」下载 Markdown / 思维导图 / HTML。</li>
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>
-      <li><b>配置</b>：点「配置」修改 API 端点/密钥/模型/价格/预算。</li>
+      <li><b>设置</b>：「设置」分两部分——「模型设置」改 API 端点/密钥/模型/价格/上下文/预算；「笔记风格」管理生成笔记的风格提示词。</li>
       <li><b>列表多选</b>：侧栏的会话 / 论文 / 概念列表，Ctrl(⌘) 点选、Shift 连选，右键可批量置顶 / 删除；Esc 取消选择。</li>
     </ul>
     <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
