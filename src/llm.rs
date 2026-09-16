@@ -260,6 +260,91 @@ fn estimate_input_tokens(messages: &[Message]) -> u64 {
     messages.iter().map(|m| estimate_tokens(&m.content)).sum()
 }
 
+/// SSE 行缓冲：按**字节**累积，只在行边界做 UTF-8 解码。
+///
+/// 网络分片（`bytes_stream`）的边界是任意的，可能把一个多字节字符（如中文、
+/// emoji）切成两半。若对每个分片直接 `from_utf8_lossy`，两半都会变成 `�`，
+/// 这就是思考过程/流式正文出现乱码的根源。这里保证整行字节齐全后再解码。
+#[derive(Default)]
+struct LineBuffer {
+    buf: Vec<u8>,
+}
+
+impl LineBuffer {
+    /// 追加一段网络字节，返回其中已完整的所有行（已 trim，不含换行）。
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + pos;
+            lines.push(String::from_utf8_lossy(&self.buf[start..end]).trim().to_string());
+            start = end + 1;
+        }
+        if start > 0 {
+            self.buf.drain(..start);
+        }
+        lines
+    }
+
+    /// 流结束时取出残留的最后一行（服务端未以换行结尾时）。
+    fn finish(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.buf).trim().to_string();
+        self.buf.clear();
+        (!line.is_empty()).then_some(line)
+    }
+}
+
+/// 处理一条 SSE 行：解析 `data:` JSON 并回调 token/思考分片。
+fn handle_stream_line<F: FnMut(&str)>(
+    line: &str,
+    usage: &mut Option<Usage>,
+    finish_reason: &mut Option<String>,
+    content: &mut String,
+    on_token: &mut F,
+    on_reasoning: &mut Option<&mut (dyn FnMut(&str) + Send)>,
+) {
+    if line.is_empty() {
+        return;
+    }
+    let Some(rest) = line.strip_prefix("data:") else {
+        return;
+    };
+    let rest = rest.trim();
+    if rest == "[DONE]" {
+        return;
+    }
+    let Ok(chunk) = serde_json::from_str::<Chunk>(rest) else {
+        return;
+    };
+    if let Some(u) = chunk.usage {
+        *usage = Some(u);
+    }
+    for ch in chunk.choices {
+        if let Some(fr) = ch.finish_reason {
+            *finish_reason = Some(fr);
+        }
+        if let Some(d) = ch.delta {
+            if let Some(r) = d.reasoning_content {
+                if !r.is_empty() {
+                    if let Some(cb) = on_reasoning.as_deref_mut() {
+                        cb(&r);
+                    }
+                }
+            }
+            if let Some(t) = d.content {
+                if !t.is_empty() {
+                    on_token(&t);
+                    content.push_str(&t);
+                }
+            }
+        }
+    }
+}
+
 pub async fn chat(
     client: &reqwest::Client,
     cfg: &LlmConfig,
@@ -303,7 +388,7 @@ pub async fn chat(
     let mut content = String::new();
     let mut usage: Option<Usage> = None;
     let mut finish_reason: Option<String> = None;
-    let mut buf = String::new();
+    let mut buf = LineBuffer::default();
     let mut on_reasoning = on_reasoning;
     let mut stream = resp.bytes_stream();
     loop {
@@ -317,49 +402,27 @@ pub async fn chat(
         };
         let Some(item) = next else { break };
         let bytes = item.context("读取响应流失败（连接可能被中断）")?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        loop {
-            let Some(pos) = buf.find('\n') else {
-                break;
-            };
-            let line: String = buf[..pos].trim().into();
-            buf = buf[pos + 1..].to_string();
-            if line.is_empty() {
-                continue;
-            }
-            let Some(rest) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let rest = rest.trim();
-            if rest == "[DONE]" {
-                continue;
-            }
-            if let Ok(chunk) = serde_json::from_str::<Chunk>(rest) {
-                if let Some(u) = chunk.usage {
-                    usage = Some(u);
-                }
-                for ch in chunk.choices {
-                    if let Some(fr) = ch.finish_reason {
-                        finish_reason = Some(fr);
-                    }
-                    if let Some(d) = ch.delta {
-                        if let Some(r) = d.reasoning_content {
-                            if !r.is_empty() {
-                                if let Some(cb) = on_reasoning.as_deref_mut() {
-                                    cb(&r);
-                                }
-                            }
-                        }
-                        if let Some(t) = d.content {
-                            if !t.is_empty() {
-                                on_token(&t);
-                                content.push_str(&t);
-                            }
-                        }
-                    }
-                }
-            }
+        for line in buf.push(&bytes) {
+            handle_stream_line(
+                &line,
+                &mut usage,
+                &mut finish_reason,
+                &mut content,
+                on_token,
+                &mut on_reasoning,
+            );
         }
+    }
+    // 个别服务端最后一帧不带换行，收尾时补处理
+    if let Some(line) = buf.finish() {
+        handle_stream_line(
+            &line,
+            &mut usage,
+            &mut finish_reason,
+            &mut content,
+            on_token,
+            &mut on_reasoning,
+        );
     }
 
     let (in_tok, out_tok, estimated) = if let Some(u) = usage {
@@ -549,5 +612,84 @@ mod tests {
         let d2 = ch2.choices[0].delta.as_ref().unwrap();
         assert_eq!(d2.content.as_deref(), Some("答"));
         assert!(d2.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn line_buffer_decodes_multibyte_at_line_boundary_only() {
+        // 逐字节喂入中文 SSE：必须在行边界整体解码，绝不能出现替换字符
+        let raw = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先想一下\"}}]}\n";
+        let mut buf = LineBuffer::default();
+        let mut lines = Vec::new();
+        for b in raw.as_bytes() {
+            lines.extend(buf.push(std::slice::from_ref(b)));
+        }
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("先想一下"), "{}", lines[0]);
+        assert!(!lines[0].contains('\u{FFFD}'));
+        assert!(buf.finish().is_none());
+    }
+
+    #[test]
+    fn stream_lines_preserve_reasoning_and_content_across_chunks() {
+        // 一帧思考 + 一帧正文 + usage，按 3 字节任意切分（必然切断多字节字符）
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先想一下：\"},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好，世界🌍\"},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34}}\n",
+            "data: [DONE]\n"
+        );
+        let mut buf = LineBuffer::default();
+        let mut usage = None;
+        let mut finish_reason = None;
+        let mut content = String::new();
+        let mut tokens = String::new();
+        let mut reasoning = String::new();
+        let mut on_token = |t: &str| tokens.push_str(t);
+        let mut on_reasoning = |r: &str| reasoning.push_str(r);
+        let mut on_reasoning_opt: Option<&mut (dyn FnMut(&str) + Send)> = Some(&mut on_reasoning);
+
+        for part in raw.as_bytes().chunks(3) {
+            for line in buf.push(part) {
+                handle_stream_line(
+                    &line,
+                    &mut usage,
+                    &mut finish_reason,
+                    &mut content,
+                    &mut on_token,
+                    &mut on_reasoning_opt,
+                );
+            }
+        }
+        // 结尾补一帧不带换行的场景
+        let tail = "data: {\"choices\":[{\"delta\":{\"content\":\"！\"}}]}";
+        for line in buf.push(tail.as_bytes()) {
+            handle_stream_line(
+                &line,
+                &mut usage,
+                &mut finish_reason,
+                &mut content,
+                &mut on_token,
+                &mut on_reasoning_opt,
+            );
+        }
+        if let Some(line) = buf.finish() {
+            handle_stream_line(
+                &line,
+                &mut usage,
+                &mut finish_reason,
+                &mut content,
+                &mut on_token,
+                &mut on_reasoning_opt,
+            );
+        }
+
+        assert_eq!(reasoning, "先想一下：");
+        assert_eq!(content, "你好，世界🌍！");
+        assert_eq!(tokens, content);
+        assert!(!content.contains('\u{FFFD}'), "{content}");
+        let u = usage.expect("usage 应被解析");
+        assert_eq!(u.prompt_tokens, Some(12));
+        assert_eq!(u.completion_tokens, Some(34));
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
     }
 }

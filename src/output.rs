@@ -10,11 +10,69 @@
 //! 不关心自己在终端还是 Web 里跑。`is_terminal()` 用于需要交互式 stdin 的分支
 //! （Web 下不能读 stdin，改用默认值）。
 
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::mpsc::UnboundedSender;
+
+/// 去掉 ANSI 转义序列（颜色码、OSC 超链接等）。
+///
+/// Web 控制台、日志文件、重定向输出都不认颜色码，若不剥离就会显示成
+/// `[1m[32m✓[39m[0m` 这类乱码。
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // CSI：ESC [ 参数 中间字节 终止字节（@-~）
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC：ESC ] ... BEL 或 ST（ESC \）
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        let _ = chars.next();
+                        break;
+                    }
+                }
+            }
+            // 其它两字节转义序列：ESC X
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// 当前输出端是否应保留颜色（`NO_COLOR` 或非终端时为否）。
+fn color_enabled(stderr: bool) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if stderr {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    }
+}
 
 /// 一条输出事件（Web 端转 SSE 时按类型映射成不同 event 名）。
 #[derive(Debug, Clone)]
@@ -90,16 +148,27 @@ impl Emitter {
     /// 输出一行（对应 println!）。
     pub fn stdout(&self, s: impl Into<String>) {
         let s = s.into();
-        if !self.send(Event::Stdout(s.clone())) {
+        // 通道模式（Web）：浏览器控制台不渲染 ANSI，必须剥离
+        if self.send(Event::Stdout(strip_ansi(&s))) {
+            return;
+        }
+        if color_enabled(false) {
             println!("{s}");
+        } else {
+            println!("{}", strip_ansi(&s));
         }
     }
 
     /// 输出一行错误/警告（对应 eprintln!）。
     pub fn stderr(&self, s: impl Into<String>) {
         let s = s.into();
-        if !self.send(Event::Stderr(s.clone())) {
+        if self.send(Event::Stderr(strip_ansi(&s))) {
+            return;
+        }
+        if color_enabled(true) {
             eprintln!("{s}");
+        } else {
+            eprintln!("{}", strip_ansi(&s));
         }
     }
 
@@ -117,7 +186,11 @@ impl Emitter {
     pub fn reasoning(&self, t: &str) {
         if !self.send(Event::Reasoning(t.to_string())) {
             use std::io::Write;
-            eprint!("\x1b[2m{t}\x1b[0m");
+            if color_enabled(true) {
+                eprint!("\x1b[2m{t}\x1b[0m");
+            } else {
+                eprint!("{t}");
+            }
             let _ = std::io::stderr().flush();
         }
     }
@@ -180,4 +253,39 @@ impl Emitter {
 pub fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner} {msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_color_codes_but_keeps_text() {
+        // 典型场景："✓ 文本已就绪" 被 owo-colors 着色后的字节序列
+        let colored = "\x1b[1m\x1b[32m✓\x1b[39m\x1b[0m 文本已就绪: 12 字符";
+        assert_eq!(strip_ansi(colored), "✓ 文本已就绪: 12 字符");
+    }
+
+    #[test]
+    fn strip_ansi_handles_osc_and_plain_text() {
+        let s = "正常中文abc\x1b]8;;https://example.com\x07链接\x1b]8;;\x07";
+        assert_eq!(strip_ansi(s), "正常中文abc链接");
+        assert_eq!(strip_ansi("没有转义码"), "没有转义码");
+    }
+
+    #[test]
+    fn channel_emitter_strips_ansi_from_stdout_and_stderr() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let e = Emitter::channel(tx);
+        e.stdout("\x1b[32mOK\x1b[0m");
+        e.stderr("\x1b[31m坏消息\x1b[0m");
+        match rx.try_recv().unwrap() {
+            Event::Stdout(s) => assert_eq!(s, "OK"),
+            other => panic!("期望 Stdout，得到 {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            Event::Stderr(s) => assert_eq!(s, "坏消息"),
+            other => panic!("期望 Stderr，得到 {other:?}"),
+        }
+    }
 }

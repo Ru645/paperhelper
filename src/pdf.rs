@@ -48,6 +48,41 @@ async fn run_killable(mut cmd: Command, what: &str) -> Result<std::process::Outp
     }
 }
 
+/// 清理 PDF 字体私有编码字符（PUA）等无法映射到 Unicode 的占位字符。
+///
+/// 部分 PDF 的公式/符号字体缺少 ToUnicode 映射，PyMuPDF 只能给出私有区码位
+/// （如 U+E000–U+F8FF），直接展示是豆腐块，发给 LLM 也是噪声。
+/// 返回（清理后的文本, 删除的字符数）。
+pub fn clean_pua(text: &str) -> (String, usize) {
+    let mut removed = 0usize;
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            let u = *c as u32;
+            let pua = (0xE000..=0xF8FF).contains(&u) // BMP 私有区
+                || (0xF0000..=0xFFFFD).contains(&u) // 补充私有区 A
+                || (0x100000..=0x10FFFD).contains(&u); // 补充私有区 B
+            if pua {
+                removed += 1;
+            }
+            !pua
+        })
+        .collect();
+    (cleaned, removed)
+}
+
+/// 抽取文本统一清洗：有删除时写日志并在 CLI 提示（字体缺映射属数据质量问题）。
+fn clean_extracted(text: String, what: &str) -> String {
+    let (cleaned, removed) = clean_pua(&text);
+    if removed > 0 {
+        let msg =
+            format!("{what} 有 {removed} 个字符因字体缺少 Unicode 映射（私有编码）无法识别，已跳过");
+        logging::warn(&msg);
+        eprintln!("⚠️  {msg}");
+    }
+    cleaned
+}
+
 /// 用 PyMuPDF（Python 子进程）抽取 PDF 全文，按页用 form-feed 分隔。
 /// 需要环境里装了 pymupdf：`pip install pymupdf`。
 pub async fn extract_pages(path: &Path) -> Result<Vec<String>> {
@@ -62,7 +97,10 @@ pub async fn extract_pages(path: &Path) -> Result<Vec<String>> {
             "PDF 解析失败: {e}\n提示：确认已 `pip install pymupdf`，且文件是有效 PDF。"
         ));
     }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let text = clean_extracted(
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        "PDF 文本",
+    );
     let pages: Vec<String> = text
         .split('\u{0C}')
         .map(|s| s.trim().to_string())
@@ -153,7 +191,7 @@ pub async fn ocr_extract(path: &Path) -> Result<String> {
         }
         return Err(anyhow!("OCR 识别失败: {e}"));
     }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let text = clean_extracted(String::from_utf8_lossy(&out.stdout).into_owned(), "OCR 文本");
     if text.trim().is_empty() {
         return Err(anyhow!("OCR 未识别出任何文本"));
     }
@@ -163,4 +201,36 @@ pub async fn ocr_extract(path: &Path) -> Result<String> {
         t0.elapsed().as_secs_f64()
     ));
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_pua_removes_private_use_chars_and_counts() {
+        // 模拟该论文公式处的私有区字符：\uf8eb-\uf8fb
+        let raw = "SE(\u{f8eb}x\u{f8fc}) = \u{f8ed} (\u{f8ee}x)\u{f8ef} log (\u{f8f0}x\u{f8f1})";
+        let (clean, removed) = clean_pua(raw);
+        assert_eq!(removed, 7);
+        assert!(clean.contains("SE("));
+        assert!(!clean.contains('\u{f8eb}'));
+        assert!(!clean.contains('\u{f8f1}'));
+    }
+
+    #[test]
+    fn clean_pua_keeps_normal_text_and_emoji() {
+        let raw = "正常中文、English、公式 $E=mc^2$、emoji 🌍";
+        let (clean, removed) = clean_pua(raw);
+        assert_eq!(removed, 0);
+        assert_eq!(clean, raw);
+    }
+
+    #[test]
+    fn clean_pua_removes_supplementary_private_use() {
+        let raw = "a\u{f0001}b\u{10fffd}c";
+        let (clean, removed) = clean_pua(raw);
+        assert_eq!(removed, 2);
+        assert_eq!(clean, "abc");
+    }
 }

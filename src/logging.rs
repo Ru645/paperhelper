@@ -93,7 +93,7 @@ pub fn log(level: Level, msg: &str) {
         "{} [{}] {}",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         level.label(),
-        msg
+        crate::output::strip_ansi(msg)
     );
     eprintln!("{line}");
     if let Some(l) = LOGGER.get() {

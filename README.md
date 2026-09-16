@@ -339,20 +339,20 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **导入解析**：`parse_import_note`（有标题建 Section 树、无标题按空行切多个段落、不剥代码围栏）；HTML 在浏览器端用 DOMParser 白名单转换（KaTeX 公式还原、脚本/事件属性丢弃、隐藏元素跳过）
 - **数学宏**：HTML 里「几乎全是 `\newcommand`」的宏块会被收集为 `Note.math_macros`（随笔记保存），渲染公式时用 `scanMacroDefs` 解析成 KaTeX 的 `macros` 选项（名字带反斜杠，避免单字母被当普通字符展开）；笔记 iframe / HTML 导出 / 弹窗回答三处共用
 - **可编辑笔记树**：块级编辑（改文字 / 整节重写 / 插入 / 删除）尽量保持块 id 稳定；`parse_markdown_blocks` 把 Markdown 解析成块序列（`#` 也当 Section），结构变化后统一重排编号
-- **流式输出 + 进度**：LLM 输出实时渲染；推理模型的 `reasoning_content` 走独立的 `Event::Reasoning` → SSE `reasoning`，界面显示「思考过程」，等待期显示上下文规模与计时；耗时任务显示进度条与实时字数/耗时
+- **流式输出 + 进度**：LLM 输出实时渲染；推理模型的 `reasoning_content` 走独立的 `Event::Reasoning` → SSE `reasoning`，界面显示「思考过程」，等待期显示上下文规模与计时；耗时任务显示进度条与实时字数/耗时。流式解码按**字节缓冲 + 行边界 UTF-8 解码**（网络分片切断中文等多字节字符也不会出现 `�`）；`Emitter` 在 Web/非终端/日志场景剥离 ANSI 颜色码
 - **并发模型**：LLM 流式阶段不持全局状态锁（prepare / 锁外 run / commit 三段式），并用全局 LLM 门串行化多个 LLM 任务、用会话版本号（epoch）防止把结果写进已被切换/编辑的会话；因此非 LLM 请求在生成期间不受影响
 - **可中止**：`interrupt` 全局信号 + `tokio::select!`——LLM 的发送/读取、重试等待、PDF/OCR 子进程（`kill_on_drop`）都能被 `Ctrl-C` / Web「停止」立即打断
 - **Web / CLI 双前端**：业务输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
 - **错误归类 + 日志**：HTTP/网络错误映射成中文摘要与排查建议（原始响应进错误链与日志）；`src/logging.rs` 轻量日志写 stderr 与 `.paperhelper/logs/`
-- **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断、上传流式写盘并限 200MB
+- **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断、上传流式写盘并限 200MB；PDF/OCR 文本自动清洗字体缺失映射产生的私有区占位字符（避免豆腐块与噪声）
 - **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
 
 ## 开发
 
 ```bash
-cargo build                 # 构建
-cargo test                  # 37 个单元测试
-cargo build --release       # 发布构建
+cargo build -p paperhelper          # 构建
+cargo test  -p paperhelper          # 65 个单元测试
+cargo build -p paperhelper --release  # 发布构建
 ```
 
 二进制产物：`./target/debug/paperhelper`（或 `./target/release/paperhelper`）。
