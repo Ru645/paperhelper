@@ -2819,7 +2819,8 @@ function newStyleForEdit() {
   $("style-label").value = "";
   $("style-desc").value = "";
   $("style-scope").value = "any";
-  $("style-prompt").value = "请阅读以下资料，生成一份学习笔记 Markdown。\n\n资料全文：\n{raw_text}";
+  $("style-prompt").value =
+    "请阅读以下资料，生成一份学习笔记 Markdown。\n\n要求：\n- 先讲清直觉，再给公式与推导；\n- 保留关键公式、数据与例子。";
   $("style-status").textContent = "新建风格：填 id 与名称后点「保存」";
   $("style-status").className = "status";
   renderStylesList();

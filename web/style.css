@@ -203,6 +203,8 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .note-gen .ng-log { flex: 0 0 auto; font-size: 12.5px; color: #555; }
 .note-gen .ng-log div { margin: 2px 0; }
 .note-gen .ng-log .err { color: var(--danger); }
+/* 生成笔记内的「思考过程」：与笔记区左右对齐、可拖动调高 */
+.note-gen .reasoning { margin: 0; flex: 0 0 auto; }
 .note-gen-stream {
   flex: 1; min-height: 0; overflow-y: auto; margin: 0; padding: 12px 14px;
   background: #fafafa; border: 1px solid var(--line); border-radius: 8px;

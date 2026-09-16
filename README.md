@@ -334,7 +334,7 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **两棵树**：笔记树（Section/Paragraph + 递归嵌套的 Explanation，`sum` 后折叠）+ 对话树（每节点一次 Q&A，跳转节点的根路径即上下文）
 - **文本锚点批注**：批注记录「锚点 + 选中文字」，笔记锚点是 `block_id`、回答锚点是 `node_id`，渲染时按文本引用定位并高亮，点击可重开弹窗；匹配时跳过 KaTeX 隐藏 MathML、按可见文本逐节点包裹，含公式的引用也能高亮且不破坏公式结构
 - **公式上下文**：选中 KaTeX 公式时从隐藏层的 `<annotation encoding="application/x-tex">` 还原 LaTeX（`$...$`/`$$...$$`）作为给 LLM 的上下文（`quote_tex`），避免传渲染后的线性文本；只选中子片段时给整条公式并注明片段（KaTeX 无子表达式源码映射）
-- **笔记风格注册表**：风格 = `id/名称/说明/适用/提示词`，清单在 `.paperhelper/styles.toml`、提示词在 `.paperhelper/styles/<id>.txt`（旧 `prompts/{note,translate,free}.txt` 首次启动自动迁移，用户改动不丢）；生成时由程序自动前置**固定输出契约**（`#` 标题 / `##` 分节 / `$公式$` 等，UI 不展示），再拼风格提示词（`{raw_text}` → 全文）与可选的「本次额外要求」
+- **笔记风格注册表**：风格 = `id/名称/说明/适用/提示词`，清单在 `.paperhelper/styles.toml`、提示词在 `.paperhelper/styles/<id>.txt`（旧 `prompts/{note,translate,free}.txt` 首次启动自动迁移，用户改动不丢）；生成时由程序自动前置**固定输出契约**（`#` 标题 / `##` 分节 / `$公式$` 等）并固定附加**资料全文**，提示词里只写「写什么、按什么顺序讲」（旧文件里的 `{raw_text}` 占位符在打开/保存/启动时自动清除）；末尾追加可选的「本次额外要求」
 - **材料类型**：`Note.material_kind` / `Paper.kind`（`paper|note|lecture`，serde 默认值兼容旧数据）；直接导入的笔记 `raw_text` 为空，`build_context_messages` 会省略【原文材料】段——ask 只发笔记本身
 - **导入解析**：`parse_import_note`（有标题建 Section 树、无标题按空行切多个段落、不剥代码围栏）；HTML 在浏览器端用 DOMParser 白名单转换（KaTeX 公式还原、脚本/事件属性丢弃、隐藏元素跳过）
 - **数学宏**：HTML 里「几乎全是 `\newcommand`」的宏块会被收集为 `Note.math_macros`（随笔记保存），渲染公式时用 `scanMacroDefs` 解析成 KaTeX 的 `macros` 选项（名字带反斜杠，避免单字母被当普通字符展开）；笔记 iframe / HTML 导出 / 弹窗回答三处共用

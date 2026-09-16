@@ -1,9 +1,10 @@
 //! 提示词模板与笔记风格的落盘与加载。
 //!
 //! - 行为提示词（ask / rewrite）外置为 `.paperhelper/prompts/*.txt`，用户可直接编辑。
-//! - **笔记风格**是一套「名字 + 说明 + 提示词模板（含 `{raw_text}`）」：
+//! - **笔记风格**是一套「名字 + 说明 + 提示词模板」：
 //!   清单在 `.paperhelper/styles.toml`，提示词在 `.paperhelper/styles/<id>.txt`；
 //!   内置风格可编辑/恢复默认，用户可新建自定义风格（Web 界面或直接改文件）。
+//!   资料全文由 `compose_style_prompt` 固定附加，风格文本里不应出现 `{raw_text}`。
 //! - `ask.txt` 约定 LLM 用 `[[概念: 名字]]` 行回报核心概念，是知识库提取概念的接口协议。
 
 use anyhow::{bail, Result};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::logging;
 use crate::paths;
 
 /// 提示词模板目录：.paperhelper/prompts/
@@ -69,7 +71,7 @@ const LEGACY_ASK_PROMPT: &str = "你是一位耐心的学习助手（适用于�
 
 回答完毕后，另起一行写 [[概念: 概念名]]，概念名是1-8个词的短语，概括本次问答涉及的核心知识点（如\"BERTScore\"、\"MQAG框架\"、\"语义熵\"）。";
 
-/// 笔记生成模板：{raw_text} 会被替换为论文全文。
+/// 笔记生成模板（资料全文由程序在 `compose_style_prompt` 末尾固定附加）。
 pub const DEFAULT_NOTE_PROMPT: &str = r#"请阅读以下论文全文，生成一份**详细**的学习笔记 Markdown，遵循固定四段架构。
 
 架构与分块规则：
@@ -78,10 +80,7 @@ pub const DEFAULT_NOTE_PROMPT: &str = r#"请阅读以下论文全文，生成一
   - 「二、前人方案」下，每个前人方案一个 `###` 小标题，说清做法与不足；
   - 「三、本文方案」下，若论文提出多个方案/变体（如 5 种变体），**每个变体单独一个 `###` 小标题**，详细说明做法、公式、数据、直觉、优缺点；
   - 「四、前景」下，每个方向一个 `###` 小标题。
-- 要详细：保留论文中的关键公式、数值结果、对比表格、算法步骤。不要泛泛概括，要展开具体内容。
-
-论文全文：
-{raw_text}"#;
+- 要详细：保留论文中的关键公式、数值结果、对比表格、算法步骤。不要泛泛概括，要展开具体内容。"#;
 
 /// 逐段翻译模板：忠实翻译、保留原文结构（单次整篇；输出被截断时会提示用户）。
 pub const DEFAULT_TRANSLATE_PROMPT: &str = r#"请把以下资料**忠实翻译**成中文，生成一份「原文照搬式」的笔记 Markdown。
@@ -90,10 +89,7 @@ pub const DEFAULT_TRANSLATE_PROMPT: &str = r#"请把以下资料**忠实翻译**
 - 标题翻译成中文。
 - 尽量忠实：逐段翻译，保留原文的章节结构、段落顺序与层级，不要合并、省略或重排。
 - 模型名、数据集名、指标名等专有名词保留英文；公式本身不翻译。
-- 不要总结、不要发挥、不要添加原文没有的内容。
-
-资料全文：
-{raw_text}"#;
+- 不要总结、不要发挥、不要添加原文没有的内容。"#;
 
 /// 中英对照翻译模板。
 pub const DEFAULT_TRANSLATE_BI_PROMPT: &str = r#"请把以下资料**逐段翻译**成中文，生成一份「原文 + 译文」对照的 Markdown 笔记。
@@ -102,16 +98,10 @@ pub const DEFAULT_TRANSLATE_BI_PROMPT: &str = r#"请把以下资料**逐段翻�
 - 标题中英都写。
 - 保留原文的章节结构；每个段落先给原文、再给译文（译文用 `> ` 引用块，或另起一段，全文保持一致）。
 - 公式本身不翻译；专有名词保留英文（首次出现可在括号内注中文）。
-- 不要总结、不要发挥、不要添加原文没有的内容。
-
-资料全文：
-{raw_text}"#;
+- 不要总结、不要发挥、不要添加原文没有的内容。"#;
 
 /// 自由笔记模板：不加结构约束，让模型自行组织。
-pub const DEFAULT_FREE_PROMPT: &str = r#"请阅读以下资料，生成一份你认为最有帮助的学习笔记 Markdown。结构、详略、排版都由你决定；若材料有清晰章节，建议沿用，以便对照原文。
-
-资料全文：
-{raw_text}"#;
+pub const DEFAULT_FREE_PROMPT: &str = r#"请阅读以下资料，生成一份你认为最有帮助的学习笔记 Markdown。结构、详略、排版都由你决定；若材料有清晰章节，建议沿用，以便对照原文。"#;
 
 /// 忠实照抄模板：内容与顺序保持原样，只做 Markdown 结构化。
 pub const DEFAULT_VERBATIM_PROMPT: &str = r#"请把以下资料整理成一份**忠实照抄式**的 Markdown 笔记：内容与顺序尽量保持原样，只做必要的结构化。
@@ -119,10 +109,7 @@ pub const DEFAULT_VERBATIM_PROMPT: &str = r#"请把以下资料整理成一份**
 要求：
 - 保留原文的章节结构：不要合并、省略或重排；段落文字不删改、不总结、不发挥。
 - 图表位置用一句话说明占位（如 `![图：…](图)`），不要凭空编造内容。
-- 扫描/OCR 可能有错字：只修正明显的断行、连字符与乱码，不做语义改写。
-
-资料全文：
-{raw_text}"#;
+- 扫描/OCR 可能有错字：只修正明显的断行、连字符与乱码，不做语义改写。"#;
 
 /// 讲义提纲模板：按知识点分节，适合课程讲义/幻灯片。
 pub const DEFAULT_LECTURE_PROMPT: &str = r#"请阅读以下课程讲义/教学材料，生成一份**复习提纲式**的学习笔记 Markdown。
@@ -130,10 +117,7 @@ pub const DEFAULT_LECTURE_PROMPT: &str = r#"请阅读以下课程讲义/教学�
 要求：
 - 用 `##` 按**知识点/主题**分节（不要按页码分）；每个知识点下用 `###` 细分（定义、定理/公式、推导、例子、易错点），按材料实际内容取舍。
 - 保留关键定义、定理、公式与推导、例题结论；省略寒暄、课程通知与重复内容。
-- 结尾加一节 `## 复习提纲`，用要点列出需要掌握的概念与题型。
-
-讲义全文：
-{raw_text}"#;
+- 结尾加一节 `## 复习提纲`，用要点列出需要掌握的概念与题型。"#;
 
 /// AI 改写 / 补充模板。占位符：{paper} {note} {target} {instruction} {task}
 pub const DEFAULT_REWRITE_PROMPT: &str = r#"你是一位论文笔记编辑助手。用户会给你论文全文、当前笔记，以及要处理的笔记片段，请按用户要求完成编辑。
@@ -162,7 +146,7 @@ pub const DEFAULT_REWRITE_PROMPT: &str = r#"你是一位论文笔记编辑助手
 
 // ===== 笔记风格注册表：.paperhelper/styles.toml + styles/<id>.txt =====
 
-/// 一种笔记风格：生成笔记时使用的提示词模板（含 `{raw_text}` 占位符）。
+/// 一种笔记风格：生成笔记时使用的提示词模板（资料全文由程序固定附加）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteStyle {
     pub id: String,
@@ -412,6 +396,20 @@ pub fn ensure_styles() -> Result<()> {
             }
         }
     }
+    // 清理风格文本里的 {raw_text} 占位符（原文改由程序固定附加，用户不应看到）
+    for s in &file.style {
+        let p = dir.join(style_file_name(s));
+        if let Ok(cur) = fs::read_to_string(&p) {
+            let cleaned = sanitize_style_prompt(&cur);
+            if cleaned != cur {
+                logging::info(format!(
+                    "风格 `{}` 的提示词已清除 {{raw_text}} 占位符（原文由程序自动附加）",
+                    s.id
+                ));
+                let _ = fs::write(&p, cleaned);
+            }
+        }
+    }
     // 自定义风格缺文件时补空文件，避免界面读取失败
     for s in &file.style {
         let p = dir.join(style_file_name(s));
@@ -452,7 +450,7 @@ pub fn style_prompt(style_id: &str) -> Result<(NoteStyle, String)> {
     Ok((meta.clone(), style_prompt_text(&meta)))
 }
 
-/// 读取某风格的提示词内容（文件缺失/为空时回落内置默认）。
+/// 读取某风格的提示词内容（文件缺失/为空时回落内置默认；自动清理旧占位符）。
 pub fn style_prompt_text(meta: &NoteStyle) -> String {
     let p = styles_dir().join(style_file_name(meta));
     let text = fs::read_to_string(&p).unwrap_or_default();
@@ -461,7 +459,7 @@ pub fn style_prompt_text(meta: &NoteStyle) -> String {
             return d.to_string();
         }
     }
-    text
+    sanitize_style_prompt(&text)
 }
 
 /// **固定输出契约**：让笔记能被程序解析成树（标题层级、公式定界符等）。
@@ -475,18 +473,38 @@ pub const STYLE_CONTRACT: &str = "【输出格式（程序解析笔记所必需�
 
 ";
 
-/// 组装完整的笔记生成提示词：固定契约 + 风格（用户可编辑部分）+ 额外要求 + 资料全文。
-/// 风格文件里若没有 `{raw_text}` 占位符，程序会在末尾补上资料全文。
+/// 清除风格文本里的原文占位符：`{raw_text}` 所在行，以及移除后残留在尾部的
+/// 「资料全文：」等纯标签行。
+///
+/// 资料全文改由程序在 `compose_style_prompt` 里固定附加，用户不应在风格里
+/// 编辑/看到占位符；旧文件在读取、保存与启动迁移时自动清理。
+pub fn sanitize_style_prompt(text: &str) -> String {
+    if !text.contains("{raw_text}") {
+        return text.to_string();
+    }
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.contains("{raw_text}")).collect();
+    while let Some(last) = lines.last() {
+        let t = last.trim().trim_end_matches([':', '：']).trim();
+        let label_only = matches!(t, "资料全文" | "论文全文" | "讲义全文" | "原文" | "资料");
+        if last.trim().is_empty() || label_only {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    lines.join("\n").trim_end().to_string()
+}
+
+/// 组装完整的笔记生成提示词：固定契约 + 风格（用户可编辑的「写什么」部分）
+/// + 资料全文（程序固定附加）+ 额外要求。
 pub fn compose_style_prompt(style: &str, raw_text: &str, extra: &str) -> Result<String> {
     let (_, body) = style_prompt(style)?;
-    let mut prompt = format!("{STYLE_CONTRACT}{body}");
-    if !body.contains("{raw_text}") {
-        prompt.push_str("\n\n资料全文：\n{raw_text}");
-    }
+    let body = sanitize_style_prompt(&body);
+    let mut prompt = format!("{STYLE_CONTRACT}{body}\n\n资料全文：\n{raw_text}");
     if !extra.trim().is_empty() {
         prompt.push_str(&format!("\n\n【本次额外要求】\n{}", extra.trim()));
     }
-    Ok(prompt.replace("{raw_text}", raw_text))
+    Ok(prompt)
 }
 
 /// 风格 id 合法性：1~40 个 ASCII 字母/数字/`-`/`_`，且以字母或数字开头。
@@ -544,7 +562,7 @@ pub fn save_style(meta: &NoteStyle, prompt: &str) -> Result<()> {
         entry.file = format!("{id}.txt");
     }
     let fname = style_file_name(entry);
-    fs::write(styles_dir().join(fname), prompt)?;
+    fs::write(styles_dir().join(fname), sanitize_style_prompt(prompt))?;
     fs::write(styles_toml_path(), toml::to_string_pretty(&file)?)?;
     Ok(())
 }
@@ -630,10 +648,24 @@ mod tests {
         for want in ["four", "translate", "translate-bi", "verbatim", "lecture", "free"] {
             assert!(ids.contains(&want.to_string()), "缺少内置风格 {want}");
         }
-        // 每个内置风格都有默认提示词且带 {raw_text} 占位符
+        // 内置提示词不含 {raw_text}（原文由程序固定附加），且不为空
         for (m, prompt) in builtin_styles() {
-            assert!(prompt.contains("{raw_text}"), "风格 {} 的提示词缺少 {{raw_text}}", m.id);
+            assert!(!prompt.trim().is_empty(), "风格 {} 的提示词为空", m.id);
+            assert!(!prompt.contains("{raw_text}"), "风格 {} 不应含 {{raw_text}}", m.id);
         }
+    }
+
+    #[test]
+    fn sanitize_style_prompt_strips_placeholder_and_label() {
+        // 旧内置格式：标签行 + 占位符行
+        let old = "请生成笔记。\n\n要求：\n- 要详细。\n\n资料全文：\n{raw_text}";
+        assert_eq!(sanitize_style_prompt(old), "请生成笔记。\n\n要求：\n- 要详细。");
+        // 占位符与标签同行
+        let inline = "请阅读以下内容。\n论文全文：{raw_text}";
+        assert_eq!(sanitize_style_prompt(inline), "请阅读以下内容。");
+        // 无占位符时保持原样
+        let cur = "只写内容要求：先直觉后公式。\n";
+        assert_eq!(sanitize_style_prompt(cur), cur);
     }
 
     #[test]
@@ -641,9 +673,12 @@ mod tests {
         let p = compose_style_prompt("four", "【资料】这里是一段论文", "只保留公式").unwrap();
         assert!(p.contains("【输出格式"), "应前置固定契约");
         assert!(p.contains("## 一、要解决的问题"), "应包含风格内容");
-        assert!(p.contains("【资料】这里是一段论文"), "应替换 raw_text 占位符");
+        assert!(
+            p.contains("资料全文：\n【资料】这里是一段论文"),
+            "应固定附加资料全文"
+        );
         assert!(p.contains("【本次额外要求】\n只保留公式"), "应追加额外要求");
-        assert!(!p.contains("{raw_text}"), "占位符应被替换");
+        assert!(!p.contains("{raw_text}"), "不应残留占位符");
     }
 
     #[test]

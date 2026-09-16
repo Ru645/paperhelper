@@ -963,7 +963,7 @@ PaperHelper 命令：
         if let Some(id) = rest.strip_prefix("show ") {
             let (meta, prompt) = crate::prompts::style_prompt(id.trim())?;
             outln!(self, "# {}（{}） scope={}\n{}", meta.id, meta.label, meta.scope, prompt);
-            outln!(self, "（固定的输出格式要求由程序自动附加，不在此显示）");
+            outln!(self, "（固定的输出格式要求与资料全文由程序自动附加，不在此显示）");
             return Ok(());
         }
         let styles = crate::prompts::list_styles()?;

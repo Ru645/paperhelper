@@ -84,6 +84,7 @@
           <details id="note-gen-reasoning" class="reasoning hidden">
             <summary>思考过程</summary>
             <div id="note-gen-reasoning-text" class="reasoning-text"></div>
+            <div class="reasoning-resize" data-target="note-gen-reasoning-text" title="拖动调整思考区高度"></div>
           </details>
           <pre id="note-gen-stream" class="note-gen-stream"></pre>
         </div>
@@ -250,8 +251,8 @@
     </div>
 
     <div id="settings-style" class="settings-pane hidden">
-      <p class="muted">风格 = 名字 + 说明 + 提示词模板（<code>{raw_text}</code> 为资料全文占位符）。内置风格可改可恢复默认，自定义风格可删除、可改 id（会同时改文件名）；文件在 <code>.paperhelper/styles/</code>。</p>
-      <p class="muted">下面只填「内容与结构」要求即可：<b>格式要求（<code>#</code> 标题、<code>##</code> 分节、<code>$公式$</code>、Markdown 表格等）由程序自动附加，不用也不应写在这里</b>。</p>
+      <p class="muted">风格 = 名字 + 说明 + <b>写什么</b>的提示词。内置风格可改可恢复默认，自定义风格可删除、可改 id（会同时改文件名）；文件在 <code>.paperhelper/styles/</code>。</p>
+      <p class="muted">这里只描述笔记 <b>要写什么、按什么顺序讲</b>（如：先讲直觉再给公式）。<b>怎么写</b>（<code>#</code> 标题、<code>$公式$</code>、Markdown 表格等语法）和<b>资料全文</b>都由程序自动处理，不必也不应写在这里。</p>
       <div class="styles-layout">
       <div class="styles-list" id="styles-list"></div>
       <div class="styles-edit">
@@ -265,7 +266,7 @@
             <option value="note">笔记 / 讲义</option>
           </select>
         </label>
-        <label>提示词（<code>{raw_text}</code> 会被替换为资料全文）</label>
+        <label>提示词（只写「写什么、按什么顺序讲」；格式与资料全文由程序自动附加）</label>
         <textarea id="style-prompt" rows="12" placeholder="请阅读以下资料，生成…"></textarea>
         <div class="styles-actions">
           <button id="btn-style-new" class="mini ghost">新建</button>
