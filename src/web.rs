@@ -262,19 +262,70 @@ async fn api_run(
             return;
         }
 
-        // 其它命令：短命令直接持锁执行；ask/check/sum 等 LLM 命令额外用门串行化
-        let needs_gate = matches!(first.as_str(), "ask" | "q" | "check" | "sum");
-        let _gate = if needs_gate {
-            match LLM_GATE.try_lock() {
-                Ok(g) => Some(g),
-                Err(_) => {
-                    emit_result_channel(&tx, Err(anyhow::anyhow!(LLM_BUSY_MSG)), &what, t0);
+        // ask/check/sum：与 ingest 相同的三段式（LLM 阶段不持 App 锁，
+        // 期间用户可浏览/切换会话；结果由 commit 写回发起会话）。
+        if matches!(first.as_str(), "ask" | "q" | "check" | "sum") {
+            enum Job {
+                Ask(crate::app::AskJob),
+                Sum(crate::app::SumJob),
+            }
+            let rest: String = command
+                .split_once(char::is_whitespace)
+                .map(|(_, r)| r.to_string())
+                .unwrap_or_default();
+            let prepared: anyhow::Result<Job> = {
+                let mut g = app2.lock().await;
+                g.emitter = Emitter::channel(tx.clone());
+                let r = if first == "sum" {
+                    g.prepare_sum(&rest).map(Job::Sum)
+                } else {
+                    g.prepare_ask_command(&rest, first == "check").map(Job::Ask)
+                };
+                g.emitter = Emitter::terminal();
+                r
+            };
+            let job = match prepared {
+                Ok(j) => j,
+                Err(e) => {
+                    emit_result_channel(&tx, Err(e), &what, t0);
                     return;
                 }
+            };
+            // 锁外执行（LLM 门串行化）
+            let res = match LLM_GATE.try_lock() {
+                Ok(_guard) => {
+                    let emitter = Emitter::channel(tx.clone());
+                    match &job {
+                        Job::Ask(j) => j.run(&emitter).await,
+                        Job::Sum(j) => j.run(&emitter).await,
+                    }
+                }
+                Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+            };
+            // 落地（持锁）
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let result = match res {
+                Ok(res) => match job {
+                    Job::Ask(j) => g.commit_ask(j, res).map(|_| ()),
+                    Job::Sum(j) => g.commit_sum(j, res),
+                },
+                Err(e) => {
+                    if let Job::Ask(j) = &job {
+                        g.abort_ask(j);
+                    }
+                    Err(e)
+                }
+            };
+            if result.is_ok() {
+                let _ = g.auto_persist();
             }
-        } else {
-            None
-        };
+            emit_result(&g.emitter, result, &what, t0);
+            g.emitter = Emitter::terminal();
+            return;
+        }
+
+        // 其它命令：短命令持锁执行（不再有长时间 LLM 命令走这里）
         let mut guard = app2.lock().await;
         guard.emitter = Emitter::channel(tx.clone());
         if let Some(e) = export.clone() {
@@ -284,7 +335,7 @@ async fn api_run(
         }
         let mutating = matches!(
             first.as_str(),
-            "ingest" | "pdf" | "ask" | "q" | "check" | "sum" | "del" | "rm" | "undo" | "new" | "load"
+            "ingest" | "pdf" | "del" | "rm" | "undo" | "new" | "load"
         );
         let result = guard.run_command(&command).await;
         if result.is_ok() && mutating {
@@ -756,7 +807,7 @@ async fn api_note_ai(
         g.emitter = Emitter::channel(tx.clone());
         let result = match res {
             Ok(res) => {
-                g.commit_usage(&res);
+                g.commit_usage(&job, &res);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -814,7 +865,7 @@ async fn api_note_restyle(
         g.emitter = Emitter::channel(tx.clone());
         let result = match res {
             Ok(res) => {
-                g.commit_usage(&res);
+                g.commit_usage(&job, &res);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1073,9 +1124,12 @@ async fn api_session_load(
     let loaded = session::Session::load(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let mut a = app.lock().await;
+    // 切换前先落盘当前会话：在途 LLM 任务稍后会把结果写回它（见 App::with_session）
+    if let Err(e) = a.auto_persist() {
+        crate::logging::warn(format!("切换会话前保存失败: {e:#}"));
+    }
     a.session = loaded;
     a.export_path = a.session.export_path.clone();
-    a.bump_epoch(); // 切换会话：让在途 LLM 任务的结果不再写回
     a.update_completions();
     let name = a.session.session_name.clone();
     Ok(Json(json!({ "ok": true, "id": target, "name": name })))
@@ -1157,12 +1211,13 @@ async fn api_session_delete(
     let _ = session::save_pins(&pins);
 
     let mut a = app.lock().await;
+    // 给在途 LLM 任务制造冲突：结果不会写回已删除的会话
+    a.bump_session(&target);
     let mut reset = false;
     if a.session.session_id == target {
         // 删除的是当前会话：自动新建空会话
         a.session = session::Session::default();
         a.export_path = None;
-        a.bump_epoch(); // 会话被重置：在途 LLM 任务的结果不再写回
         a.update_completions();
         reset = true;
     }

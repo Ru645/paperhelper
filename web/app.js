@@ -18,7 +18,11 @@ let importResolve = null;   // 导入弹窗的 Promise resolve
 let editBlockId = null;     // 正在编辑的块 id
 let editBlockKind = "paragraph"; // 正在编辑的块类型：paragraph | section | title
 let editMode = "manual";    // manual | rewrite | append
-let editAbort = null;       // AI 生成时的 AbortController
+// AI 生成结果按块存草稿：block_id -> { text, status, cls }（关弹窗/切会话都不丢）
+const editDrafts = new Map();
+// 正在后台生成的 AI 编辑任务：{ blockId, ctrl }（与顶部进度/停止按钮联动）
+let editRun = null;
+let importRun = null;       // 后台导入任务：{ sessionId }，用于切回发起会话时恢复覆盖层
 const dynamicTabs = new Map(); // key -> { btn, pane }
 // 批注（选中文字提问）
 let annotationsCache = [];
@@ -233,6 +237,19 @@ function appendReasoning(which, text) {
 // ===== 笔记区「生成中」覆盖层（导入/生成笔记的实时反馈） =====
 let noteGenTimer = null, noteGenStart = 0, noteGenChars = 0;
 
+function noteGenTick() {
+  const secs = Math.round((Date.now() - noteGenStart) / 1000);
+  const parts = [secs + "s"];
+  if (noteGenChars > 0) parts.unshift(noteGenChars.toLocaleString() + " 字");
+  $("note-gen-meta").textContent = parts.join(" · ");
+}
+
+/// 显示覆盖层（内容保留）：切回发起会话时可恢复实时反馈。
+function noteGenShow() {
+  $("note-gen").classList.remove("hidden");
+  if (!noteGenTimer) noteGenTimer = setInterval(noteGenTick, 500);
+}
+
 function noteGenReset() {
   $("note-gen-stream").textContent = "";
   $("note-gen-log").innerHTML = "";
@@ -242,13 +259,7 @@ function noteGenReset() {
   if (noteGenTimer) { clearInterval(noteGenTimer); noteGenTimer = null; }
   noteGenStart = Date.now();
   noteGenChars = 0;
-  noteGenTimer = setInterval(() => {
-    const secs = Math.round((Date.now() - noteGenStart) / 1000);
-    const parts = [secs + "s"];
-    if (noteGenChars > 0) parts.unshift(noteGenChars.toLocaleString() + " 字");
-    $("note-gen-meta").textContent = parts.join(" · ");
-  }, 500);
-  $("note-gen").classList.remove("hidden");
+  noteGenShow();
 }
 
 function noteGenHide() {
@@ -396,22 +407,35 @@ function handleFrame(frame, opts = {}) {
   const { name, text } = parseFrame(frame);
   // 导入/生成笔记：反馈都进「笔记区」覆盖层（控制台只在出错时用）
   if (opts.ui === "import") {
+    // 用户切走会话时覆盖层被隐藏：任务继续，完成/错误仍需在控制台可见
+    const overlayHidden = () => $("note-gen").classList.contains("hidden");
     switch (name) {
-      case "stdout": noteGenLog(text); return;
-      case "stderr": noteGenLog(text, "err"); return;
-      case "token": noteGenToken(text); return;
+      case "stdout": if (overlayHidden()) appendConsole(text, "ok"); else noteGenLog(text); return;
+      case "stderr": if (overlayHidden()) appendConsole(text, "err"); else noteGenLog(text, "err"); return;
+      case "token": if (!overlayHidden()) noteGenToken(text); return;
       case "chars": {
         noteGenChars = Math.max(0, parseInt(text, 10) || 0);
         progressChars = noteGenChars;
         updateProgressText();
         return;
       }
-      case "reasoning": appendReasoning("note-gen", text); return;
+      case "reasoning": if (!overlayHidden()) appendReasoning("note-gen", text); return;
       case "progress": noteGenPhase(text); setProgress(text); return;
       case "progress_done": setProgress(""); return;
-      case "aborted": noteGenLog("⏹ 已中止", "err"); setProgress(""); return;
+      case "aborted":
+        if (overlayHidden()) appendConsole("⏹ 已中止", "warn"); else noteGenLog("⏹ 已中止", "err");
+        setProgress("");
+        return;
       case "error": renderError(text); return;
-      case "done": noteGenLog("✓ 完成"); setProgress(""); return;
+      case "done":
+        if (overlayHidden()) {
+          appendConsole("✓ 生成完成（结果已写入发起会话，见左侧会话列表）", "ok");
+          showBusyHint("✓ 生成完成，结果已写入发起会话");
+        } else {
+          noteGenLog("✓ 完成");
+        }
+        setProgress("");
+        return;
       default: if (text) noteGenLog(text); return;
     }
   }
@@ -468,6 +492,7 @@ async function stopCurrent() {
   try { await fetch("/api/interrupt", { method: "POST" }); } catch (e) { /* 忽略 */ }
   if (currentAbort) { try { currentAbort.abort(); } catch (e) { /* 忽略 */ } }
   if (annAbort) { try { annAbort.abort(); } catch (e) { /* 忽略 */ } }
+  if (editRun) { try { editRun.ctrl.abort(); } catch (e) { /* 忽略 */ } }
 }
 
 async function runCommand(command, opts = {}) {
@@ -1395,6 +1420,19 @@ function populateEditStyles() {
   else if ([...sel.options].some((o) => o.value === "four")) sel.value = "four";
 }
 
+/// 弹窗是否正打开着某个块（AI 流式回填只在此时更新界面）。
+function editModalOpen(bid) {
+  return !$("edit-modal").classList.contains("hidden") && editBlockId === bid;
+}
+
+/// 按后台生成状态刷新「生成/停止」按钮（生成属于别的块时只禁用生成）。
+function reflectEditRun() {
+  const mine = !!editRun && editRun.blockId === editBlockId;
+  $("btn-edit-gen").disabled = !!editRun;
+  $("btn-edit-stop").classList.toggle("hidden", !mine);
+  showBar("edit-ai-bar", mine);
+}
+
 async function openEditModal(id) {
   editBlockId = id;
   setEditTab("manual");
@@ -1423,6 +1461,17 @@ async function openEditModal(id) {
     }
     // 章节：编辑框展示「标题 + 全部子块」；段落/标题：只有自身文字
     $("edit-text").value = editBlockKind === "section" && b.markdown ? b.markdown : (b.text || "");
+    // 后台生成的草稿（含生成中途的实时内容）：打开时恢复
+    const draft = editDrafts.get(id);
+    if (draft && draft.text) $("edit-text").value = draft.text;
+    if (draft && draft.status) {
+      $("edit-status").textContent = draft.status;
+      $("edit-status").className = "status " + (draft.cls || "");
+    } else if (editRun && editRun.blockId === id) {
+      $("edit-status").textContent = "AI 生成中…";
+      $("edit-status").className = "status";
+    }
+    reflectEditRun();
     const kind = isTitle ? "标题" : b.kind === "section" ? `章节 ${b.number || ""}`.trim() : "段落";
     $("edit-title").textContent = "编辑" + kind;
     const parts = [];
@@ -1446,10 +1495,8 @@ async function openEditModal(id) {
 }
 
 function closeEditModal() {
-  if (editAbort) {
-    try { editAbort.abort(); } catch (e) { /* 忽略 */ }
-    editAbort = null;
-  }
+  // AI 生成任务不中断：结果会存为草稿（editDrafts），关弹窗/切会话都不丢；
+  // 需要停止请点弹窗内或顶部「停止」。
   setEditProgress("");
   $("edit-modal").classList.add("hidden");
   $("blk-edit-btn").classList.add("hidden");
@@ -1458,6 +1505,7 @@ function closeEditModal() {
 async function generateEdit() {
   if (!editBlockId) return;
   if (running || llmBusyTask) { showBusyHint(); return; }
+  const bid = editBlockId;
   const instruction = $("edit-instruction").value.trim();
   const st = $("edit-status");
   const isRestyle = editMode === "restyle";
@@ -1468,20 +1516,37 @@ async function generateEdit() {
   }
   const mode = editMode === "append" ? "append" : "rewrite";
   llmBusyTask = isRestyle ? "按风格重写全文" : "AI 生成";
+  setRunning(true); // 顶部进度 + 停止按钮：切走后也能随时回到/中止
+  setProgress(isRestyle ? "按风格重写中…" : "AI 生成中…");
   setEditProgress(isRestyle ? "按风格重写中…" : "AI 生成中…");
   resetReasoning("edit");
-  $("edit-text").value = "";
-  $("btn-edit-gen").disabled = true;
-  $("btn-edit-stop").classList.remove("hidden");
-  showBar("edit-ai-bar", true);
   const ctrl = new AbortController();
-  editAbort = ctrl;
+  const run = { blockId: bid, ctrl };
+  editRun = run;
   let acc = "";
+  const setStatus = (s, cls) => {
+    const d = editDrafts.get(bid) || { text: "" };
+    d.text = acc;
+    d.status = s;
+    d.cls = cls || "";
+    editDrafts.set(bid, d);
+    if (editModalOpen(bid)) {
+      $("edit-status").textContent = s;
+      $("edit-status").className = "status " + (cls || "");
+    }
+  };
+  setStatus("生成中…");
+  if (editModalOpen(bid)) {
+    $("edit-text").value = "";
+    $("btn-edit-gen").disabled = true;
+    $("btn-edit-stop").classList.remove("hidden");
+  }
+  showBar("edit-ai-bar", true);
   try {
     const url = isRestyle ? "/api/note/restyle" : "/api/note/ai";
     const body = isRestyle
       ? { style: $("edit-style").value, extra: instruction }
-      : { block_id: editBlockId, instruction, mode };
+      : { block_id: bid, instruction, mode };
     await postSse(url, body, ({ name, text }) => {
       if (name === "token") {
         if (!acc) {
@@ -1489,10 +1554,13 @@ async function generateEdit() {
           setEditProgress("");
         }
         acc += text;
-        $("edit-text").value = acc;
-        $("edit-text").scrollTop = $("edit-text").scrollHeight;
+        setStatus("生成中…");
+        if (editModalOpen(bid)) {
+          $("edit-text").value = acc;
+          $("edit-text").scrollTop = $("edit-text").scrollHeight;
+        }
       } else if (name === "reasoning") {
-        appendReasoning("edit", text);
+        if (editModalOpen(bid)) appendReasoning("edit", text);
       } else if (name === "progress") {
         setEditProgress(text);
       } else if (name === "stderr") {
@@ -1500,42 +1568,49 @@ async function generateEdit() {
       } else if (name === "error") {
         const { summary } = parseError(text);
         setEditProgress("");
-        st.textContent = "❌ " + summary;
-        st.className = "status err";
+        setStatus("❌ " + summary, "err");
+        appendConsole("❌ AI 生成失败：" + summary, "err");
       } else if (name === "aborted") {
         setEditProgress("");
-        st.textContent = "⏹ 已中止";
-        st.className = "status";
+        setStatus("⏹ 已中止");
+        if (!editModalOpen(bid)) appendConsole("⏹ AI 生成已中止", "warn");
       }
     }, { signal: ctrl.signal });
-    if (acc && !st.classList.contains("err")) {
+    const cur = editDrafts.get(bid) || {};
+    if (acc && !cur.cls) {
       setEditProgress("");
-      st.textContent = "✓ 已生成（可修改后点" + (mode === "append" ? "「插入」" : "「应用」") + "）";
-      st.className = "status ok";
+      setStatus("✓ 已生成（可修改后点" + (mode === "append" ? "「插入」" : "「应用」") + "）", "ok");
+      if (!editModalOpen(bid)) {
+        appendConsole("✓ AI 生成完成，草稿已保存（打开对应块即可应用）", "ok");
+        showBusyHint("✓ 生成完成，草稿已保存");
+      }
     }
   } catch (e) {
     if (e && e.name === "AbortError") {
-      st.textContent = "⏹ 已中止";
-      st.className = "status";
+      setStatus("⏹ 已中止");
+      if (!editModalOpen(bid)) appendConsole("⏹ AI 生成已中止", "warn");
     } else {
-      st.textContent = "❌ " + e.message;
-      st.className = "status err";
+      setStatus("❌ " + e.message, "err");
+      appendConsole("❌ AI 生成失败：" + e.message, "err");
     }
   }
-  editAbort = null;
+  if (editRun === run) editRun = null;
   llmBusyTask = "";
+  setRunning(false);
   setEditProgress("");
   showBar("edit-ai-bar", false);
-  $("btn-edit-gen").disabled = false;
-  $("btn-edit-stop").classList.add("hidden");
+  if (editModalOpen(bid)) {
+    $("btn-edit-gen").disabled = false;
+    $("btn-edit-stop").classList.add("hidden");
+  }
   const rbox = $("edit-reasoning");
   if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
 }
 
 function stopEditGen() {
   fetch("/api/interrupt", { method: "POST" }).catch(() => {});
-  if (editAbort) {
-    try { editAbort.abort(); } catch (e) { /* 忽略 */ }
+  if (editRun) {
+    try { editRun.ctrl.abort(); } catch (e) { /* 忽略 */ }
   }
 }
 
@@ -1556,6 +1631,7 @@ async function applyEdit(forceInsert) {
     st.className = "status";
     try {
       await postJson("/api/note/restyle/apply", { text });
+      editDrafts.clear(); // 整篇重建：旧块 id 的草稿全部失效
       st.textContent = "✓ 已保存";
       st.className = "status ok";
       closeEditModal();
@@ -1580,6 +1656,7 @@ async function applyEdit(forceInsert) {
   st.className = "status";
   try {
     await postJson(url, body);
+    editDrafts.delete(editBlockId);
     st.textContent = "✓ 已保存";
     st.className = "status ok";
     closeEditModal();
@@ -1597,6 +1674,7 @@ async function deleteEditBlock() {
   if (!confirm("删除该块及其子树？子块与追问会一并删除，相关批注也会移除。\n" + hint)) return;
   try {
     await postJson("/api/note/delete", { block_id: editBlockId });
+    editDrafts.delete(editBlockId);
     closeEditModal();
     await refreshState();
     reloadNote(null, true);
@@ -2286,9 +2364,13 @@ function renderSessions(list) {
 }
 
 async function loadSession(id, opts = {}) {
-  // 有 LLM 任务在跑时，切换会话会让未提交的结果作废（后端 epoch 保护），先确认
-  if (running || llmBusyTask) {
-    if (!confirm("有 LLM 任务正在运行（" + busyLabel() + "）。\n切换会话将放弃未写入的结果，确定切换？")) return;
+  // LLM 任务运行中也可自由切换：任务与发起会话绑定，结果写回那里（后端按会话版本校验）；
+  // 导入的实时反馈覆盖层随会话隐藏/恢复，完成后在控制台提示。
+  if (importRun) {
+    if (importRun.sessionId && importRun.sessionId === id) noteGenShow();
+    else noteGenHide();
+  } else {
+    noteGenHide(); // 没有后台导入时切会话，确保覆盖层不残留
   }
   const res = await fetch("/api/sessions/load", {
     method: "POST",
@@ -2762,7 +2844,13 @@ async function importFile(file) {
     const cmd = isRaw
       ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
       : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
-    await runCommand(cmd, { export: exportName, ui: "import", quiet: true });
+    // 记录发起会话：用户切走再切回时恢复实时反馈覆盖层
+    importRun = { sessionId: (lastState && lastState.session_id) || "" };
+    try {
+      await runCommand(cmd, { export: exportName, ui: "import", quiet: true });
+    } finally {
+      importRun = null;
+    }
   } catch (e) {
     noteGenLog("❌ 导入失败: " + e.message, "err");
     appendConsole("❌ 导入失败: " + e.message, "err");

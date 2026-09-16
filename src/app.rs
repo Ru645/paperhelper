@@ -22,6 +22,7 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::MatchingBracketValidator;
 use rustyline::{Cmd, Editor, KeyEvent, Helper};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -297,19 +298,23 @@ pub struct App {
     node_numbers: Arc<Mutex<Vec<String>>>,
     /// del 的内存撤销栈（最近在后，上限 20）。
     undo_stack: Vec<UndoSnapshot>,
-    /// 会话状态版本号：任何会改动会话内容（笔记/对话/批注）的操作都会递增。
-    /// 长时间 LLM 任务在开始时记录它，完成时若版本已变就放弃写入，
-    /// 避免把结果写进被切换/编辑过的会话。
-    pub state_epoch: u64,
+    /// 每个会话的状态版本号（key = session_id；未保存的新会话用固定占位符）。
+    /// 任何会改动会话内容（笔记/对话/批注）的操作都会递增对应会话的版本号。
+    /// 在途 LLM 任务在开始时记录「发起会话 key + 版本号」，完成时：
+    /// - 结果写回发起会话（用户切走了也不丢，见 `with_session`）；
+    /// - 若发起会话的版本号已变（被编辑/删除/被别的任务写过），则判冲突。
+    pub session_revs: HashMap<String, u64>,
 }
 
 /// 一次 ask/批注提问的「可锁外执行」上下文：
 /// prepare 阶段在持锁时构造；`run()` 不访问 App（可在锁外流式执行）；
-/// `commit_ask()` 再持锁落地，并检查 epoch 是否变化。
+/// `commit_ask()` 再持锁落地，并检查发起会话的版本号是否变化。
 pub struct AskJob {
     msgs: Vec<Message>,
     cfg: crate::config::LlmConfig,
     client: reqwest::Client,
+    /// 发起会话的版本号 key（`App::session_key`）——完成时据此写回发起会话。
+    session: String,
     epoch: u64,
     /// LLM 失败/中止时要恢复的 conversation.current（批注流程会临时改它）。
     restore_current: Option<String>,
@@ -359,6 +364,8 @@ pub struct IngestJob {
     msgs: Vec<Message>,
     cfg: crate::config::LlmConfig,
     client: reqwest::Client,
+    /// 发起会话的版本号 key（`App::session_key`）——完成时据此写回发起会话。
+    session: String,
     epoch: u64,
     raw_text: String,
     source_path: String,
@@ -378,6 +385,8 @@ pub struct SimpleJob {
     cfg: crate::config::LlmConfig,
     client: reqwest::Client,
     progress: String,
+    /// 发起会话的版本号 key：用量写回这个会话（用户切走也不记错账）。
+    session: String,
 }
 
 impl SimpleJob {
@@ -396,6 +405,29 @@ impl SimpleJob {
         if first {
             emitter.progress_done();
         }
+        res
+    }
+}
+
+/// sum（子树概括）的任务：prepare 在持锁时构造，`run()` 可在锁外流式执行。
+pub struct SumJob {
+    msgs: Vec<Message>,
+    cfg: crate::config::LlmConfig,
+    client: reqwest::Client,
+    /// 发起会话的版本号 key：总结写回这个会话（用户切走也不丢）。
+    session: String,
+    epoch: u64,
+    /// 被概括的子树根节点 id（commit 时据此定位 Explanation）。
+    cur: String,
+}
+
+impl SumJob {
+    /// 锁外执行 LLM 非流式调用（总结是一次性输出）。
+    pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        interrupt::reset();
+        emitter.progress("概括总结中…");
+        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |_| {}, None).await;
+        emitter.progress_done();
         res
     }
 }
@@ -457,13 +489,64 @@ impl App {
             section_numbers: Arc::new(Mutex::new(Vec::new())),
             node_numbers: Arc::new(Mutex::new(Vec::new())),
             undo_stack: Vec::new(),
-            state_epoch: 0,
+            session_revs: HashMap::new(),
         }
     }
 
-    /// 递增会话版本号（见 `state_epoch`）。
+    /// 当前会话的版本号 key（未保存的新会话用固定占位符，不会与时间戳 id 冲突）。
+    pub fn session_key(&self) -> String {
+        if self.session.session_id.is_empty() {
+            "\u{0}unsaved".to_string()
+        } else {
+            self.session.session_id.clone()
+        }
+    }
+
+    /// 某个会话当前的版本号（没记录过为 0）。
+    pub fn session_epoch(&self, key: &str) -> u64 {
+        self.session_revs.get(key).copied().unwrap_or(0)
+    }
+
+    /// 递增**当前会话**的版本号（改动其内容后调用，见 `session_revs`）。
     pub(crate) fn bump_epoch(&mut self) {
-        self.state_epoch = self.state_epoch.wrapping_add(1);
+        let key = self.session_key();
+        self.bump_session(&key);
+    }
+
+    /// 递增指定会话的版本号（如删除会话时给在途任务制造冲突）。
+    pub(crate) fn bump_session(&mut self, key: &str) {
+        let e = self.session_revs.entry(key.to_string()).or_insert(0);
+        *e = e.wrapping_add(1);
+    }
+
+    /// 给有内容但尚未保存的会话分配 session_id：在途任务用它的 key 定位发起会话。
+    pub(crate) fn ensure_session_id(&mut self) {
+        if self.session.session_id.is_empty()
+            && (self.session.notes.is_some() || !self.session.conversation.nodes.is_empty())
+        {
+            self.session.session_id = crate::paths::new_session_stamp();
+        }
+    }
+
+    /// 把当前会话临时换成 `target_id` 对应的磁盘会话，执行 `f`，成功后保存并换回。
+    /// `f` 内的 `self.session` / `self.export_path` 操作都会落在目标会话上；
+    /// `f` 失败（或返回 Err）则目标会话不落盘。用于把 LLM 结果写回发起会话。
+    fn with_session<F, T>(&mut self, target_id: &str, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let path = crate::paths::session_path(target_id);
+        let loaded = Session::load(&path)?;
+        let prev_session = std::mem::replace(&mut self.session, loaded);
+        let prev_export = std::mem::replace(&mut self.export_path, self.session.export_path.clone());
+        let out = f(self);
+        let target_export = std::mem::replace(&mut self.export_path, prev_export);
+        let mut target_session = std::mem::replace(&mut self.session, prev_session);
+        let value = out?;
+        target_session.export_path = target_export;
+        crate::paths::ensure_sessions_dir()?;
+        target_session.save(&path)?;
+        Ok(value)
     }
 
     /// 是否有可撤销的删除（Web 用于启用/禁用撤销按钮）。
@@ -696,10 +779,17 @@ impl App {
             "concepts" => self.cmd_concepts().await,
             "styles" => self.cmd_styles(rest).await,
             "new" => {
+                // 先保存当前会话：在途 LLM 任务稍后仍能写回它（写回不需要它是当前会话）
+                if let Err(e) = self.auto_persist() {
+                    crate::logging::warn(format!("新建会话前保存失败: {e:#}"));
+                }
+                if self.session.session_id.is_empty() {
+                    // 空会话没有 id（key 是占位符，new 后会重复使用）：递增版本号让在途任务判冲突
+                    self.bump_session(&self.session_key());
+                }
                 self.session = Session::default();
                 self.export_path = None;
                 self.undo_stack.clear();
-                self.bump_epoch();
                 outln!(self, "已新建会话。");
                 Ok(())
             }
@@ -1006,9 +1096,14 @@ PaperHelper 命令：
             bail!("用法: load <文件>");
         }
         let path = normalize_path_arg(rest);
+        // 先保存当前会话：在途 LLM 任务稍后仍能写回它
+        if let Err(e) = self.auto_persist() {
+            crate::logging::warn(format!("加载会话前保存失败: {e:#}"));
+        }
         self.session = Session::load(Path::new(&path))?;
+        // 从文件加载的会话可能没有 id：补一个，避免在途任务用占位符 key 混淆
+        self.ensure_session_id();
         self.export_path = self.session.export_path.clone();
-        self.bump_epoch();
         outln!(self, "已加载会话: 笔记={}, 对话节点={}",
             self.session.notes.is_some(),
             self.session.conversation.nodes.len());
@@ -1157,11 +1252,15 @@ PaperHelper 命令：
             Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
             Message { role: "user".into(), content: prompt },
         ];
+        // 有笔记/对话的会话先分配 id：在途任务完成时按此 key 写回发起会话
+        self.ensure_session_id();
+        let session = self.session_key();
         Ok(IngestPrep::Llm(Box::new(IngestJob {
             msgs,
             cfg: self.config.llm.clone(),
             client: self.client.clone(),
-            epoch: self.state_epoch,
+            session: session.clone(),
+            epoch: self.session_epoch(&session),
             raw_text,
             source_path: file_path,
             export_file,
@@ -1170,8 +1269,34 @@ PaperHelper 命令：
     }
 
     /// ingest 的 **落地段**（持锁）：解析生成结果、登记知识库与会话、导出。
-    /// 若导入期间会话已被切换/编辑（epoch 变化），则把结果另存为新会话，避免丢数据。
+    /// 用户已切换到别的会话时，把结果写回发起会话；发起会话被改动/删除时另存为新会话。
     pub fn commit_ingest(&mut self, job: IngestJob, res: crate::llm::LlmResult) -> Result<()> {
+        let target = job.session.clone();
+        let current = self.session_key();
+        if target != current {
+            let ok = job.epoch == self.session_epoch(&target)
+                && crate::paths::session_path(&target).exists();
+            if ok {
+                let name = self.with_session(&target, |app| {
+                    app.commit_ingest_local(&job, res)?;
+                    Ok(app.session.session_name.clone())
+                })?;
+                outln!(self, "{} 导入完成，笔记已写入会话《{}》", "✓".green().bold(), name);
+                self.update_completions();
+                return Ok(());
+            }
+            return self.commit_ingest_as_new(job, res, None);
+        }
+        if job.epoch != self.session_epoch(&target) {
+            return self.commit_ingest_as_new(job, res, Some("导入期间会话已变更"));
+        }
+        self.commit_ingest_local(&job, res)?;
+        self.update_completions();
+        Ok(())
+    }
+
+    /// ingest 落地到「当前会话」（调用前已确保目标会话就是当前会话）。
+    fn commit_ingest_local(&mut self, job: &IngestJob, res: crate::llm::LlmResult) -> Result<()> {
         self.record_usage(res.input_tokens, res.output_tokens);
         if res.truncated() {
             outerr!(
@@ -1185,42 +1310,52 @@ PaperHelper 命令：
         note.material_kind = job.kind.clone();
         let title = note.title.clone();
         let nblocks = note.count_blocks();
-
-        if job.epoch != self.state_epoch {
-            // 导入期间用户切换/编辑了会话：不覆盖当前会话，另存为新会话
-            let paper_id = uuid::Uuid::new_v4().to_string();
-            note.paper_id = paper_id.clone();
-            let mut sess = Session::default();
-            sess.notes = Some(note);
-            sess.current_paper_id = Some(paper_id.clone());
-            sess.session_name = title.clone();
-            sess.session_id = crate::paths::new_session_stamp();
-            sess.export_path = Some(job.export_file.clone());
-            self.kb.add_paper(Paper {
-                id: paper_id,
-                title: title.clone(),
-                path: job.source_path.clone(),
-                read_at: Utc::now().to_rfc3339(),
-                kind: job.kind.clone(),
-                pinned: false,
-            });
-            self.kb.save()?;
-            crate::paths::ensure_sessions_dir()?;
-            sess.save(&crate::paths::session_path(&sess.session_id))?;
-            outerr!(
-                self,
-                "{} 导入期间会话已切换，结果已另存为新会话《{}》（{}）",
-                "⚠️ ".yellow(),
-                title,
-                sess.session_id
-            );
-            return Ok(());
-        }
-
         outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
         self.register_note(note, &job.source_path, &job.export_file, res.input_tokens, res.output_tokens)
-            .with_context(|| format!("导入《{title}》"))?;
-        self.update_completions();
+            .with_context(|| format!("导入《{title}》"))
+    }
+
+    /// 无法写回发起会话时，把导入结果另存为新会话（知识库用量记全局）。
+    fn commit_ingest_as_new(
+        &mut self,
+        job: IngestJob,
+        res: crate::llm::LlmResult,
+        why: Option<&str>,
+    ) -> Result<()> {
+        let (in_tok, out_tok) = (res.input_tokens, res.output_tokens);
+        let cost = self.price_cost(in_tok, out_tok);
+        self.kb.stats.add(in_tok, out_tok, cost);
+        let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
+        note.material_kind = job.kind.clone();
+        let paper_id = uuid::Uuid::new_v4().to_string();
+        note.paper_id = paper_id.clone();
+        let title = note.title.clone();
+        let mut sess = Session::default();
+        sess.notes = Some(note);
+        sess.current_paper_id = Some(paper_id.clone());
+        sess.session_name = title.clone();
+        sess.session_id = crate::paths::new_session_stamp();
+        sess.export_path = Some(job.export_file.clone());
+        sess.stats.add(in_tok, out_tok, cost);
+        self.kb.add_paper(Paper {
+            id: paper_id,
+            title: title.clone(),
+            path: job.source_path.clone(),
+            read_at: Utc::now().to_rfc3339(),
+            kind: job.kind.clone(),
+            pinned: false,
+        });
+        self.kb.save()?;
+        crate::paths::ensure_sessions_dir()?;
+        sess.save(&crate::paths::session_path(&sess.session_id))?;
+        outerr!(
+            self,
+            "{} {}，结果已另存为新会话《{}》（{}）",
+            "⚠️ ".yellow(),
+            why.unwrap_or("发起会话已删除"),
+            title,
+            sess.session_id
+        );
         Ok(())
     }
 
@@ -1395,6 +1530,14 @@ PaperHelper 命令：
             outln!(self, "说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
             return Ok(());
         }
+        let job = self.prepare_ask_command(args, false)?;
+        self.run_ask(job).await.map(|_| ())
+    }
+
+    /// ask/check 的 **prepare 段入口**（CLI 与 Web 三段式共用）：
+    /// 解析参数 → 定位块 → `prepare_ask`；返回的 `AskJob` 可在不持 App 锁时流式执行。
+    pub fn prepare_ask_command(&mut self, args: &str, is_check: bool) -> Result<AskJob> {
+        let args = args.trim();
         // `--no-concept`：本次回答不写入「已学概念」（适合“这段什么意思”这类操作性提问）
         let (record_concept, args) = if let Some(rest) = strip_flag(args, "--no-concept") {
             (false, rest)
@@ -1405,7 +1548,11 @@ PaperHelper 命令：
         let (block_num, question) = parse_ask_args(args);
         let question = question.trim();
         if question.is_empty() {
-            bail!("用法: ask <编号> <问题>   例: ask 3.2 BERTScore是什么   (ask --help 看详情)");
+            bail!(
+                "用法: {} <编号> <问题>   例: {} 3.2 BERTScore是什么",
+                if is_check { "check" } else { "ask" },
+                if is_check { "check" } else { "ask" }
+            );
         }
         if block_num.is_none() {
             outerr!(self, "{} 未指定编号，将用关键词匹配定位（可能不准）。建议用 `ask <编号> <问题>`。", "⚠️ ".yellow());
@@ -1414,8 +1561,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, false, None, record_concept).await?;
-        Ok(())
+        self.prepare_ask(question, block_id, is_check, None, record_concept)
     }
 
     /// check <编号> <想法>：与 ask 类似调 LLM 回答，但不写入笔记、不增加追问嵌套。
@@ -1431,17 +1577,8 @@ PaperHelper 命令：
             outln!(self, "说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
             return Ok(());
         }
-        let (block_num, question) = parse_ask_args(args);
-        let question = question.trim();
-        if question.is_empty() {
-            bail!("用法: check <编号> <想法>   例: check 3.2 我觉得这个方法等价于余弦相似度");
-        }
-        if self.session.notes.is_none() {
-            bail!("还没有笔记，先 `ingest <pdf>`");
-        }
-        let block_id = self.resolve_block_id(question, &block_num);
-        self.ask_core(question, block_id, true, None, false).await?;
-        Ok(())
+        let job = self.prepare_ask_command(args, true)?;
+        self.run_ask(job).await.map(|_| ())
     }
 
     /// 按编号/关键词定位笔记块（ask/check 共用）。
@@ -1461,7 +1598,7 @@ PaperHelper 命令：
     /// ask/check 的 **prepare 段**（持锁）：预算检查 + 组装上下文。
     /// 返回的 `AskJob` 自带 msgs/config/client/emitter，可在**不持 App 锁**时流式执行。
     pub fn prepare_ask(
-        &self,
+        &mut self,
         question: &str,
         block_id: Option<String>,
         is_check: bool,
@@ -1471,13 +1608,16 @@ PaperHelper 命令：
         if !self.check_budget()? {
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
+        self.ensure_session_id();
+        let session = self.session_key();
         let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref(), quote);
         let approx_tokens = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
         Ok(AskJob {
             msgs,
             cfg: self.config.llm.clone(),
             client: self.client.clone(),
-            epoch: self.state_epoch,
+            session: session.clone(),
+            epoch: self.session_epoch(&session),
             restore_current: self.session.conversation.current.clone(),
             parent: self.session.conversation.current.clone(),
             question: question.to_string(),
@@ -1490,16 +1630,49 @@ PaperHelper 命令：
     }
 
     /// LLM 段失败/被中止：恢复 prepare 时临时改动的 conversation.current。
+    /// 用户已切走时，直接在发起会话的磁盘文件上恢复（若它还在）。
     pub fn abort_ask(&mut self, job: &AskJob) {
+        if job.session != self.session_key() {
+            let path = crate::paths::session_path(&job.session);
+            if let Ok(mut sess) = Session::load(&path) {
+                sess.conversation.current = job.restore_current.clone();
+                let _ = sess.save(&path);
+            }
+            return;
+        }
         self.session.conversation.current = job.restore_current.clone();
     }
 
     /// ask/check 的 **落地段**（持锁）：写解释/概念/对话节点。
-    /// 若期间会话已被切换/编辑（epoch 变化），则不写入并报错。
+    /// 用户已切走时把结果写回发起会话；发起会话被改动/删除则拒写（不污染任何会话）。
     pub fn commit_ask(&mut self, job: AskJob, res: crate::llm::LlmResult) -> Result<(String, Option<String>)> {
-        if job.epoch != self.state_epoch {
+        let target = job.session.clone();
+        let current = self.session_key();
+        if target != current {
+            if job.epoch != self.session_epoch(&target) {
+                bail!("会话已变更，本次回答未写入（可重新提问）");
+            }
+            if !crate::paths::session_path(&target).exists() {
+                bail!("发起会话已被删除，本次回答未写入");
+            }
+            let (name, out) = self.with_session(&target, |app| {
+                let name = app.session.session_name.clone();
+                let out = app.commit_ask_local(&job, res)?;
+                Ok((name, out))
+            })?;
+            outln!(self, "{} 回答已写入会话《{}》", "✓".green().bold(), name);
+            return Ok(out);
+        }
+        if job.epoch != self.session_epoch(&target) {
             bail!("会话已变更，本次回答未写入（可重新提问）");
         }
+        let out = self.commit_ask_local(&job, res)?;
+        self.update_completions();
+        Ok(out)
+    }
+
+    /// ask/check 落地到「当前会话」（调用前已确保目标会话就是当前会话）。
+    pub(crate) fn commit_ask_local(&mut self, job: &AskJob, res: crate::llm::LlmResult) -> Result<(String, Option<String>)> {
         self.record_usage(res.input_tokens, res.output_tokens);
         let (clean_answer, concept) = extract_concept(&res.content);
         // 节点标题：模型给出了概念就用它，否则用问题前若干字（仅作显示）
@@ -1609,21 +1782,12 @@ PaperHelper 命令：
             outln!(self, "[注: 本次 token 数为估算]");
         }
         self.bump_epoch();
-        self.update_completions();
         Ok((node_id, explanation_id))
     }
 
 
-    /// ask/check 共用核心（CLI 顺序执行）：prepare → 锁外 LLM → commit。
-    async fn ask_core(
-        &mut self,
-        question: &str,
-        block_id: Option<String>,
-        is_check: bool,
-        quote: Option<&str>,
-        record_concept: bool,
-    ) -> Result<(String, Option<String>)> {
-        let job = self.prepare_ask(question, block_id, is_check, quote, record_concept)?;
+    /// 执行 `AskJob`（锁外流式）并落地：失败/被打断时恢复会话指针。
+    pub async fn run_ask(&mut self, job: AskJob) -> Result<(String, Option<String>)> {
         let emitter = self.emitter.clone();
         match job.run(&emitter).await {
             Ok(res) => self.commit_ask(job, res),
@@ -1900,32 +2064,36 @@ PaperHelper 命令：
     }
 
     /// AI 重写/补充的 **prepare 段**（持锁）：只读会话，组装消息。
-    pub fn prepare_note_ai(&self, block_id: &str, instruction: &str, mode: &str) -> Result<SimpleJob> {
+    pub fn prepare_note_ai(&mut self, block_id: &str, instruction: &str, mode: &str) -> Result<SimpleJob> {
         let msgs = self.note_ai_messages(block_id, instruction, mode)?;
         let progress = self.announce_context(&msgs, "AI 生成中…");
+        self.ensure_session_id();
         Ok(SimpleJob {
             msgs,
             cfg: self.config.llm.clone(),
             client: self.client.clone(),
             progress,
+            session: self.session_key(),
         })
     }
 
     /// 按风格重写全文的 **prepare 段**（持锁）。
-    pub fn prepare_restyle(&self, style: &str, extra: &str) -> Result<SimpleJob> {
+    pub fn prepare_restyle(&mut self, style: &str, extra: &str) -> Result<SimpleJob> {
         let msgs = self.restyle_messages(style, extra)?;
         let progress = self.announce_context(&msgs, "按风格重写中…");
+        self.ensure_session_id();
         Ok(SimpleJob {
             msgs,
             cfg: self.config.llm.clone(),
             client: self.client.clone(),
             progress,
+            session: self.session_key(),
         })
     }
 
-    /// 只生成、不改会话的任务落地（持锁）：记用量 + 截断提示。
-    pub fn commit_usage(&mut self, res: &crate::llm::LlmResult) {
-        self.record_usage(res.input_tokens, res.output_tokens);
+    /// 只生成、不改会话的任务落地（持锁）：记用量（写回发起会话）+ 截断提示。
+    pub fn commit_usage(&mut self, job: &SimpleJob, res: &crate::llm::LlmResult) {
+        self.record_usage_for(&job.session, res.input_tokens, res.output_tokens);
         if res.truncated() {
             outerr!(self, "{} 输出达到上限（finish_reason=length），内容可能被截断", "⚠️ ".yellow());
         }
@@ -2013,13 +2181,46 @@ PaperHelper 命令：
     }
 
     /// 批注的 **落地段**（持锁）：写问答节点 + 批注记录。
+    /// 用户已切走时把批注写回发起会话；发起会话被改动/删除则拒写。
     pub fn commit_annotate(
         &mut self,
         job: AskJob,
         anchor: AnnAnchor,
         res: crate::llm::LlmResult,
     ) -> Result<(String, String, Option<String>)> {
-        let (node_id, expl_id) = self.commit_ask(job, res)?;
+        let target = job.session.clone();
+        let current = self.session_key();
+        if target != current {
+            if job.epoch != self.session_epoch(&target) {
+                bail!("会话已变更，本次批注未写入（可重新提问）");
+            }
+            if !crate::paths::session_path(&target).exists() {
+                bail!("发起会话已被删除，本次批注未写入");
+            }
+            let (name, out) = self.with_session(&target, |app| {
+                let name = app.session.session_name.clone();
+                let out = app.commit_annotate_local(&job, anchor, res)?;
+                Ok((name, out))
+            })?;
+            outln!(self, "{} 批注已写入会话《{}》", "✓".green().bold(), name);
+            return Ok(out);
+        }
+        if job.epoch != self.session_epoch(&target) {
+            bail!("会话已变更，本次批注未写入（可重新提问）");
+        }
+        let out = self.commit_annotate_local(&job, anchor, res)?;
+        self.update_completions();
+        Ok(out)
+    }
+
+    /// 批注落地到「当前会话」（调用前已确保目标会话就是当前会话）。
+    fn commit_annotate_local(
+        &mut self,
+        job: &AskJob,
+        anchor: AnnAnchor,
+        res: crate::llm::LlmResult,
+    ) -> Result<(String, String, Option<String>)> {
+        let (node_id, expl_id) = self.commit_ask_local(job, res)?;
         let ann_id = uuid::Uuid::new_v4().to_string();
         let annotation = match anchor {
             AnnAnchor::Note { block_id, quote, quote_tex } => Annotation {
@@ -2155,6 +2356,17 @@ PaperHelper 命令：
     /// 带解释的祖先（跳过 check）→ 给该 Explanation 写 summary 并折叠（collapsed）
     /// → 同步导出。终端先打印总结正文，笔记中体现为 <details> 折叠+总结。
     async fn cmd_sum(&mut self, rest: &str) -> Result<()> {
+        let job = self.prepare_sum(rest)?;
+        let emitter = self.emitter.clone();
+        match job.run(&emitter).await {
+            Ok(res) => self.commit_sum(job, res),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// sum 的 **prepare 段**（持锁）：定位节点、收集子树、组 prompt。
+    /// 返回的 `SumJob` 可在不持 App 锁时流式执行（Web 三段式复用）。
+    pub fn prepare_sum(&mut self, rest: &str) -> Result<SumJob> {
         if self.session.notes.is_none() {
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
@@ -2179,9 +2391,7 @@ PaperHelper 命令：
         if subtree.is_empty() {
             bail!("当前节点无问答内容");
         }
-        interrupt::reset();
-        let budget_ok = self.check_budget()?;
-        if !budget_ok {
+        if !self.check_budget()? {
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
 
@@ -2203,19 +2413,58 @@ PaperHelper 命令：
             Message { role: "system".into(), content: "你是学习总结助手，只输出总结正文。".into() },
             Message { role: "user".into(), content: prompt },
         ];
+        self.ensure_session_id();
+        let session = self.session_key();
+        Ok(SumJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            session: session.clone(),
+            epoch: self.session_epoch(&session),
+            cur,
+        })
+    }
 
-        self.emitter.progress("概括总结中…");
-        let res = llm::chat(&self.client, &self.config.llm, &msgs, false, self.config.llm.thinking_mode, &mut |_| {}, None).await;
-        self.emitter.progress_done();
-        let res = res?;
+    /// sum 的 **落地段**（持锁）：把总结挂到 Explanation（折叠子树）并同步导出。
+    /// 用户已切走时写回发起会话；发起会话被改动/删除则拒写。
+    pub fn commit_sum(&mut self, job: SumJob, res: crate::llm::LlmResult) -> Result<()> {
+        let target = job.session.clone();
+        let current = self.session_key();
+        if target != current {
+            if job.epoch != self.session_epoch(&target) {
+                bail!("会话已变更，本次总结未写入（可重试）");
+            }
+            if !crate::paths::session_path(&target).exists() {
+                bail!("发起会话已被删除，本次总结未写入");
+            }
+            let name = self.with_session(&target, |app| {
+                app.commit_sum_local(&job, res)?;
+                Ok(app.session.session_name.clone())
+            })?;
+            outln!(self, "{} 总结已写入会话《{}》", "✓".green().bold(), name);
+            self.update_completions();
+            return Ok(());
+        }
+        if job.epoch != self.session_epoch(&target) {
+            bail!("会话已变更，本次总结未写入（可重试）");
+        }
+        self.commit_sum_local(&job, res)?;
+        self.update_completions();
+        Ok(())
+    }
+
+    /// sum 落地到「当前会话」（调用前已确保目标会话就是当前会话）。
+    fn commit_sum_local(&mut self, job: &SumJob, res: crate::llm::LlmResult) -> Result<()> {
         self.record_usage(res.input_tokens, res.output_tokens);
-
+        if res.estimated {
+            outln!(self, "[注: 本次 token 数为估算]");
+        }
         let summary = res.content.trim().to_string();
         outln!(self, "\n**总结**：{summary}\n");
 
         // 写入笔记：插入当前节点（或其最近有解释的祖先，跳过 check）对应的
         // Explanation：折叠其子树 + 挂总结
-        let target_expl_id = Conversation::explanation_ancestor(&self.session.conversation.nodes, &cur)
+        let target_expl_id = Conversation::explanation_ancestor(&self.session.conversation.nodes, &job.cur)
             .ok_or_else(|| anyhow!("当前对话链上没有可插入总结的追问（先 `ask` 产生追问后再 `sum`）"))?;
         if let Some(note) = self.session.notes.as_mut() {
             if let Some(expl) = note.find_explanation_mut(&target_expl_id) {
@@ -2223,6 +2472,7 @@ PaperHelper 命令：
                 expl.collapsed = true;
             }
         }
+        self.bump_epoch();
         // 自动同步导出（与 ask 相同逻辑）
         if let Some(p) = &self.export_path {
             if let Some(note) = &self.session.notes {
@@ -2367,13 +2617,37 @@ PaperHelper 命令：
         Ok(used < budget)
     }
 
-    /// 记录一次 LLM 调用的 token 与成本（会话 + 全局）。
-    pub(crate) fn record_usage(&mut self, input: u64, output: u64) {
+    /// 按当前价格配置换算一次调用的成本（不做任何记录）。
+    pub(crate) fn price_cost(&self, input: u64, output: u64) -> f64 {
         let in_price = self.config.pricing.input_price_per_1m;
         let out_price = self.config.pricing.output_price_per_1m;
-        let cost = input as f64 * in_price / 1_000_000.0 + output as f64 * out_price / 1_000_000.0;
+        input as f64 * in_price / 1_000_000.0 + output as f64 * out_price / 1_000_000.0
+    }
+
+    /// 记录一次 LLM 调用的 token 与成本（会话 + 全局）。
+    pub(crate) fn record_usage(&mut self, input: u64, output: u64) {
+        let cost = self.price_cost(input, output);
         self.session.stats.add(input, output, cost);
         self.kb.stats.add(input, output, cost);
+    }
+
+    /// 记录一次 LLM 调用的用量，并写回到发起会话（用户可能已切走）。
+    /// 目标会话被删除时只记全局，避免凭空造会话。
+    pub(crate) fn record_usage_for(&mut self, session_key: &str, input: u64, output: u64) {
+        let cost = self.price_cost(input, output);
+        self.kb.stats.add(input, output, cost);
+        if session_key == self.session_key() {
+            self.session.stats.add(input, output, cost);
+            return;
+        }
+        if crate::paths::session_path(session_key).exists() {
+            if let Err(e) = self.with_session(session_key, |app| {
+                app.session.stats.add(input, output, cost);
+                Ok(())
+            }) {
+                crate::logging::warn(format!("用量写回会话失败（{session_key}）: {e}"));
+            }
+        }
     }
 
     /// 更新补全用的编号列表（section 编号 + 对话树节点编号）。
