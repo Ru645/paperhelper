@@ -23,6 +23,7 @@ mod pdf;
 mod presets;
 mod prompts;
 mod session;
+mod transfer;
 mod web;
 
 use anyhow::{anyhow, Result};

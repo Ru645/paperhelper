@@ -72,13 +72,14 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.toml")
 }
 
-pub fn knowledge_path() -> PathBuf {
-    data_dir().join("knowledge.json")
+/// 指定数据目录下的知识库文件（迁移/测试用）。
+pub fn knowledge_path_in(dir: &Path) -> PathBuf {
+    dir.join("knowledge.json")
 }
 
-/// 置顶会话编号列表（旁路文件，避免改写大会话文件）。
-pub fn pins_path() -> PathBuf {
-    data_dir().join("pins.json")
+/// 指定数据目录下的置顶文件（迁移/测试用）。
+pub fn pins_path_in(dir: &Path) -> PathBuf {
+    dir.join("pins.json")
 }
 
 /// 上传文件目录（Web 端导入 PDF 等）。
@@ -109,7 +110,12 @@ pub fn ensure_logs_dir() -> Result<()> {
 
 /// 会话存档目录
 pub fn sessions_dir() -> PathBuf {
-    data_dir().join("sessions")
+    sessions_dir_in(&data_dir())
+}
+
+/// 指定数据目录下的会话存档目录（迁移/测试用）。
+pub fn sessions_dir_in(dir: &Path) -> PathBuf {
+    dir.join("sessions")
 }
 
 /// 确保会话目录存在
@@ -127,13 +133,23 @@ pub fn new_session_stamp() -> String {
 
 /// 会话文件路径（按文件名标识，如时间戳）
 pub fn session_path(id: &str) -> PathBuf {
-    sessions_dir().join(format!("{id}.json"))
+    session_path_in(&data_dir(), id)
+}
+
+/// 指定数据目录下的会话文件路径（迁移/测试用）。
+pub fn session_path_in(dir: &Path, id: &str) -> PathBuf {
+    sessions_dir_in(dir).join(format!("{id}.json"))
 }
 
 /// 列出所有会话文件名标识（去 .json，按名称排序）。
 /// 新会话为时间戳（如 20260908_175624）；历史遗留的纯数字 ID 同样按文件名匹配。
 pub fn list_sessions() -> Vec<String> {
-    let dir = sessions_dir();
+    list_sessions_in(&data_dir())
+}
+
+/// 列出指定数据目录下的会话标识（迁移/测试用）。
+pub fn list_sessions_in(dir: &Path) -> Vec<String> {
+    let dir = sessions_dir_in(dir);
     if !dir.exists() {
         return Vec::new();
     }

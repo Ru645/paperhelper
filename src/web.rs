@@ -33,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::App;
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, llm, logging, notes, paths, pdf, session};
+use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -74,6 +74,12 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/sessions/pin", post(api_session_pin))
         .route("/api/sessions/rename", post(api_session_rename))
         .route("/api/sessions/delete", post(api_session_delete))
+        .route("/api/sessions/export", get(api_sessions_export))
+        .route(
+            "/api/sessions/import",
+            post(api_sessions_import)
+                .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
+        )
         .route("/api/concept", get(api_concept))
         .route("/api/paper", get(api_paper))
         .route("/api/paper/note", get(api_paper_note))
@@ -1641,6 +1647,167 @@ async fn api_session_delete(
         reset = true;
     }
     Ok(Json(json!({ "ok": true, "id": target, "reset": reset })))
+}
+
+// ===== 会话迁移：导出 / 导入 =====
+
+#[derive(Deserialize)]
+struct SessionExportQuery {
+    /// 会话编号（逗号分隔多个）；缺省 = 全部会话 + 知识库 + 置顶。
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// `GET /api/sessions/export[?id=<编号[,编号…]>]`
+/// - 单个：原始会话 JSON（可被 CLI `load` 直接加载）
+/// - 多个/缺省：备份包（缺省含全部会话 + 知识库 + 全部置顶）
+async fn api_sessions_export(Query(q): Query<SessionExportQuery>) -> Response {
+    let dir = paths::data_dir();
+    let keys: Vec<String> = q
+        .id
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if keys.len() == 1 {
+        let target = match resolve_session_id(&keys[0]) {
+            Ok(t) => t,
+            Err((code, msg)) => return (code, msg).into_response(),
+        };
+        let sess = match session::Session::load(&paths::session_path(&target)) {
+            Ok(s) => s,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("读取会话失败：{e:#}"))
+                    .into_response()
+            }
+        };
+        return match serde_json::to_string_pretty(&sess) {
+            Ok(body) => json_attachment(body, format!("{target}.json")),
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化失败：{e}")).into_response()
+            }
+        };
+    }
+
+    let selected = if keys.is_empty() {
+        None
+    } else {
+        let mut ids = Vec::with_capacity(keys.len());
+        for k in &keys {
+            match resolve_session_id(k) {
+                Ok(t) => ids.push(t),
+                Err((code, msg)) => return (code, msg).into_response(),
+            }
+        }
+        Some(ids)
+    };
+    let bundle = match transfer::export_bundle(&dir, selected.as_deref()) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("导出失败：{e:#}")).into_response()
+        }
+    };
+    let body = match serde_json::to_string_pretty(&bundle) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化失败：{e}")).into_response()
+        }
+    };
+    let name = format!(
+        "paperhelper-backup-{}.json",
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    );
+    json_attachment(body, name)
+}
+
+/// `POST /api/sessions/import`（multipart，字段 `file`）：
+/// 接受备份包或单个会话 JSON；编号冲突保留两者（自动改名），完全相同则跳过。
+async fn api_sessions_import(
+    State(app): State<SharedApp>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取上传失败（连接可能中断）：{e}")))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = field.file_name().unwrap_or("import.json").to_string();
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("读取上传数据失败：{e}")))?;
+        if bytes.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "文件为空".into()));
+        }
+        if bytes.len() as u64 > MAX_UPLOAD_BYTES {
+            let limit_mb = MAX_UPLOAD_BYTES / 1024 / 1024;
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("文件超过 {limit_mb}MB 上限，已拒绝"),
+            ));
+        }
+        let input = transfer::parse_import(&bytes)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        let dir = paths::data_dir();
+        let report = tokio::task::spawn_blocking(move || transfer::import_into(&dir, input))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("导入任务异常：{e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("导入失败：{e:#}")))?;
+        // 备份包可能带知识库：合并后重新载入内存（非 LLM 操作，短暂持锁）
+        if report.papers_added > 0 || report.concepts_added > 0 {
+            let mut a = app.lock().await;
+            match knowledge::KnowledgeBase::load() {
+                Ok(kb) => a.kb = kb,
+                Err(e) => logging::warn(format!("导入后重新加载知识库失败：{e:#}")),
+            }
+        }
+        logging::info(format!(
+            "会话导入完成：{filename}（新增 {}，跳过 {}；知识库 +{} 论文/+{} 概念；置顶 +{}）",
+            report.sessions.iter().filter(|s| !s.skipped).count(),
+            report.sessions.iter().filter(|s| s.skipped).count(),
+            report.papers_added,
+            report.concepts_added,
+            report.pins_added,
+        ));
+        return Ok(Json(json!({
+            "ok": true,
+            "sessions": report.sessions,
+            "knowledge": {
+                "papers_added": report.papers_added,
+                "concepts_added": report.concepts_added,
+            },
+            "pins_added": report.pins_added,
+        })));
+    }
+    Err((StatusCode::BAD_REQUEST, "缺少 file 字段".into()))
+}
+
+/// 以附件下载形式返回 JSON（文件名 ASCII 回退 + RFC 5987 filename*，支持中文）。
+fn json_attachment(body: String, filename: String) -> Response {
+    let ascii: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && c != '"' { c } else { '_' })
+        .collect();
+    let cd = format!(
+        "attachment; filename=\"{ascii}\"; filename*=UTF-8''{}",
+        pct_encode(&filename)
+    );
+    let mut resp = (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        body,
+    )
+        .into_response();
+    if let Ok(v) = header::HeaderValue::from_str(&cd) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp
 }
 
 // ===== 概念 / 论文详情 =====

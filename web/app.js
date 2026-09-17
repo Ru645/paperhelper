@@ -2422,6 +2422,7 @@ function showSessionMenu(x, y, s) {
         label: `${allPinned ? "取消置顶" : "置顶"}选中 ${bulk.length} 项`,
         fn: () => pinSessionsBulk(bulk, !allPinned),
       },
+      { label: `导出选中 ${bulk.length} 项`, fn: () => exportSessionsBulk(bulk) },
       { label: `删除选中 ${bulk.length} 项…`, danger: true, fn: () => deleteSessionsBulk(bulk) },
     ]);
     return;
@@ -2430,8 +2431,56 @@ function showSessionMenu(x, y, s) {
   showMenu(x, y, [
     { label: s.pinned ? "取消置顶" : "置顶会话", fn: () => pinSession(s.id, !s.pinned) },
     { label: "重命名", fn: () => renameSession(s) },
+    { label: "导出会话", fn: () => downloadUrl(`/api/sessions/export?id=${encodeURIComponent(s.id)}`) },
     { label: "删除会话", danger: true, fn: () => deleteSession(s) },
   ]);
+}
+
+/// 触发浏览器下载（GET 带 Content-Disposition）。
+function downloadUrl(url) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function exportSessionsBulk(items) {
+  const ids = items.map((s) => s.id).join(",");
+  downloadUrl(`/api/sessions/export?id=${encodeURIComponent(ids)}`);
+}
+
+/// 导入会话 / 整库备份：上传 JSON → 后端合并（编号冲突自动改名、重复跳过）。
+async function importSessionsFile(file) {
+  appendConsole(`⏳ 正在导入 ${file.name} …`);
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const res = await fetch("/api/sessions/import", { method: "POST", body: fd });
+    if (!res.ok) {
+      appendConsole("❌ 导入失败: " + (await res.text()), "err");
+      return;
+    }
+    const j = await res.json();
+    const list = j.sessions || [];
+    const added = list.filter((s) => !s.skipped).length;
+    const renamed = list.filter((s) => !s.skipped && s.to !== s.from).length;
+    const skipped = list.filter((s) => s.skipped).length;
+    let msg = `✅ 导入完成：新增 ${added} 个会话`;
+    if (renamed) msg += `（其中 ${renamed} 个因编号冲突自动改名）`;
+    if (skipped) msg += `，跳过 ${skipped} 个已导入过的`;
+    const kb = j.knowledge || {};
+    if (kb.papers_added || kb.concepts_added) {
+      msg += `；知识库 +${kb.papers_added || 0} 论文 / +${kb.concepts_added || 0} 概念`;
+    }
+    if (j.pins_added) msg += `；置顶 +${j.pins_added}`;
+    appendConsole(msg, "ok");
+    await refreshSessions();
+    await refreshState();
+  } catch (e) {
+    appendConsole("❌ 导入失败: " + e.message, "err");
+  }
 }
 
 function showPaperMenu(x, y, p) {
@@ -3744,6 +3793,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("btn-refresh").onclick = () => { refreshState(); reloadNote(); };
+
+  // 会话迁移：导入 / 导出全部（换机时把会话+知识库+置顶搬到另一台电脑）
+  $("btn-session-import").onclick = () => $("session-import-file").click();
+  $("session-import-file").onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (f) importSessionsFile(f);
+  };
+  $("btn-session-export-all").onclick = () => downloadUrl("/api/sessions/export");
 
   // 批注弹窗
   $("ann-close").onclick = closeAnnPopup;

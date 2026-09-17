@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 
 use crate::paths;
 use crate::session::SessionStats;
@@ -55,10 +56,22 @@ pub struct KnowledgeBase {
     pub stats: SessionStats,
 }
 
+/// 知识库合并结果（新增计数，供导入报告展示）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MergeCounts {
+    pub papers_added: usize,
+    pub concepts_added: usize,
+}
+
 impl KnowledgeBase {
     /// 从磁盘加载；文件不存在时返回空库（首次使用）。
     pub fn load() -> Result<Self> {
-        let p = paths::knowledge_path();
+        Self::load_from(&paths::data_dir())
+    }
+
+    /// 从指定数据目录加载（迁移/测试用）。
+    pub fn load_from(dir: &Path) -> Result<Self> {
+        let p = paths::knowledge_path_in(dir);
         if !p.exists() {
             return Ok(KnowledgeBase::default());
         }
@@ -69,10 +82,44 @@ impl KnowledgeBase {
 
     /// 全量写回磁盘（knowledge.json 体积小，无需增量）。
     pub fn save(&self) -> Result<()> {
-        paths::ensure_data_dir()?;
+        self.save_to(&paths::data_dir())
+    }
+
+    /// 全量写回指定数据目录（迁移/测试用）。
+    pub fn save_to(&self, dir: &Path) -> Result<()> {
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+        }
         let s = serde_json::to_string_pretty(self)?;
-        fs::write(paths::knowledge_path(), s)?;
+        fs::write(paths::knowledge_path_in(dir), s)?;
         Ok(())
+    }
+
+    /// 合并另一份知识库（跨安装迁移导入）：论文按 id、概念按 (name, paper_id) 去重；
+    /// 累计用量各字段取 max（重复导入不膨胀，迁到新机时效果 = 原机累计）。
+    pub fn merge_from(&mut self, other: &KnowledgeBase) -> MergeCounts {
+        let mut counts = MergeCounts::default();
+        for p in &other.papers {
+            if !self.papers.iter().any(|x| x.id == p.id) {
+                self.papers.push(p.clone());
+                counts.papers_added += 1;
+            }
+        }
+        for c in &other.concepts {
+            if !self
+                .concepts
+                .iter()
+                .any(|x| x.name == c.name && x.paper_id == c.paper_id)
+            {
+                self.concepts.push(c.clone());
+                counts.concepts_added += 1;
+            }
+        }
+        self.stats.calls = self.stats.calls.max(other.stats.calls);
+        self.stats.total_input = self.stats.total_input.max(other.stats.total_input);
+        self.stats.total_output = self.stats.total_output.max(other.stats.total_output);
+        self.stats.total_cost = self.stats.total_cost.max(other.stats.total_cost);
+        counts
     }
 
     /// 登记一篇论文（按 id 判重，已读不重复入库）。

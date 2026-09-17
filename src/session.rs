@@ -313,7 +313,12 @@ pub fn find_concept_qa(
 
 /// 读取置顶会话编号列表（`.paperhelper/pins.json`），不存在则空。
 pub fn load_pins() -> Vec<String> {
-    match fs::read_to_string(paths::pins_path()) {
+    load_pins_from(&paths::data_dir())
+}
+
+/// 读取指定数据目录的置顶列表（迁移/测试用）。
+pub fn load_pins_from(dir: &Path) -> Vec<String> {
+    match fs::read_to_string(paths::pins_path_in(dir)) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
@@ -321,9 +326,16 @@ pub fn load_pins() -> Vec<String> {
 
 /// 写回置顶会话编号列表。
 pub fn save_pins(ids: &[String]) -> Result<()> {
-    paths::ensure_data_dir()?;
+    save_pins_to(&paths::data_dir(), ids)
+}
+
+/// 写回指定数据目录的置顶列表（迁移/测试用）。
+pub fn save_pins_to(dir: &Path, ids: &[String]) -> Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
     let s = serde_json::to_string_pretty(ids)?;
-    fs::write(paths::pins_path(), s)?;
+    fs::write(paths::pins_path_in(dir), s)?;
     Ok(())
 }
 

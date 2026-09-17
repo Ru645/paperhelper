@@ -42,8 +42,15 @@
         <ul id="outline" class="outline"><li class="muted">（还没有笔记）</li></ul>
       </section>
       <section data-panel="sessions">
-        <h3>会话历史 <span class="sel-count" id="sel-count-sessions"></span></h3>
+        <h3>
+          <span>会话历史 <span class="sel-count" id="sel-count-sessions"></span></span>
+          <span class="tree-actions">
+            <button id="btn-session-import" class="mini ghost" title="导入会话或整库备份（.json），可从另一台电脑迁移">导入</button>
+            <button id="btn-session-export-all" class="mini ghost" title="导出全部会话 + 知识库 + 置顶（换机迁移 / 备份）">导出全部</button>
+          </span>
+        </h3>
         <ul id="sessions" class="session-list"><li class="muted">（无）</li></ul>
+        <input type="file" id="session-import-file" accept=".json,application/json" hidden>
       </section>
       <section data-panel="papers">
         <h3>已读论文 <span class="sel-count" id="sel-count-papers"></span></h3>
