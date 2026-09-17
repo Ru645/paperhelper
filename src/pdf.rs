@@ -12,11 +12,168 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokio::process::Command;
 
 use crate::logging;
+
+/// 探测到的 Python 命令缓存：`(程序, 前置参数)`，如 `("py", ["-3"])`。
+/// 首次使用时按候选顺序探测（跑 `--version`），成功后缓存；安装依赖后可重置。
+static PY_CACHE: std::sync::LazyLock<tokio::sync::RwLock<Option<(String, Vec<String>)>>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
+
+/// Python 候选顺序：`PAPERHELPER_PYTHON`（显式指定，不校验）→ 打包内置
+/// （exe 同级 `python/python.exe` 或 `python/bin/python3`）→ Windows `py -3` →
+/// `python` → `python3`。最后两个只作兜底（无法同步判断 PATH 是否存在）。
+fn python_candidates(
+    env: Option<&str>,
+    exe_dir: Option<&Path>,
+    windows: bool,
+) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(p) = env.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push((p.to_string(), Vec::new()));
+    }
+    if let Some(dir) = exe_dir {
+        let embedded = if windows {
+            dir.join("python").join("python.exe")
+        } else {
+            dir.join("python").join("bin").join("python3")
+        };
+        if embedded.is_file() {
+            out.push((embedded.to_string_lossy().to_string(), Vec::new()));
+        }
+    }
+    if windows {
+        out.push(("py".into(), vec!["-3".into()]));
+        out.push(("python".into(), Vec::new()));
+        out.push(("python3".into(), Vec::new()));
+    } else {
+        out.push(("python3".into(), Vec::new()));
+        out.push(("python".into(), Vec::new()));
+    }
+    // 去重（保持顺序）
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(p, a)| seen.insert((p.clone(), a.join(" "))));
+    out
+}
+
+/// 跑 `--version` 判断候选是否可用（3 秒超时，找不到即 false）。
+async fn probe_ok(program: &str, args: &[String]) -> bool {
+    let mut cmd = Command::new(program);
+    cmd.args(args).arg("--version");
+    let fut = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    matches!(tokio::time::timeout(Duration::from_secs(3), fut).await, Ok(Ok(s)) if s.success())
+}
+
+/// 当前可用的 Python 命令（程序 + 前置参数）。探测结果缓存，`reset_python_probe` 可清空。
+pub async fn python_command() -> (String, Vec<String>) {
+    if let Some(c) = PY_CACHE.read().await.clone() {
+        return c;
+    }
+    let env = std::env::var("PAPERHELPER_PYTHON").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let candidates = python_candidates(env.as_deref(), exe_dir.as_deref(), cfg!(windows));
+    let mut found: Option<(String, Vec<String>)> = None;
+    for (p, a) in &candidates {
+        if probe_ok(p, a).await {
+            found = Some((p.clone(), a.clone()));
+            break;
+        }
+    }
+    // 全部失败时用最后的兜底候选，让报错信息里能看到尝试过的命令
+    let result = found.unwrap_or_else(|| candidates.last().cloned().unwrap_or(("python3".into(), vec![])));
+    if PY_CACHE.read().await.is_none() {
+        *PY_CACHE.write().await = Some(result.clone());
+        logging::info(format!(
+            "Python 探测：{} {}",
+            result.0,
+            if result.1.is_empty() { String::new() } else { result.1.join(" ") }
+        ));
+    }
+    result
+}
+
+/// 安装/卸载依赖后重置探测缓存（下次调用重新探测）。
+pub async fn reset_python_probe() {
+    *PY_CACHE.write().await = None;
+}
+
+/// Python / PyMuPDF 环境检测结果（向导「环境检查」与 `/api/deps` 用）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DepsStatus {
+    /// 探测到的 Python 命令（未找到则为兜底候选）
+    pub python_cmd: String,
+    /// Python 版本（无法运行时为 None）
+    pub python_version: Option<String>,
+    /// PyMuPDF 版本（未安装为 None）
+    pub pymupdf_version: Option<String>,
+    /// 是否可以直接解析 PDF
+    pub ready: bool,
+    /// 是否来自打包内置 Python（exe 同级 python/ 目录）
+    pub embedded: bool,
+}
+
+const STATUS_SCRIPT: &str = r#"
+import sys
+print("PY=" + sys.version.split()[0])
+try:
+    import pymupdf
+    print("PYMUPDF=" + str(getattr(pymupdf, "__version__", "unknown")))
+except Exception:
+    print("PYMUPDF=missing")
+"#;
+
+/// 检测 Python 与 PyMuPDF 是否可用（供首启向导展示/一键安装）。
+pub async fn deps_status() -> DepsStatus {
+    let (py, args) = python_command().await;
+    let exe_embedded = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .map(|d| {
+            d.join("python").join("python.exe").is_file() || d.join("python").join("bin").join("python3").is_file()
+        })
+        .unwrap_or(false);
+    let mut cmd = Command::new(&py);
+    cmd.args(&args)
+        .arg("-c")
+        .arg(STATUS_SCRIPT)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let mut python_version = None;
+    let mut pymupdf_version = None;
+    // 独立超时，不接全局 interrupt（状态查询不应被上一次中止信号影响）
+    if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("PY=") {
+                    python_version = Some(v.trim().to_string());
+                } else if let Some(v) = line.strip_prefix("PYMUPDF=") {
+                    if v.trim() != "missing" {
+                        pymupdf_version = Some(v.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    DepsStatus {
+        python_cmd: if args.is_empty() { py.clone() } else { format!("{py} {}", args.join(" ")) },
+        ready: python_version.is_some() && pymupdf_version.is_some(),
+        python_version,
+        pymupdf_version,
+        embedded: exe_embedded,
+    }
+}
 
 const SCRIPT: &str = r#"
 import sys, pymupdf
@@ -87,9 +244,10 @@ fn clean_extracted(text: String, what: &str) -> String {
 /// 需要环境里装了 pymupdf：`pip install pymupdf`。
 pub async fn extract_pages(path: &Path) -> Result<Vec<String>> {
     let t0 = std::time::Instant::now();
-    let mut cmd = Command::new("python3");
-    cmd.arg("-c").arg(SCRIPT).arg(path);
-    let out = run_killable(cmd, "python3（需安装 pymupdf）").await?;
+    let (py, args) = python_command().await;
+    let mut cmd = Command::new(&py);
+    cmd.args(&args).arg("-c").arg(SCRIPT).arg(path);
+    let out = run_killable(cmd, &format!("{py}（需安装 pymupdf）")).await?;
     if !out.status.success() {
         let e = String::from_utf8_lossy(&out.stderr);
         logging::error(format!("PDF 解析失败 {}: {e}", path.display()));
@@ -179,10 +337,11 @@ pub async fn ocr_extract(path: &Path) -> Result<String> {
     };
 
     let t0 = std::time::Instant::now();
-    let mut cmd = Command::new("python3");
-    cmd.arg("-c").arg(OCR_SCRIPT).arg(path).arg(&lang);
+    let (py, args) = python_command().await;
+    let mut cmd = Command::new(&py);
+    cmd.args(&args).arg("-c").arg(OCR_SCRIPT).arg(path).arg(&lang);
     logging::info(format!("OCR 开始（lang={lang}）：{}", path.display()));
-    let out = run_killable(cmd, "OCR（python3/tesseract）").await?;
+    let out = run_killable(cmd, &format!("OCR（{py}/tesseract）")).await?;
     if !out.status.success() {
         let e = String::from_utf8_lossy(&out.stderr);
         logging::error(format!("OCR 失败 {}: {e}", path.display()));
@@ -232,5 +391,26 @@ mod tests {
         let (clean, removed) = clean_pua(raw);
         assert_eq!(removed, 2);
         assert_eq!(clean, "abc");
+    }
+
+    #[test]
+    fn python_candidates_order_env_first_and_embedded_used() {
+        let dir = std::path::Path::new("/opt/ph");
+        let cands = python_candidates(Some("/usr/bin/python3.12"), Some(dir), false);
+        assert_eq!(cands[0], ("/usr/bin/python3.12".to_string(), vec![]));
+        // 不存在的内置路径不入选；其余为 PATH 兜底候选
+        let names: Vec<&str> = cands.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, vec!["/usr/bin/python3.12", "python3", "python"]);
+    }
+
+    #[test]
+    fn python_candidates_windows_tries_py_launcher() {
+        let cands = python_candidates(None, None, true);
+        assert_eq!(cands[0], ("py".to_string(), vec!["-3".to_string()]));
+        assert_eq!(cands[1].0, "python");
+        assert_eq!(cands[2].0, "python3");
+        // 空环境变量不产生候选，也不重复
+        let cands2 = python_candidates(Some("  "), None, false);
+        assert_eq!(cands2.len(), 2);
     }
 }

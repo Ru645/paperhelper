@@ -20,6 +20,7 @@ mod notes;
 mod output;
 mod paths;
 mod pdf;
+mod presets;
 mod prompts;
 mod session;
 mod web;
@@ -76,22 +77,31 @@ async fn main() -> Result<()> {
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // web 子命令：paperhelper web [--port N]（默认 8080，仅监听本机）
+    // web 子命令：paperhelper web [--port N] [--open]（默认 8080，仅监听本机；
+    // 端口被占自动顺延；--open 启动后自动打开默认浏览器）
     if !args.is_empty() && args[0] == "web" {
         let mut port = 8080u16;
+        let mut open = false;
         let mut i = 1;
         while i < args.len() {
-            if args[i] == "--port" && i + 1 < args.len() {
-                port = args[i + 1].parse().unwrap_or(8080);
-                i += 2;
-            } else if let Some(p) = args[i].strip_prefix("--port=") {
-                port = p.parse().unwrap_or(8080);
-                i += 1;
-            } else {
-                i += 1;
+            match args[i].as_str() {
+                "--port" if i + 1 < args.len() => {
+                    port = args[i + 1].parse().unwrap_or(8080);
+                    i += 2;
+                }
+                "--open" => {
+                    open = true;
+                    i += 1;
+                }
+                other => {
+                    if let Some(p) = other.strip_prefix("--port=") {
+                        port = p.parse().unwrap_or(8080);
+                    }
+                    i += 1;
+                }
             }
         }
-        return web::serve(app, port).await;
+        return web::serve(app, port, open).await;
     }
 
     // 仅 CLI 路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。

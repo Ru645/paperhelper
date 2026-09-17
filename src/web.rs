@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Multipart, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -33,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::App;
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, llm, logging, notes, paths, session};
+use crate::{export, llm, logging, notes, paths, pdf, session};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -46,6 +46,11 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/run", post(api_run))
         .route("/api/interrupt", post(api_interrupt))
         .route("/api/state", get(api_state))
+        .route("/api/deps", get(api_deps))
+        .route("/api/deps/install", post(api_deps_install))
+        .route("/api/shutdown", post(api_shutdown))
+        .route("/api/open-data-dir", post(api_open_data_dir))
+        .route("/api/presets", get(api_presets))
         .route("/api/note", get(api_note))
         .route("/api/styles", get(api_styles))
         .route("/api/styles/save", post(api_style_save))
@@ -131,14 +136,87 @@ async fn log_requests(req: Request, next: Next) -> Response {
     resp
 }
 
+/// 本机 Web 服务的优雅退出句柄：`/api/shutdown` 触发（桌面壳关窗也用它替代 Ctrl-C）。
+#[derive(Default)]
+pub struct ShutdownHandle {
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownHandle {
+    /// 请求退出（可在任意任务里调用）。
+    pub fn trigger(&self) {
+        self.notify.notify_one();
+    }
+
+    /// 等待退出请求（`with_graceful_shutdown` 用）。
+    pub async fn wait(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// 绑定监听端口：从 `start` 起最多顺延 `tries` 个端口（被占则 +1），
+/// 返回（监听器, 实际地址, 请求的起始端口）。`start=0` 时由系统分配随机端口。
+pub async fn bind_with_fallback(
+    start: u16,
+    tries: u16,
+) -> Result<(tokio::net::TcpListener, SocketAddr, u16)> {
+    let mut last_err: Option<(SocketAddr, std::io::Error)> = None;
+    for offset in 0..tries.max(1) {
+        let addr = SocketAddr::from(([127, 0, 0, 1], start.saturating_add(offset)));
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                let actual = l.local_addr().unwrap_or(addr);
+                return Ok((l, actual, start));
+            }
+            Err(e) => last_err = Some((addr, e)),
+        }
+    }
+    let (addr, e) = last_err.ok_or_else(|| anyhow::anyhow!("无法绑定监听端口"))?;
+    Err(anyhow::anyhow!(
+        "端口 {start} 起连续 {tries} 个都被占用（最后一次尝试 {addr}：{e}），可用 --port 指定其他端口"
+    ))
+}
+
+/// 打开系统默认浏览器（失败只提示，不影响服务）。
+pub fn open_browser(url: &str) {
+    let (prog, args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
+        ("cmd", vec!["/C", "start", "", url])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    match std::process::Command::new(prog)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => logging::info(format!("已请求打开浏览器：{url}")),
+        Err(e) => {
+            logging::warn(format!("无法自动打开浏览器（{prog}: {e}）；请手动访问 {url}"));
+            println!("无法自动打开浏览器，请手动访问 {url}");
+        }
+    }
+}
+
 /// 启动 Web 服务（仅监听 127.0.0.1，本机使用）。
-pub async fn serve(app: App, port: u16) -> Result<()> {
+/// `open=true` 时启动后自动打开浏览器；端口被占自动顺延（8080→8090）。
+pub async fn serve(app: App, port: u16, open: bool) -> Result<()> {
     let shared: SharedApp = Arc::new(Mutex::new(app));
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("PaperHelper Web 已启动: http://{addr}");
+    let (listener, addr, requested) = bind_with_fallback(port, 10).await?;
+    if requested != 0 && addr.port() != requested {
+        let msg = format!("端口 {requested} 被占用，已自动改用 {}。", addr.port());
+        logging::warn(&msg);
+        println!("{msg}");
+    }
+    let url = format!("http://{addr}");
+    println!("PaperHelper Web 已启动: {url}");
     println!("（Ctrl-C 停止服务）");
-    logging::info(format!("Web 服务监听 http://{addr}（数据目录 {}）", paths::data_dir().display()));
+    logging::info(format!("Web 服务监听 {url}（数据目录 {}）", paths::data_dir().display()));
+    if open {
+        open_browser(&url);
+    }
 
     // web 模式不安装 CLI 的 REPL 打断器，这里自行监听 Ctrl-C 并终止整个进程。
     // 直接 exit 以确保即使有浏览器 SSE 长连接也能立即退出（不做 graceful 等待）。
@@ -151,7 +229,12 @@ pub async fn serve(app: App, port: u16) -> Result<()> {
         }
     });
 
-    axum::serve(listener, router(shared)).await?;
+    // /api/shutdown（顶栏「退出」按钮）走优雅退出；桌面壳关窗时也调用它。
+    let shutdown = Arc::new(ShutdownHandle::default());
+    let wait_handle = shutdown.clone();
+    axum::serve(listener, router(shared).layer(Extension(shutdown.clone())))
+        .with_graceful_shutdown(async move { wait_handle.wait().await })
+        .await?;
     Ok(())
 }
 
@@ -510,6 +593,184 @@ fn build_state(a: &App) -> serde_json::Value {
         "papers": papers,
         "concepts": concepts,
     })
+}
+
+// ===== 环境检测 / 依赖安装 / 服务商预设 / 退出 =====
+
+/// 环境快照：Python 与 PyMuPDF 是否可用（首启向导「环境检查」用）。
+async fn api_deps() -> Json<serde_json::Value> {
+    let st = pdf::deps_status().await;
+    Json(json!({
+        "python": st.python_version,
+        "python_cmd": st.python_cmd,
+        "pymupdf": st.pymupdf_version,
+        "ready": st.ready,
+        "embedded": st.embedded,
+        "data_dir": paths::data_dir().display().to_string(),
+        "pip_index": pip_index(),
+    }))
+}
+
+/// 依赖安装门：同一时刻只允许一个 pip 安装任务。
+static DEPS_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// pip 安装源：默认清华镜像，可用 `PAPERHELPER_PIP_INDEX` 覆盖（内网/离线源）。
+fn pip_index() -> String {
+    std::env::var("PAPERHELPER_PIP_INDEX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://pypi.tuna.tsinghua.edu.cn/simple".to_string())
+}
+
+/// 一键安装 PyMuPDF：清华镜像、SSE 流式进度、可中止（Ctrl-C / Web「停止」）。
+async fn api_deps_install() -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
+    tokio::spawn(async move {
+        let emitter = Emitter::channel(tx.clone());
+        let t0 = std::time::Instant::now();
+        let result = install_pymupdf(&emitter).await;
+        emitter.progress_done();
+        emit_result(&emitter, result, "安装 PyMuPDF", t0);
+    });
+    let stream = UnboundedReceiverStream::new(rx).map(|ev| Ok::<_, Infallible>(to_sse(ev)));
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 执行 `python -m pip install pymupdf`（流式回显输出，可中止）。
+async fn install_pymupdf(emitter: &Emitter) -> anyhow::Result<()> {
+    interrupt::reset();
+    let _guard = DEPS_GATE
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("已有依赖安装任务在运行，请稍候或先点「停止」"))?;
+
+    let st = pdf::deps_status().await;
+    if let Some(v) = st.pymupdf_version.clone() {
+        emitter.stdout(format!("✓ PyMuPDF 已安装（{v}），无需重复安装"));
+        return Ok(());
+    }
+    let (py, args) = pdf::python_command().await;
+    let index = pip_index();
+    if st.python_version.is_none() {
+        emitter.stdout(format!(
+            "⚠ 未检测到可用的 Python（尝试的命令：{py}）。请先安装 Python 3，\
+             或设置 PAPERHELPER_PYTHON 指向解释器；仍将尝试用该命令执行 pip。"
+        ));
+    }
+    emitter.stdout(format!("使用 Python：{py} {}", args.join(" ")));
+    emitter.progress("正在从镜像安装 PyMuPDF…");
+    logging::info(format!("开始安装 PyMuPDF：{py} -m pip install -i {index} pymupdf"));
+
+    let mut cmd = tokio::process::Command::new(&py);
+    cmd.args(&args)
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--disable-pip-version-check")
+        .arg("-i")
+        .arg(&index)
+        .arg("pymupdf")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("无法启动 pip（{py}）: {e}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let em_out = emitter.clone();
+    let em_err = emitter.clone();
+    let h_out = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            em_out.stdout(l);
+        }
+    });
+    let h_err = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            em_err.stderr(l);
+        }
+    });
+
+    let status = tokio::select! {
+        s = child.wait() => s.map_err(|e| anyhow::anyhow!("等待 pip 结束失败: {e}"))?,
+        _ = interrupt::wait() => {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!(llm::Interrupted));
+        }
+    };
+    let _ = h_out.await;
+    let _ = h_err.await;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "PyMuPDF 安装失败（pip 退出码 {:?}）。可手动安装后重试：\n  \
+             {py} {} -m pip install -i {index} pymupdf",
+            status.code(),
+            args.join(" ")
+        ));
+    }
+    // 安装后重置探测缓存并复检
+    pdf::reset_python_probe().await;
+    let st = pdf::deps_status().await;
+    match st.pymupdf_version {
+        Some(v) => {
+            emitter.stdout(format!("✓ 安装完成：PyMuPDF {v}"));
+            Ok(())
+        }
+        None => Err(anyhow::anyhow!(
+            "pip 执行完成，但仍无法 import pymupdf。可能装到了其他 Python 环境：\
+             可用 PAPERHELPER_PYTHON 指定解释器路径后重试"
+        )),
+    }
+}
+
+/// 服务商预设（先启向导卡片；与 CLI `config presets` 同一份数据）。
+async fn api_presets() -> Json<serde_json::Value> {
+    Json(json!({ "presets": crate::presets::all() }))
+}
+
+/// 优雅退出（顶栏「退出」按钮；桌面壳关窗也用它）。
+async fn api_shutdown(Extension(sh): Extension<Arc<ShutdownHandle>>) -> Json<serde_json::Value> {
+    logging::info("收到 /api/shutdown，Web 服务即将退出");
+    sh.trigger();
+    Json(json!({ "ok": true }))
+}
+
+/// 在系统文件管理器里打开数据目录（新手找不到 `.paperhelper` 时用）。
+async fn api_open_data_dir() -> Json<serde_json::Value> {
+    if let Err(e) = paths::ensure_data_dir() {
+        return Json(json!({ "ok": false, "error": format!("创建数据目录失败: {e:#}") }));
+    }
+    let dir = paths::data_dir();
+    let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+    match open_path(&abs) {
+        Ok(()) => Json(json!({ "ok": true, "path": abs.display().to_string() })),
+        Err(e) => Json(json!({ "ok": false, "path": abs.display().to_string(), "error": e })),
+    }
+}
+
+/// 用系统文件管理器打开路径（WSL 下 xdg-open 可能不可用，返回中文提示）。
+fn open_path(path: &std::path::Path) -> std::result::Result<(), String> {
+    let p = path.to_string_lossy().to_string();
+    let (prog, args): (&str, Vec<String>) = if cfg!(target_os = "windows") {
+        ("explorer", vec![p])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![p])
+    } else {
+        ("xdg-open", vec![p])
+    };
+    std::process::Command::new(prog)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开文件管理器（{prog} 不可用：{e}）"))
 }
 
 // ===== 笔记渲染 =====
@@ -1822,6 +2083,8 @@ fn sanitize_upload_name(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// 一致性检查：`app.js` 里 `$("id")` 引用的元素，必须都在 `index.html` 里存在。
     /// 防止「新 app.js + 旧 index.html」这类版本错配导致初始化抛错、按钮全部失效。
     #[test]
@@ -1850,5 +2113,40 @@ mod tests {
             missing.is_empty(),
             "app.js 引用了 index.html 中不存在的元素 id（版本错配）: {missing:?}"
         );
+    }
+
+    /// 端口顺延：占住一个端口后应从下一个可用端口启动，并返回原始请求端口。
+    #[tokio::test]
+    async fn bind_with_fallback_skips_busy_port() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let busy = listener.local_addr().unwrap().port();
+        if busy > 65530 {
+            return; // 端口太靠后，没有顺延空间
+        }
+        let (_l2, addr, requested) = bind_with_fallback(busy, 10).await.unwrap();
+        assert_eq!(requested, busy);
+        assert_ne!(addr.port(), busy, "被占端口不应复用");
+        assert!(addr.port() > busy);
+    }
+
+    /// start=0 时由系统分配随机端口（打包版/测试常用）。
+    #[tokio::test]
+    async fn bind_with_fallback_supports_random_port() {
+        let (_l, addr, requested) = bind_with_fallback(0, 1).await.unwrap();
+        assert_eq!(requested, 0);
+        assert_ne!(addr.port(), 0);
+    }
+
+    /// ShutdownHandle：trigger 后 wait 立即返回（用于 /api/shutdown 与桌面壳关窗）。
+    #[tokio::test]
+    async fn shutdown_handle_notifies_waiters() {
+        let sh = Arc::new(ShutdownHandle::default());
+        let sh2 = sh.clone();
+        let h = tokio::spawn(async move { sh2.wait().await });
+        sh.trigger();
+        tokio::time::timeout(std::time::Duration::from_secs(2), h)
+            .await
+            .expect("wait 未被唤醒")
+            .unwrap();
     }
 }

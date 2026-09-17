@@ -852,6 +852,7 @@ PaperHelper 命令：
   concepts                 列出已学概念(跨论文)
   config show              查看配置
   config set <k> <v>       设置(如 llm.api_key / llm.model / llm.context_length)
+  config presets [id]      列出内置服务商预设 / 一键填入(deepseek/paratera/ollama/custom)
   config test              测试 LLM 连接(端点/Key/模型)，失败显示原始响应
   new                      新建会话
   exit                     退出（自动保存会话）
@@ -904,8 +905,65 @@ PaperHelper 命令：
                 outln!(self, "已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
             }
             "test" => self.cmd_config_test().await?,
-            _ => outln!(self, "用法: config [show | set <key> <value> | test]"),
+            "presets" | "preset" => self.cmd_config_presets(args)?,
+            _ => outln!(self, "用法: config [show | set <key> <value> | presets [id] | test]"),
         }
+        Ok(())
+    }
+
+    /// `config presets [id]`：列出内置服务商预设；带 id（或序号）时把
+    /// Endpoint/模型/上下文/单价预填进配置并保存。预设只是"预填表单"，
+    /// 不代理请求：用户仍用自己的 Key 从本机直连所选服务商。
+    fn cmd_config_presets(&mut self, args: &str) -> Result<()> {
+        let (id, _) = split_cmd(args);
+        let list = crate::presets::all();
+        if id.is_empty() {
+            outln!(self, "=== 内置服务商预设（config presets <id> 一键填入）===");
+            for (i, p) in list.iter().enumerate() {
+                outln!(self, "{}. {:<24} {}", i + 1, p.name, p.id);
+                outln!(self, "   端点: {}", if p.endpoint.is_empty() { "(自行填写)" } else { p.endpoint });
+                outln!(self, "   模型: {}   上下文: {}   {}", if p.model.is_empty() { "(自行填写)" } else { p.model }, p.context_length, p.note);
+                if p.needs_key {
+                    outln!(self, "   Key : {}", p.key_url);
+                }
+            }
+            outln!(self, "用法: config presets deepseek  → 填入端点/模型/上下文/单价（不改 Key）");
+            outln!(self, "      再用 config set llm.api_key <你的Key> 或启动 Web 首启向导填写 Key");
+            return Ok(());
+        }
+        let preset = list
+            .iter()
+            .find(|p| p.id.eq_ignore_ascii_case(id))
+            .or_else(|| {
+                let n = id.parse::<usize>().ok()?;
+                if n >= 1 { list.get(n - 1) } else { None }
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "没有预设 `{id}`。可用: {}",
+                    list.iter().map(|p| p.id).collect::<Vec<_>>().join(" / ")
+                )
+            })?;
+        if !preset.endpoint.is_empty() {
+            self.config.llm.api_endpoint = preset.endpoint.to_string();
+        }
+        if !preset.model.is_empty() {
+            self.config.llm.model = preset.model.to_string();
+        }
+        self.config.llm.context_length = preset.context_length;
+        self.config.llm.thinking_mode = preset.thinking;
+        self.config.pricing.input_price_per_1m = preset.input_price_per_1m;
+        self.config.pricing.output_price_per_1m = preset.output_price_per_1m;
+        self.config.save()?;
+        outln!(self, "{} 已应用预设「{}」：", "✓".green().bold(), preset.name);
+        outln!(self, "  llm.api_endpoint = {}", self.config.llm.api_endpoint);
+        outln!(self, "  llm.model        = {}", self.config.llm.model);
+        outln!(self, "  llm.context_length = {}", self.config.llm.context_length);
+        outln!(self, "  pricing = {}/{} per 1M", self.config.pricing.input_price_per_1m, self.config.pricing.output_price_per_1m);
+        if preset.needs_key {
+            outln!(self, "  下一步: config set llm.api_key <你的Key>（申请: {}）", preset.key_url);
+        }
+        outln!(self, "  提示: config test 可验证连接");
         Ok(())
     }
 

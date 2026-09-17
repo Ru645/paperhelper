@@ -178,6 +178,7 @@ source ~/.bashrc
 | `save [file]` / `load <file>` | 保存 / 加载会话 |
 | `new` | 新建会话 |
 | `config show` / `config set <k> <v>` | 查看 / 设置配置 |
+| `config presets [id]` | 列出内置服务商预设；带 id（`deepseek`/`paratera`/`ollama`/`custom`）预填端点/模型/上下文/单价 |
 | `config test` | 用当前配置发一条最小请求，测试端点 / Key / 模型；失败打印原始响应 |
 | `exit` | 退出（自动保存会话，告知恢复方式） |
 
@@ -209,6 +210,14 @@ brew install tesseract tesseract-lang                    # macOS
 
 > 没装 tesseract 时只有 `--ocr` 不可用，其余功能不受影响。
 
+**Python 解释器的查找顺序**（找不到 PATH 里的 `python3` 时尤其有用）：
+
+1. 环境变量 `PAPERHELPER_PYTHON`（显式指定，如 `C:\Python313\python.exe`）
+2. 打包内置解释器（exe 同级 `python/` 目录，官方 Windows 包自带）
+3. Windows：`py -3` → `python` → `python3`；Linux/macOS：`python3` → `python`
+
+`import pymupdf` 失败的报错里会给出当前解释器的修复命令。Web「环境检查」页也有同样信息。
+
 ### 2. 编译
 
 直接 clone 出来就是一个独立 Cargo crate，正常构建即可。若你的上级目录恰好是 Cargo workspace，则加 `-p paperhelper`：
@@ -217,7 +226,7 @@ brew install tesseract tesseract-lang                    # macOS
 git clone <仓库地址> && cd paperhelper
 cargo build                 # 独立 crate 直接构建
 cargo build -p paperhelper  # 在 workspace 下时加 -p
-cargo test                  # 运行测试（37 个）
+cargo test                  # 运行测试（75 个）
 ```
 
 编译产物在 `./target/debug/paperhelper`。
@@ -241,6 +250,7 @@ EOF
 **方式 3：CLI 交互式**
 ```bash
 paperhelper
+> config presets deepseek          # 一键预填端点/模型/上下文/单价（deepseek/paratera/ollama/custom）
 > config set llm.api_key sk-xxxxxxxx
 > config set llm.model deepseek-v4-pro
 > config set llm.api_endpoint https://api.deepseek.com/v1/chat/completions
@@ -254,6 +264,8 @@ paperhelper
 
 ```bash
 paperhelper web              # Web 界面（推荐，默认 http://127.0.0.1:8080）
+paperhelper web --open       # 启动后自动打开默认浏览器
+paperhelper web --port 9000  # 指定端口（被占会自动顺延到下一个可用端口）
 paperhelper                  # CLI REPL
 ```
 
@@ -302,6 +314,13 @@ paperhelper                  # CLI REPL
 ```
 
 所有文件已被 `.gitignore` 忽略，不会泄露。
+
+数据目录默认是**当前工作目录**下的 `.paperhelper/`。想固定到一个位置（换工作目录也不"丢"笔记），可用环境变量 `PAPERHELPER_DATA_DIR`，支持绝对路径与 `~` 开头：
+
+```bash
+PAPERHELPER_DATA_DIR="$HOME/PaperHelper/.paperhelper" paperhelper web
+# Windows PowerShell: $env:PAPERHELPER_DATA_DIR="$env:USERPROFILE\PaperHelper\.paperhelper"
+```
 
 ## 日志与排错
 
@@ -352,7 +371,7 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 
 ```bash
 cargo build -p paperhelper          # 构建
-cargo test  -p paperhelper          # 65 个单元测试
+cargo test  -p paperhelper          # 75 个单元测试
 cargo build -p paperhelper --release  # 发布构建
 ```
 
