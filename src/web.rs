@@ -205,13 +205,28 @@ pub fn open_browser(url: &str) {
 
 /// 启动 Web 服务（仅监听 127.0.0.1，本机使用）。
 /// `open=true` 时启动后自动打开浏览器；端口被占自动顺延（8080→8090）。
-pub async fn serve(app: App, port: u16, open: bool) -> Result<()> {
+/// `port_file` 非空时，绑定成功后把实际端口写入该文件（供桌面壳握手，退出时删除）。
+pub async fn serve(
+    app: App,
+    port: u16,
+    open: bool,
+    port_file: Option<std::path::PathBuf>,
+) -> Result<()> {
     let shared: SharedApp = Arc::new(Mutex::new(app));
     let (listener, addr, requested) = bind_with_fallback(port, 10).await?;
     if requested != 0 && addr.port() != requested {
         let msg = format!("端口 {requested} 被占用，已自动改用 {}。", addr.port());
         logging::warn(&msg);
         println!("{msg}");
+    }
+    if let Some(pf) = &port_file {
+        if let Some(dir) = pf.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // 写失败必须立即报错：桌面壳靠这个文件拿端口，否则会一直等（超时后才能提示）
+        std::fs::write(pf, addr.port().to_string())
+            .map_err(|e| anyhow::anyhow!("无法写入端口文件 {}：{e}", pf.display()))?;
+        logging::info(format!("已写入端口文件 {}（端口 {}）", pf.display(), addr.port()));
     }
     let url = format!("http://{addr}");
     println!("PaperHelper Web 已启动: {url}");
@@ -238,6 +253,9 @@ pub async fn serve(app: App, port: u16, open: bool) -> Result<()> {
     axum::serve(listener, router(shared).layer(Extension(shutdown.clone())))
         .with_graceful_shutdown(async move { wait_handle.wait().await })
         .await?;
+    if let Some(pf) = &port_file {
+        let _ = std::fs::remove_file(pf);
+    }
     Ok(())
 }
 

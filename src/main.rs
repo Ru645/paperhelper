@@ -77,16 +77,22 @@ async fn main() -> Result<()> {
     // 解析命令行参数
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // web 子命令：paperhelper web [--port N] [--open]（默认 8080，仅监听本机；
-    // 端口被占自动顺延；--open 启动后自动打开默认浏览器）
+    // web 子命令：paperhelper web [--port N] [--open] [--port-file <路径>]（默认 8080，
+    // 仅监听本机；端口被占自动顺延；--open 启动后自动打开默认浏览器；
+    // --port-file 把实际端口写入文件，供 Windows 桌面壳握手，端口传 0 时由系统随机分配）
     if !args.is_empty() && args[0] == "web" {
         let mut port = 8080u16;
         let mut open = false;
+        let mut port_file: Option<std::path::PathBuf> = None;
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
                 "--port" if i + 1 < args.len() => {
                     port = args[i + 1].parse().unwrap_or(8080);
+                    i += 2;
+                }
+                "--port-file" if i + 1 < args.len() => {
+                    port_file = Some(std::path::PathBuf::from(&args[i + 1]));
                     i += 2;
                 }
                 "--open" => {
@@ -96,12 +102,14 @@ async fn main() -> Result<()> {
                 other => {
                     if let Some(p) = other.strip_prefix("--port=") {
                         port = p.parse().unwrap_or(8080);
+                    } else if let Some(p) = other.strip_prefix("--port-file=") {
+                        port_file = Some(std::path::PathBuf::from(p));
                     }
                     i += 1;
                 }
             }
         }
-        return web::serve(app, port, open).await;
+        return web::serve(app, port, open, port_file).await;
     }
 
     // 仅 CLI 路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。

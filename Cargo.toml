@@ -19,3 +19,16 @@ owo-colors = "4"
 rustyline = "14"
 axum = { version = "0.7", features = ["json", "multipart"] }
 tokio-stream = "0.1"
+
+# Windows 桌面壳（src/bin/paperhelper-desktop.rs）：把 `paperhelper web` 装进 WebView2 原生窗口。
+# 仅 Windows 编译，其他平台 `cargo build` 不受影响（源码里按 cfg 门控）。
+[target.'cfg(windows)'.dependencies]
+wry = "0.57"
+tao = "0.37"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

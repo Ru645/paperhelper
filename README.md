@@ -9,6 +9,7 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 ## 核心功能
 
 - **Web 界面（主）**：导入、阅读笔记、选中提问、管理会话、配置模型、导出，全部在浏览器里完成
+- **Windows 桌面版**：双击 `paperhelper-desktop.exe` 即用（原生窗口 + 内置 WebView2），自动启动本地服务、关窗即停、单实例防重复打开；无需终端与浏览器，数据固定存 `%USERPROFILE%\PaperHelper\.paperhelper`
 - **四步上手向导**：首次打开（或未配置模型）自动弹出「选服务商 → 填 API Key → 检查环境 → 导入示例」；内置一份示例笔记（原样导入，0 token）与一篇示例论文（体验完整流程），填完 Key 可当场「测试连接」；未配置模型时发起提问也会自动引导到向导
 - **笔记内就地提问**：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内问答；答案与所选文字绑定，点击高亮即可重新展开。选中公式会把它在 KaTeX 里的**原始 LaTeX**交给模型（不是渲染后的文本）
 - **章节提问**：右键笔记标题（h1=全文，h2/h3=小节）→「对本章节提问」
@@ -234,7 +235,7 @@ cargo build -p paperhelper  # 在 workspace 下时加 -p
 cargo test                  # 运行测试（81 个）
 ```
 
-编译产物在 `./target/debug/paperhelper`。
+编译产物在 `./target/debug/paperhelper`；Windows 上还会多一个 `./target/debug/paperhelper-desktop.exe`（桌面窗口版，Linux/macOS 编译为空壳，不影响构建与测试）。
 
 ### 3. 配置大模型（设置 → 模型设置）
 
@@ -271,10 +272,13 @@ paperhelper
 paperhelper web              # Web 界面（推荐，默认 http://127.0.0.1:8080）
 paperhelper web --open       # 启动后自动打开默认浏览器
 paperhelper web --port 9000  # 指定端口（被占会自动顺延到下一个可用端口）
+paperhelper-desktop          # Windows 桌面窗口版（见下）
 paperhelper                  # CLI REPL
 ```
 
 在运行 Web 服务的终端按 `Ctrl-C` 停止服务；CLI 下 `Ctrl-C` 是打断当前任务。
+
+**Windows 桌面窗口版**（`paperhelper-desktop.exe`，与 `paperhelper.exe` 同目录）：双击即以原生窗口打开界面，不用终端、不用浏览器。它做的事：单实例互斥锁（重复双击会聚焦已有窗口）→ 用隐藏控制台启动 `paperhelper web --port 0 --port-file <临时文件>`（随机端口、不弹黑框）→ 读端口文件后用 WebView2 打开 `http://127.0.0.1:<端口>/` → 关窗先 `/api/interrupt`（终止在途 LLM 任务）再 `/api/shutdown`（优雅退出），并把服务进程放进 Job Object，壳崩溃也不会残留后台服务。需要系统里有 Microsoft Edge WebView2 运行时（Win10 1803+ / Win11 一般自带），缺失时安装包会自动补装。源码 `src/bin/paperhelper-desktop.rs`（仅 Windows 编译，其他平台是空壳）；图标由 `python3 scripts/make_icon.py` 生成到 `assets/icon.ico`。
 
 ## 配置项
 
