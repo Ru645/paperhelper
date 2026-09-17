@@ -21,6 +21,7 @@
       </div>
     </div>
     <button id="btn-undo" class="ghost" disabled title="撤销上一次编辑/删除">撤销</button>
+    <button id="btn-wizard" class="ghost" title="首次使用向导：选服务商 / 填 Key / 检查环境 / 导入示例">向导</button>
     <button id="btn-help" class="ghost">帮助</button>
     <button id="btn-config" class="ghost">设置</button>
     <button id="btn-refresh" class="ghost">刷新</button>
@@ -309,6 +310,26 @@
       <li><b>列表多选</b>：侧栏的会话 / 论文 / 概念列表，Ctrl(⌘) 点选、Shift 连选，右键可批量置顶 / 删除；Esc 取消选择。</li>
     </ul>
     <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
+  </div>
+</div>
+
+<!-- 首次使用向导：服务商 → Key → 环境 → 示例 -->
+<div id="wizard-modal" class="modal hidden">
+  <div class="modal-box wizard-box">
+    <h2>四步开始使用</h2>
+    <ol class="wizard-steps" id="wizard-steps">
+      <li data-step="1"><span>1</span>选服务商</li>
+      <li data-step="2"><span>2</span>填 Key</li>
+      <li data-step="3"><span>3</span>检查环境</li>
+      <li data-step="4"><span>4</span>导入示例</li>
+    </ol>
+    <div class="wizard-body" id="wizard-body"><p class="muted">加载中…</p></div>
+    <p id="wizard-status" class="status"></p>
+    <div class="modal-actions">
+      <button id="btn-wizard-skip" class="ghost">跳过</button>
+      <button id="btn-wizard-prev" class="ghost hidden">上一步</button>
+      <button id="btn-wizard-next" class="primary">下一步</button>
+    </div>
   </div>
 </div>
 

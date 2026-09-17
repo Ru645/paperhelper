@@ -90,6 +90,8 @@ pub fn router(app: SharedApp) -> Router {
             "/api/upload",
             post(api_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
         )
+        .route("/api/samples", get(api_samples))
+        .route("/api/samples/import", post(api_sample_import))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
@@ -286,6 +288,111 @@ async fn api_vendor(axum::extract::Path(path): axum::extract::Path<String>) -> R
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, format!("vendor 资源不存在: {path}")).into_response(),
+    }
+}
+
+// ===== 首启向导：示例材料（编译期内嵌，离线可用） =====
+
+/// 示例一：SelfCheckGPT 学习笔记（Markdown，原样导入：不调模型、0 token）。
+const SAMPLE_NOTE_MD: &[u8] = include_bytes!("../assets/samples/selfcheckgpt-note.md");
+/// 示例二：MIND 幻觉检测论文（PDF，完整体验：解析 → 调用一次模型生成笔记）。
+const SAMPLE_PAPER_PDF: &[u8] = include_bytes!("../assets/samples/mind-hallucination.pdf");
+
+struct SampleDef {
+    id: &'static str,
+    name: &'static str,
+    kind: &'static str,
+    desc: &'static str,
+    /// 写进 uploads 目录时的文件名（带时间戳前缀防冲突）。
+    file_name: &'static str,
+    /// 导入后自动导出的笔记文件名。
+    export_name: &'static str,
+    needs_key: bool,
+    bytes: &'static [u8],
+}
+
+fn samples() -> [SampleDef; 2] {
+    [
+        SampleDef {
+            id: "note",
+            name: "SelfCheckGPT 学习笔记",
+            kind: "md",
+            desc: "先看看生成好的笔记长什么样：原样导入，不调用模型、0 token，断网也能导入",
+            file_name: "SelfCheckGPT_学习笔记.md",
+            export_name: "笔记_SelfCheckGPT.md",
+            needs_key: false,
+            bytes: SAMPLE_NOTE_MD,
+        },
+        SampleDef {
+            id: "paper",
+            name: "MIND 幻觉检测论文（PDF）",
+            kind: "pdf",
+            desc: "完整体验：解析 PDF 全文 → 调用一次模型生成结构化笔记（约几分钱）",
+            file_name: "MIND幻觉检测论文.pdf",
+            export_name: "MIND幻觉检测_笔记.md",
+            needs_key: true,
+            bytes: SAMPLE_PAPER_PDF,
+        },
+    ]
+}
+
+/// 示例清单（供向导第四步渲染）。
+async fn api_samples() -> Json<serde_json::Value> {
+    let list: Vec<_> = samples()
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "kind": s.kind,
+                "desc": s.desc,
+                "size": s.bytes.len(),
+                "needs_key": s.needs_key,
+            })
+        })
+        .collect();
+    Json(json!({ "samples": list }))
+}
+
+#[derive(Deserialize)]
+struct SampleReq {
+    id: String,
+}
+
+/// 把内嵌示例写到 uploads 目录，返回可直接执行的导入命令（由前端走 `/api/run`）。
+async fn api_sample_import(
+    Json(req): Json<SampleReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(s) = samples().into_iter().find(|s| s.id == req.id) else {
+        return Err((StatusCode::BAD_REQUEST, format!("未知示例：{}", req.id)));
+    };
+    paths::ensure_uploads_dir()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("创建上传目录失败: {e:#}")))?;
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let path = paths::uploads_dir().join(format!("{stamp}_{}", s.file_name));
+    tokio::fs::write(&path, s.bytes)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("写入示例文件失败: {e}")))?;
+    logging::info(format!("导入示例：{} → {}", s.name, path.display()));
+    Ok(Json(json!({
+        "path": path.to_string_lossy(),
+        "command": sample_command(&s, &path),
+        "export": s.export_name,
+        "name": s.name,
+        "needs_key": s.needs_key,
+    })))
+}
+
+/// 示例导入命令：md 原样导入（0 token），pdf 用内置「四段式」风格生成笔记。
+fn sample_command(s: &SampleDef, path: &std::path::Path) -> String {
+    let q = format!(
+        "\"{}\"",
+        path.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    if s.kind == "md" {
+        format!("ingest --note --kind note --text {q}")
+    } else {
+        format!("ingest --style four --kind paper {q}")
     }
 }
 
@@ -511,6 +618,15 @@ async fn api_state(State(app): State<SharedApp>) -> Json<serde_json::Value> {
     Json(build_state(&a))
 }
 
+/// 是否本地模型服务（Ollama / llama.cpp 等，通常不需要 API Key）。
+fn is_local_endpoint(endpoint: &str) -> bool {
+    let e = endpoint.to_ascii_lowercase();
+    e.contains("127.0.0.1")
+        || e.contains("localhost")
+        || e.contains("[::1]")
+        || e.contains("0.0.0.0")
+}
+
 fn build_state(a: &App) -> serde_json::Value {
     let s = &a.session.stats;
     let g = &a.kb.stats;
@@ -582,6 +698,8 @@ fn build_state(a: &App) -> serde_json::Value {
         "model": a.config.llm.model,
         "endpoint": a.config.llm.api_endpoint,
         "api_key_set": !a.config.llm.api_key.is_empty(),
+        "llm_ready": !a.config.llm.api_key.is_empty()
+            || is_local_endpoint(&a.config.llm.api_endpoint),
         "api_key_masked": crate::app::mask_key(&a.config.llm.api_key),
         "context_length": a.config.llm.context_length,
         "thinking_mode": a.config.llm.thinking_mode,
@@ -2119,12 +2237,15 @@ mod tests {
             let after = &rest[pos + 3..];
             let Some(end) = after.find("\")") else { break };
             let id = &after[..end];
-            // 只校验形如标识符的 id（跳过含空格/运算符的表达式）
+            // 显式动态创建的元素（app.js 里 innerHTML 生成 `id="..."`）同样有效
             let is_ident = !id.is_empty()
                 && id
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if is_ident && !index_html.contains(&format!("id=\"{id}\"")) {
+            if is_ident
+                && !index_html.contains(&format!("id=\"{id}\""))
+                && !app_js.contains(&format!("id=\"{id}\""))
+            {
                 if !missing.iter().any(|m| m == id) {
                     missing.push(id.to_string());
                 }
@@ -2135,6 +2256,16 @@ mod tests {
             missing.is_empty(),
             "app.js 引用了 index.html 中不存在的元素 id（版本错配）: {missing:?}"
         );
+    }
+
+    /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。
+    #[test]
+    fn local_endpoint_detection() {
+        assert!(is_local_endpoint("http://127.0.0.1:11434/v1/chat/completions"));
+        assert!(is_local_endpoint("http://localhost:8080/v1/chat/completions"));
+        assert!(is_local_endpoint("http://[::1]:11434/v1/chat/completions"));
+        assert!(!is_local_endpoint("https://api.deepseek.com/v1/chat/completions"));
+        assert!(!is_local_endpoint(""));
     }
 
     /// 端口顺延：占住一个端口后应从下一个可用端口启动，并返回原始请求端口。
@@ -2187,5 +2318,24 @@ mod tests {
             "font/woff2"
         );
         assert!(find("marked.min.js").unwrap().bytes.len() > 10_000);
+    }
+
+    /// 示例材料已内嵌且格式正确（向导第四步的前提）。
+    #[test]
+    fn sample_assets_embedded() {
+        assert!(SAMPLE_NOTE_MD.len() > 1000, "示例笔记为空");
+        assert!(SAMPLE_PAPER_PDF.starts_with(b"%PDF-"), "示例论文不是 PDF");
+        assert!(String::from_utf8_lossy(SAMPLE_NOTE_MD).contains('#'));
+        let s = samples();
+        assert_eq!(s.len(), 2);
+        assert!(!s[0].needs_key && s[1].needs_key, "示例的 needs_key 标记不对");
+    }
+
+    /// 示例导入命令：md 走原样导入（0 token），pdf 走四段式生成。
+    #[test]
+    fn sample_command_variants() {
+        let p = std::path::Path::new("/tmp/示例 笔记.md");
+        assert!(sample_command(&samples()[0], p).starts_with("ingest --note --kind note --text \""));
+        assert!(sample_command(&samples()[1], p).starts_with("ingest --style four --kind paper \""));
     }
 }

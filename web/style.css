@@ -631,3 +631,58 @@ ul.outline li.para { color: #888; font-size: 12px; }
   color: var(--blue); background: var(--blue-light); border-radius: 8px;
   vertical-align: 1px;
 }
+
+/* ===== 首次使用向导 ===== */
+.wizard-box { width: 640px; }
+.wizard-steps { display: flex; gap: 6px; list-style: none; margin: 0 0 16px; padding: 0; }
+.wizard-steps li {
+  flex: 1; display: flex; align-items: center; gap: 6px; padding: 6px 2px;
+  font-size: 12px; color: var(--muted); border-bottom: 2px solid var(--line);
+}
+.wizard-steps li span {
+  width: 18px; height: 18px; border-radius: 50%; background: #e5e5e2; color: #666;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0;
+}
+.wizard-steps li.active { color: var(--fg); border-bottom-color: var(--blue); }
+.wizard-steps li.active span { background: var(--blue); color: #fff; }
+.wizard-steps li.done { color: var(--ok); border-bottom-color: var(--ok); }
+.wizard-steps li.done span { background: var(--ok); color: #fff; }
+.wizard-body { min-height: 180px; }
+.wizard-body input[type=text], .wizard-body input[type=password] {
+  display: block; width: 100%; margin-top: 4px; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 13px;
+}
+.wizard-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.wizard-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+  cursor: pointer; background: #fff;
+}
+.wizard-card:hover { border-color: var(--blue); }
+.wizard-card.active { border-color: var(--blue); background: var(--blue-light); }
+.wizard-card h4 { font-size: 13px; margin-bottom: 4px; }
+.wizard-card p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+.wizard-card .wz-meta { margin-top: 6px; font-size: 11px; color: var(--muted); word-break: break-all; }
+.wizard-card .wz-badge {
+  display: inline-block; margin-left: 4px; padding: 0 5px; font-size: 10px;
+  border-radius: 8px; background: #eef2ff; color: var(--blue); vertical-align: 1px;
+}
+.wizard-note { font-size: 12px; color: var(--muted); line-height: 1.7; margin: 8px 0; }
+.wz-dep {
+  display: flex; justify-content: space-between; gap: 8px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; font-size: 13px;
+}
+.wz-dep .ok { color: var(--ok); }
+.wz-dep .bad { color: var(--danger); }
+.wz-log {
+  max-height: 160px; overflow-y: auto; margin-top: 8px; padding: 8px 10px;
+  background: #1e1e1e; color: #ddd; border-radius: 6px; font: 12px/1.5 ui-monospace, monospace;
+  white-space: pre-wrap; word-break: break-all;
+}
+.wz-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+
+/* 顶栏「未配置模型」提示 */
+.model-warn {
+  display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 11px;
+  color: var(--danger); border: 1px solid var(--danger); border-radius: 8px;
+  vertical-align: 1px; cursor: pointer;
+}

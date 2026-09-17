@@ -499,6 +499,12 @@ async function runCommand(command, opts = {}) {
   if (!command || !command.trim()) return;
   // LLM 任务互斥；非 LLM 命令（撤销/跳转/查看等）在 LLM 任务期间仍可执行
   const isLlm = LLM_CMD_RE.test(command.trim());
+  // 未配置模型：弹向导（原样导入 `ingest --note` 不调模型，直接放行）
+  if (isLlm && lastState && !lastState.llm_ready && !/--note\b/.test(command)) {
+    openWizard(2);
+    wizardStatus("还没有配置模型服务：先在向导里选服务商、填 API Key", "err");
+    return;
+  }
   if (isLlm && (running || llmBusyTask)) {
     showBusyHint();
     return;
@@ -574,6 +580,7 @@ async function refreshState() {
     renderPapers(st);
     renderConcepts(st);
     renderNoteEmpty(st);
+    maybeAutoWizard(st);
   } catch (e) {
     console.error(e);
   }
@@ -593,7 +600,10 @@ function renderNoteEmpty(st) {
 }
 
 function renderModel(st) {
-  $("model").innerHTML = `模型 <b>${esc(st.model)}</b>`;
+  const hint = st.llm_ready
+    ? ""
+    : ' <span class="model-warn" title="点顶栏「向导」配置模型服务">未配置模型</span>';
+  $("model").innerHTML = `模型 <b>${esc(st.model)}</b>${hint}`;
 }
 
 function renderUsage(st) {
@@ -3268,6 +3278,339 @@ function stopConfigTest() {
   }
 }
 
+// ===== 首次使用向导（服务商 → Key → 环境 → 示例） =====
+
+let wizardStep = 1;
+let wizardPresets = null;    // /api/presets 缓存
+let wizardPreset = null;     // 当前选中的服务商预设
+let wizardDeps = null;       // /api/deps 快照
+let wizardSamples = null;    // /api/samples 缓存
+let wizardTestAbort = null;  // 「测试连接」的 AbortController
+let wizardAutoShown = false; // 自动弹出只做一次（页面加载后）
+let wizardRenderSeq = 0;     // 丢弃过期的异步渲染
+
+function wizardStatus(msg, cls = "") {
+  const el = $("wizard-status");
+  el.textContent = msg || "";
+  el.className = "status" + (cls ? " " + cls : "");
+}
+
+function openWizard(step) {
+  if (step) wizardStep = step;
+  wizardStatus("");
+  $("wizard-modal").classList.remove("hidden");
+  renderWizard();
+}
+
+function closeWizard() {
+  $("wizard-modal").classList.add("hidden");
+  if (wizardTestAbort) {
+    try { wizardTestAbort.abort(); } catch (e) { /* 忽略 */ }
+    wizardTestAbort = null;
+  }
+}
+
+/// 页面加载后若未配置模型（无 Key 且非本地服务）自动弹一次向导。
+function maybeAutoWizard(st) {
+  if (wizardAutoShown) return;
+  wizardAutoShown = true;
+  if (!$("wizard-modal").classList.contains("hidden")) return;
+  if (!st || st.llm_ready) return;
+  openWizard(1);
+}
+
+async function renderWizard() {
+  const seq = ++wizardRenderSeq;
+  const body = $("wizard-body");
+  document.querySelectorAll("#wizard-steps li").forEach((li) => {
+    const n = Number(li.dataset.step);
+    li.classList.toggle("active", n === wizardStep);
+    li.classList.toggle("done", n < wizardStep);
+  });
+  $("btn-wizard-prev").classList.toggle("hidden", wizardStep <= 1);
+  $("btn-wizard-next").textContent = wizardStep >= 4 ? "完成" : "下一步";
+  $("btn-wizard-next").disabled = false;
+  if (wizardStep === 1) return renderWizardPresets(body, seq);
+  if (wizardStep === 2) return renderWizardKey(body, seq);
+  if (wizardStep === 3) return renderWizardDeps(body, seq);
+  return renderWizardSamples(body, seq);
+}
+
+async function renderWizardPresets(body, seq) {
+  body.innerHTML = '<p class="muted">加载服务商列表…</p>';
+  if (!wizardPresets) {
+    try {
+      wizardPresets = (await (await fetch("/api/presets")).json()).presets || [];
+    } catch (e) {
+      body.innerHTML = '<p class="wizard-note">读取服务商列表失败，请检查服务是否在运行。</p>';
+      return;
+    }
+  }
+  if (seq !== wizardRenderSeq) return;
+  const intro = document.createElement("p");
+  intro.className = "wizard-note";
+  intro.textContent = "选一个模型服务商：国内推荐 DeepSeek（便宜、快、支持长文）；装了 Ollama 可完全本地运行、不花钱。";
+  const wrap = document.createElement("div");
+  wrap.className = "wizard-cards";
+  for (const p of wizardPresets) {
+    const d = document.createElement("div");
+    d.className = "wizard-card" + (wizardPreset && wizardPreset.id === p.id ? " active" : "");
+    d.innerHTML =
+      `<h4>${esc(p.name)}${p.needs_key ? "" : '<span class="wz-badge">无需 Key</span>'}</h4>` +
+      `<p>${esc(p.note || "")}</p>` +
+      `<div class="wz-meta">${esc(p.model || "（自行填写）")}<br>${esc(p.endpoint || "")}</div>`;
+    d.onclick = () => { wizardPreset = p; renderWizard(); };
+    wrap.appendChild(d);
+  }
+  body.innerHTML = "";
+  body.appendChild(intro);
+  body.appendChild(wrap);
+  if (!wizardPreset) wizardStatus("点一张卡片选择服务商");
+}
+
+function renderWizardKey(body, seq) {
+  const p = wizardPreset;
+  if (!p) { wizardStep = 1; return renderWizard(); }
+  const curEndpoint = (lastState && lastState.endpoint) || "";
+  const curModel = (lastState && lastState.model) || "";
+  body.innerHTML = `
+    <label>API Endpoint<input id="wz-endpoint" type="text" placeholder="https://…/v1/chat/completions"></label>
+    <label>API Key<input id="wz-key" type="password" placeholder="${p.needs_key ? "粘贴你的 API Key" : "本地服务可留空"}"></label>
+    <label>模型<input id="wz-model" type="text" placeholder="模型名"></label>
+    <p class="wizard-note" id="wz-hint"></p>
+    <div class="wz-actions">
+      <button id="btn-wz-test" class="ghost">测试连接</button>
+      ${p.key_url ? `<a class="hint" target="_blank" rel="noopener" href="${esc(p.key_url)}">去申请 Key ↗</a>` : ""}
+    </div>
+    <div id="wz-test-result" class="test-result hidden"></div>`;
+  $("wz-endpoint").value = p.endpoint || curEndpoint;
+  $("wz-model").value = p.model || curModel;
+  $("wz-hint").textContent = p.needs_key
+    ? "Key 只保存在本机（.paperhelper/config.toml），不会发往除该服务商外的任何地方。"
+    : "本地模型一般不需要 Key；若服务要求，随便填一串也可以。";
+  $("btn-wz-test").onclick = testWizardConfig;
+  $("wz-key").onkeydown = (e) => { if (e.key === "Enter") wizardNext(); };
+  if (seq !== wizardRenderSeq) return;
+}
+
+/// 测试向导表单里的配置（不保存），成功后用户再点「下一步」保存。
+async function testWizardConfig() {
+  const result = $("wz-test-result");
+  result.classList.remove("hidden");
+  result.className = "test-result";
+  result.textContent = "测试中…（最多等待 30 秒）";
+  const btn = $("btn-wz-test");
+  btn.disabled = true;
+  const ctrl = new AbortController();
+  wizardTestAbort = ctrl;
+  try {
+    const res = await fetch("/api/config/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        endpoint: $("wz-endpoint").value.trim(),
+        model: $("wz-model").value.trim(),
+        api_key: $("wz-key").value.trim(),
+      }),
+      signal: ctrl.signal,
+    });
+    const r = await res.json();
+    if (r.ok) {
+      result.className = "test-result ok";
+      result.textContent = `✓ 连接成功 · ${r.latency_ms}ms · 模型 ${r.model} · 回复「${r.reply}」`;
+    } else {
+      result.className = "test-result err";
+      result.textContent = `✗ 连接失败${r.status ? "（HTTP " + r.status + "）" : ""}：${r.raw || "无响应"}`;
+    }
+  } catch (e) {
+    if (e && e.name !== "AbortError") {
+      result.className = "test-result err";
+      result.textContent = "❌ " + e.message;
+    }
+  }
+  wizardTestAbort = null;
+  const b = $("btn-wz-test");
+  if (b) b.disabled = false;
+}
+
+/// 保存向导第 2 步到配置（服务商预设会连上下文长度/思考模式/单价一起写入）。
+async function saveWizardConfig() {
+  const p = wizardPreset || {};
+  const endpoint = $("wz-endpoint").value.trim();
+  const model = $("wz-model").value.trim();
+  const key = $("wz-key").value.trim();
+  if (!endpoint) throw new Error("API Endpoint 不能为空");
+  const keyRequired = p.needs_key !== false;
+  if (keyRequired && !key && !(lastState && lastState.api_key_set)) {
+    throw new Error("请先粘贴 API Key（没有 Key？回上一步选 Ollama 本地模型）");
+  }
+  wizardStatus("保存中…");
+  await setConfig("llm.api_endpoint", endpoint);
+  if (model) await setConfig("llm.model", model);
+  if (key) await setConfig("llm.api_key", key);
+  if (p.id) {
+    await setConfig("llm.context_length", String(p.context_length || 0));
+    await setConfig("llm.thinking_mode", p.thinking ? "true" : "false");
+    await setConfig("pricing.input_price_per_1m", String(p.input_price_per_1m || 0));
+    await setConfig("pricing.output_price_per_1m", String(p.output_price_per_1m || 0));
+  }
+  await refreshState();
+}
+
+async function renderWizardDeps(body, seq) {
+  body.innerHTML = '<p class="muted">检查 Python / PyMuPDF…</p>';
+  let d;
+  try {
+    d = await (await fetch("/api/deps")).json();
+  } catch (e) {
+    body.innerHTML = '<p class="wizard-note">读取环境信息失败，请检查服务是否在运行。</p>';
+    return;
+  }
+  if (seq !== wizardRenderSeq) return;
+  wizardDeps = d;
+  const pyOk = !!d.python;
+  const pdfOk = !!d.ready || !!d.pymupdf;
+  body.innerHTML = `
+    <p class="wizard-note">解析 PDF 需要 Python + PyMuPDF（读 PDF 的库）。检测结果如下，缺了可以一键安装；只读 Markdown 笔记的话可以跳过。</p>
+    <div class="wz-dep"><span>Python</span><span class="${pyOk ? "ok" : "bad"}">${
+      pyOk ? esc(d.python) + "（" + esc(d.python_cmd) + "）" : "❌ 未找到"
+    }</span></div>
+    <div class="wz-dep"><span>PyMuPDF</span><span class="${pdfOk ? "ok" : "bad"}">${
+      d.embedded ? "✓ 已内置" : pdfOk ? "✓ " + esc(d.pymupdf || "已安装") : "❌ 未安装"
+    }</span></div>
+    <div class="wz-actions" id="wz-dep-actions"></div>
+    <div class="wz-log hidden" id="wz-dep-log"></div>`;
+  const actions = $("wz-dep-actions");
+  if (pdfOk) {
+    const span = document.createElement("span");
+    span.className = "wizard-note";
+    span.textContent = "✓ 环境就绪，可以解析 PDF 了";
+    actions.appendChild(span);
+    return;
+  }
+  const install = document.createElement("button");
+  install.className = "primary";
+  install.textContent = pyOk ? "一键安装 PyMuPDF" : "用系统 Python 尝试安装";
+  const stop = document.createElement("button");
+  stop.className = "ghost";
+  stop.textContent = "停止";
+  stop.onclick = () => fetch("/api/interrupt", { method: "POST" }).catch(() => {});
+  install.onclick = async () => {
+    install.disabled = true;
+    stop.disabled = false;
+    const log = $("wz-dep-log");
+    log.classList.remove("hidden");
+    log.textContent = "";
+    wizardStatus("正在安装 PyMuPDF（走国内镜像，可点「停止」）…");
+    let failed = false;
+    try {
+      await postSse("/api/deps/install", {}, (ev) => {
+        if (ev.name === "stdout" || ev.name === "stderr") {
+          log.textContent += ev.text + "\n";
+          log.scrollTop = log.scrollHeight;
+        } else if (ev.name === "error") {
+          failed = true;
+          renderError(ev.text);
+          wizardStatus("❌ 安装失败，可查看控制台详情", "err");
+        } else if (ev.name === "aborted") {
+          failed = true;
+          wizardStatus("⏹ 已中止安装", "err");
+        }
+      });
+      if (!failed) wizardStatus("安装结束，重新检测…");
+      wizardDeps = null;
+      await renderWizard();
+    } catch (e) {
+      wizardStatus("❌ 安装失败：" + e.message, "err");
+      install.disabled = false;
+    }
+  };
+  actions.appendChild(install);
+  actions.appendChild(stop);
+}
+
+async function renderWizardSamples(body, seq) {
+  body.innerHTML = '<p class="muted">加载示例…</p>';
+  if (!wizardSamples) {
+    try {
+      wizardSamples = (await (await fetch("/api/samples")).json()).samples || [];
+    } catch (e) {
+      body.innerHTML = '<p class="wizard-note">读取示例失败，请检查服务是否在运行。</p>';
+      return;
+    }
+  }
+  if (seq !== wizardRenderSeq) return;
+  const intro = document.createElement("p");
+  intro.className = "wizard-note";
+  intro.textContent =
+    "先试一个：笔记示例「原样导入」不调用模型、0 token；论文示例会解析 PDF 并调用一次模型生成笔记（第一次体验完整流程）。";
+  const wrap = document.createElement("div");
+  wrap.className = "wizard-cards";
+  for (const s of wizardSamples) {
+    const d = document.createElement("div");
+    d.className = "wizard-card";
+    d.innerHTML =
+      `<h4>${esc(s.name)}${s.needs_key
+        ? '<span class="wz-badge">调用模型</span>'
+        : '<span class="wz-badge">0 token</span>'}</h4>` +
+      `<p>${esc(s.desc)}</p>` +
+      `<div class="wz-meta">${Math.round((s.size || 0) / 1024)} KB</div>`;
+    d.onclick = () => importWizardSample(s);
+    wrap.appendChild(d);
+  }
+  body.innerHTML = "";
+  body.appendChild(intro);
+  body.appendChild(wrap);
+}
+
+async function importWizardSample(s) {
+  if (s.needs_key && lastState && !lastState.llm_ready) {
+    wizardStep = 2;
+    renderWizard();
+    wizardStatus("这个示例要调用模型：先在第 2 步填好 API Key", "err");
+    return;
+  }
+  wizardStatus("准备示例文件…");
+  let res;
+  try {
+    res = await fetch("/api/samples/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id }),
+    });
+  } catch (e) {
+    wizardStatus("❌ " + e.message, "err");
+    return;
+  }
+  if (!res.ok) {
+    wizardStatus("❌ " + (await res.text()), "err");
+    return;
+  }
+  const j = await res.json();
+  closeWizard();
+  appendConsole("> " + j.command, "ok");
+  await runCommand(j.command, { export: j.export, ui: "import", quiet: true });
+}
+
+async function wizardNext() {
+  if (wizardStep === 2) {
+    try {
+      await saveWizardConfig();
+    } catch (e) {
+      wizardStatus("❌ " + e.message, "err");
+      return;
+    }
+  }
+  if (wizardStep >= 4) {
+    closeWizard();
+    appendConsole("✓ 向导完成；随时可点顶栏「向导」重看", "ok");
+    return;
+  }
+  wizardStep++;
+  wizardStatus("");
+  renderWizard();
+}
+
 // ===== 事件绑定 =====
 
 // ===== 侧栏：活动栏切换 + 宽度拖拽 =====
@@ -3355,6 +3698,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("btn-undo").onclick = () => runCommand("undo");
   $("btn-help").onclick = () => $("help-modal").classList.remove("hidden");
+  $("btn-wizard").onclick = () => openWizard(1);
+  $("btn-wizard-prev").onclick = () => {
+    if (wizardStep <= 1) return;
+    wizardStep--;
+    wizardStatus("");
+    renderWizard();
+  };
+  $("btn-wizard-next").onclick = wizardNext;
+  $("btn-wizard-skip").onclick = () => closeWizard();
   $("btn-help-close").onclick = () => $("help-modal").classList.add("hidden");
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".dropdown")) $("export-menu").classList.add("hidden");

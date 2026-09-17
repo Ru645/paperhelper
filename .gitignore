@@ -3,7 +3,7 @@ session-*.json
 session.json
 .env
 .paperhelper/
-samples/
+/samples/
 *.log*.md
 AGENTS.md
 
