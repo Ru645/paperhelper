@@ -66,7 +66,26 @@ jobs:
 
       - name: 打包（免安装 zip + 安装包）
         shell: pwsh
-        run: ./scripts/package-windows.ps1 -OutDir dist-win
+        run: |
+          # 日志同时留一份文件：失败时上传成 artifact，方便排查（Actions 原始日志需仓库管理员权限）
+          $ErrorActionPreference = "Continue"
+          $code = 1
+          try {
+            & ./scripts/package-windows.ps1 -OutDir dist-win 2>&1 | Tee-Object -FilePath dist-win-package.log
+            $code = $LASTEXITCODE
+          } catch {
+            $_ | Out-String | Tee-Object -FilePath dist-win-package.log -Append
+          }
+          if ($code -ne 0) { exit $code }
+
+      - name: 打包日志（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-log
+          path: dist-win-package.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

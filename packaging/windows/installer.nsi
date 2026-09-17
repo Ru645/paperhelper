@@ -1,4 +1,7 @@
-; PaperHelper Windows 安装包（NSIS 3 / Unicode）
+﻿; PaperHelper Windows 安装包（NSIS 3 / Unicode）
+;
+; 注意：本文件必须保存为 UTF-8 with BOM——makensis 按「有 BOM → UTF-8，无 BOM → 系统 ANSI 代码页」
+; 读脚本；不带 BOM 在英文 Windows（ACP=1252）上会把中文文件名/文案解成乱码，导致 File 找不到文件。
 ;
 ; 构建（由 scripts/package-windows.ps1 调用）：
 ;   makensis /DVERSION=0.1.0 /DVI4=0.1.0.0 /DDIST=<abs runtime 目录> /DOUT=<abs setup.exe> /DICON=<abs icon.ico> installer.nsi
