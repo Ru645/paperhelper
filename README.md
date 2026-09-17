@@ -6,6 +6,14 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 
 主界面是**浏览器 Web 应用**（`paperhelper web`），也提供功能等价的**命令行界面（CLI）**。安装与启动见文末[「安装与部署」](#安装与部署)。
 
+## 三步上手（Windows 10/11）
+
+1. **下载安装**：打开 [Releases](https://github.com/Ru645/paperhelper/releases/latest) 下载 `paperhelper-setup.exe` 双击安装（或 `paperhelper-windows-x64.zip` 解压后双击 `paperhelper-desktop.exe`）。不需要装 Python / Rust / 任何命令行工具。若 Windows 弹「已保护你的电脑」，点「更多信息 → 仍要运行」即可（未签名应用的正常提示）。
+2. **粘贴 API Key**：首次打开会自动弹出向导——选服务商（推荐 DeepSeek）→ 到服务商网站创建 API Key 复制回来 → 点「测试连接」→ 检查环境。Key 只存在本机。
+3. **导入论文**：把 PDF 拖进窗口 → 选「论文 → 生成笔记」→ 在笔记里**选中不懂的文字点「提问」**。想先零成本体验，点向导第 4 步的「导入示例」。
+
+更详细的图解版（花多少钱 / 数据放哪 / 扫描版 PDF / 离线可用性 / 报错排查等常见问题）见 **[快速开始.html](快速开始.html)**：安装包与 zip 内已附带，安装后开始菜单里也能直接打开。
+
 ## 核心功能
 
 - **Web 界面（主）**：导入、阅读笔记、选中提问、管理会话、配置模型、导出，全部在浏览器里完成
@@ -282,7 +290,7 @@ paperhelper                  # CLI REPL
 
 ### 5. Windows 安装包 / 绿色版（维护者）
 
-普通用户直接用 Release 里的两个产物即可：`paperhelper-setup.exe`（安装到 `%LOCALAPPDATA%\PaperHelper`，桌面 + 开始菜单快捷方式，per-user 免管理员）或 `paperhelper-windows-x64.zip`（解压后双击 `paperhelper-desktop.exe`）。两者都内置 Python 解释器与 PyMuPDF，用户机器上**不需要装 Python**。
+普通用户直接用 Release 里的两个产物即可：`paperhelper-setup.exe`（安装到 `%LOCALAPPDATA%\PaperHelper`，桌面 + 开始菜单快捷方式，per-user 免管理员）或 `paperhelper-windows-x64.zip`（解压后双击 `paperhelper-desktop.exe`）。两者都内置 Python 解释器与 PyMuPDF，用户机器上**不需要装 Python**；包内附带《快速开始.html》（安装后开始菜单也有快捷方式）。
 
 自己出包（在 Windows 上）：
 

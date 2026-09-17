@@ -103,6 +103,10 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage | Out-Null
 Copy-Item (Join-Path $rel "paperhelper.exe") $stage
 Copy-Item (Join-Path $rel "paperhelper-desktop.exe") $stage
+# 上手文档（生成物已入库；改内容后重新生成：python3 scripts/make_quickstart.py）
+$quickstart = Join-Path $RepoRoot "快速开始.html"
+if (-not (Test-Path $quickstart)) { Fail "缺少 快速开始.html（在仓库根目录运行 python3 scripts/make_quickstart.py 生成）" }
+Copy-Item $quickstart $stage
 New-Item -ItemType Directory -Path $pyDir | Out-Null
 
 # ---- 3. 内置 Python（python.org embeddable）----
