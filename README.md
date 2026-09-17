@@ -9,7 +9,7 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 ## 核心功能
 
 - **Web 界面（主）**：导入、阅读笔记、选中提问、管理会话、配置模型、导出，全部在浏览器里完成
-- **Windows 桌面版**：双击 `paperhelper-desktop.exe` 即用（原生窗口 + 内置 WebView2），自动启动本地服务、关窗即停、单实例防重复打开；无需终端与浏览器，数据固定存 `%USERPROFILE%\PaperHelper\.paperhelper`
+- **Windows 桌面版**：Release 提供一键安装包 `paperhelper-setup.exe`（或解压即用的 zip），双击装好即用（原生窗口 + 内置 WebView2），**内置 Python 与 PyMuPDF、用户机器不用装 Python**；自动启动本地服务、关窗即停、单实例防重复打开；无需终端与浏览器，数据固定存 `%USERPROFILE%\PaperHelper\.paperhelper`
 - **四步上手向导**：首次打开（或未配置模型）自动弹出「选服务商 → 填 API Key → 检查环境 → 导入示例」；内置一份示例笔记（原样导入，0 token）与一篇示例论文（体验完整流程），填完 Key 可当场「测试连接」；未配置模型时发起提问也会自动引导到向导
 - **笔记内就地提问**：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内问答；答案与所选文字绑定，点击高亮即可重新展开。选中公式会把它在 KaTeX 里的**原始 LaTeX**交给模型（不是渲染后的文本）
 - **章节提问**：右键笔记标题（h1=全文，h2/h3=小节）→「对本章节提问」
@@ -278,7 +278,22 @@ paperhelper                  # CLI REPL
 
 在运行 Web 服务的终端按 `Ctrl-C` 停止服务；CLI 下 `Ctrl-C` 是打断当前任务。
 
-**Windows 桌面窗口版**（`paperhelper-desktop.exe`，与 `paperhelper.exe` 同目录）：双击即以原生窗口打开界面，不用终端、不用浏览器。它做的事：单实例互斥锁（重复双击会聚焦已有窗口）→ 用隐藏控制台启动 `paperhelper web --port 0 --port-file <临时文件>`（随机端口、不弹黑框）→ 读端口文件后用 WebView2 打开 `http://127.0.0.1:<端口>/` → 关窗先 `/api/interrupt`（终止在途 LLM 任务）再 `/api/shutdown`（优雅退出），并把服务进程放进 Job Object，壳崩溃也不会残留后台服务。需要系统里有 Microsoft Edge WebView2 运行时（Win10 1803+ / Win11 一般自带），缺失时安装包会自动补装。源码 `src/bin/paperhelper-desktop.rs`（仅 Windows 编译，其他平台是空壳）；图标由 `python3 scripts/make_icon.py` 生成到 `assets/icon.ico`。
+**Windows 桌面窗口版**（`paperhelper-desktop.exe`，与 `paperhelper.exe` 同目录）：双击即以原生窗口打开界面，不用终端、不用浏览器。它做的事：单实例互斥锁（重复双击会聚焦已有窗口）→ 用隐藏控制台启动 `paperhelper web --port 0 --port-file <临时文件>`（随机端口、不弹黑框）→ 读端口文件后用 WebView2 打开 `http://127.0.0.1:<端口>/` → 关窗先 `/api/interrupt`（终止在途 LLM 任务）再 `/api/shutdown`（优雅退出），并把服务进程放进 Job Object，壳崩溃也不会残留后台服务。需要系统里有 Microsoft Edge WebView2 运行时（Win10 1803+ / Win11 一般自带），没装时安装程序会提示并打开官方下载页。源码 `src/bin/paperhelper-desktop.rs`（仅 Windows 编译，其他平台是空壳）；图标由 `python3 scripts/make_icon.py` 生成到 `assets/icon.ico`。
+
+### 5. Windows 安装包 / 绿色版（维护者）
+
+普通用户直接用 Release 里的两个产物即可：`paperhelper-setup.exe`（安装到 `%LOCALAPPDATA%\PaperHelper`，桌面 + 开始菜单快捷方式，per-user 免管理员）或 `paperhelper-windows-x64.zip`（解压后双击 `paperhelper-desktop.exe`）。两者都内置 Python 解释器与 PyMuPDF，用户机器上**不需要装 Python**。
+
+自己出包（在 Windows 上）：
+
+```powershell
+pwsh scripts/package-windows.ps1                  # 编译 + 下载 Python/PyMuPDF + 出 zip 和 setup.exe
+pwsh scripts/package-windows.ps1 -SkipInstaller   # 只要绿色 zip（不装 NSIS 时自动跳过安装包）
+```
+
+脚本流程：`cargo build --release -p paperhelper --bins` → 下载 python.org embeddable（`-PythonVersion`，默认 3.13.13；`-PythonMirror` 可换镜像）→ 改写 `python313._pth` 让 `Lib\site-packages` 生效 → `pip download` 拉 win_amd64 的 PyMuPDF wheel 解包进去（`-PipIndex` 换镜像）→ 用内置 `python.exe -c "import pymupdf"` 自检 → 组 `dist-win\runtime\` → 压缩 zip → 有 `makensis` 时按 `packaging/windows/installer.nsi` 出安装包。安装包不删用户数据（笔记在 `%USERPROFILE%\PaperHelper\.paperhelper`，与安装目录分离）。
+
+CI：`.github/workflows/windows-release.yml` 在推 `v*` tag 时自动跑「编译 → CLI 起服务冒烟（`--port-file` 握手 + `/api/state`）→ 打包 → 发 Release」；也可在 Actions 页手动触发（只出构建产物不发布）。
 
 ## 配置项
 

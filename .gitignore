@@ -9,3 +9,6 @@ AGENTS.md
 
 # 大作业提交材料（本地生成，不提交）
 submission/
+
+# Windows 打包产物
+dist-win/

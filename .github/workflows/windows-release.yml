@@ -1,0 +1,89 @@
+name: windows-release
+
+# 打 tag（v*）自动构建并发布 Release；也可在 Actions 页面手动触发（只上传构建产物，不发布）。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust（stable）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译 release（CLI + 桌面壳）
+        run: cargo build --release -p paperhelper --bins
+
+      - name: Python / pip 检查
+        run: |
+          python --version
+          python -m pip --version
+
+      - name: 冒烟测试（CLI 起服务 + /api/state 200）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Join-Path $PWD "target/release/paperhelper.exe"
+          $pf  = Join-Path $env:TEMP "ph-smoke-port.txt"
+          Remove-Item $pf -Force -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath $exe -ArgumentList @("web", "--port", "0", "--port-file", $pf) -PassThru -WindowStyle Hidden
+          $port = $null
+          try {
+            for ($i = 0; $i -lt 60 -and -not $proc.HasExited; $i++) {
+              Start-Sleep -Milliseconds 500
+              if (-not (Test-Path $pf)) { continue }
+              $p = (Get-Content $pf -Raw).Trim()
+              if (-not $p) { continue }
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$p/api/state" -UseBasicParsing -TimeoutSec 3
+                if ($r.StatusCode -eq 200) { $port = $p; break }
+              } catch { }
+            }
+            if (-not $port) { throw "冒烟测试失败：服务未在 30 秒内就绪" }
+            Write-Host "冒烟测试通过：端口 $port"
+          } finally {
+            if ($port) {
+              try { Invoke-WebRequest -Method POST -Uri "http://127.0.0.1:$port/api/shutdown" -UseBasicParsing -TimeoutSec 3 | Out-Null } catch { }
+            }
+            Start-Sleep -Seconds 2
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: 安装 NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: 打包（免安装 zip + 安装包）
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -OutDir dist-win
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperhelper-windows-x64
+          path: |
+            dist-win/paperhelper-windows-x64.zip
+            dist-win/paperhelper-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 发布 Release（仅 tag）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-win/paperhelper-windows-x64.zip
+            dist-win/paperhelper-setup.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
