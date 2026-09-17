@@ -7,7 +7,7 @@
 //! - 思维导图：缩进 markdown，追问以 💬 前缀展示（markmap 兼容）。
 //! - HTML：单文件。把 Markdown 以 JS 字符串嵌入，运行时由 marked 渲染、
 //!   KaTeX 渲染公式；左侧为对话树 <ul>（当前节点高亮 + token 显示）。
-//!   CDN 双源（jsdelivr → npmmirror）自动 fallback，全挂则降级纯文本。
+//!   渲染资源（marked/KaTeX/字体）全部编译期内嵌，离线可用。
 //!   导出前先 `convert_inline_math_delims` 统一公式定界符，规避 marked 转义。
 
 use std::collections::HashSet;
@@ -222,9 +222,8 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation, annotations: &[A
     }
 }
 
-/// 生成自包含 HTML：单文件，CDN 引入 marked + KaTeX 渲染 Markdown 与公式；
-/// 左侧对话树（当前节点高亮），右侧笔记；CDN 不可用时降级显示原文。
-/// 资源加载带 fallback：jsdelivr 失败自动切 npmmirror。
+/// 生成自包含 HTML：单文件，内嵌 marked + KaTeX（样式与字体同样内嵌），
+/// 完全离线渲染 Markdown 与公式；左侧对话树（当前节点高亮），右侧笔记。
 /// `annotations`：批注（引用文字+问答线程）——正文隐藏其问答，改为文字高亮 +
 /// 点击弹出只读小窗口；高亮失败的在文末「批注」列表兜底。
 pub fn to_html(note: &Note, conv: &Conversation, annotations: &[Annotation]) -> String {
@@ -292,6 +291,13 @@ fn thread_json(
         "children": children,
     })
 }
+
+/// 离线渲染资源：编译期内嵌（`web/vendor/` 随仓库提交，marked/KaTeX 均为 MIT）。
+/// 导出 HTML 不依赖任何 CDN：断网、内网都能正常渲染公式。
+const MARKED_JS: &str = include_str!("../web/vendor/marked.min.js");
+const KATEX_JS: &str = include_str!("../web/vendor/katex.min.js");
+/// KaTeX 样式：字体已由 `build.rs` 转为 data URI（见 `$OUT_DIR/katex_inline.css`）
+const KATEX_CSS_INLINE: &str = include_str!(concat!(env!("OUT_DIR"), "/katex_inline.css"));
 
 /// 批注相关的 CSS（注入导出 HTML；单独字符串避免 `format!` 花括号转义）。
 const ANN_CSS: &str = r#"
@@ -623,7 +629,7 @@ fn to_html_with(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — PaperHelper 笔记</title>
-<style>/* 占位：KaTeX 样式由 JS loader 按需注入（带 CDN fallback） */</style>
+<style>{katex_css}</style>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif; color: #1a1a1a; background: #fafafa; }}
@@ -659,74 +665,22 @@ fn to_html_with(
   </main>
 </div>
 <div id="ann-popup" class="ann-popup hidden"></div>
+<script>{marked_js}</script>
+<script>{katex_js}</script>
 <script>
-// 资源加载器：按序尝试多个 CDN（jsdelivr → npmmirror），全部失败走降级
-const CDNS = [
-  'https://cdn.jsdelivr.net/npm',
-  'https://registry.npmmirror.com'
-];
-function cssUrl(cdn, path) {{
-  // path 形如 "name@version/rest"；npmmirror 用 files API 映射
-  if (cdn.includes('npmmirror')) {{
-    const slash = path.indexOf('/');
-    const pkg = path.slice(0, slash);
-    const rest = path.slice(slash + 1);
-    const parts = pkg.split('@');
-    const name = parts[0], ver = parts[parts.length - 1];
-    return `https://registry.npmmirror.com/${{name}}/${{ver}}/files/${{rest}}`;
-  }}
-  return cdn + '/' + path;
-}}
-function loadCss(paths) {{
-  return new Promise(resolve => {{
-    let i = 0;
-    const tryNext = () => {{
-      if (i >= CDNS.length) return resolve(false);
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = cssUrl(CDNS[i % CDNS.length], paths[0]);
-      link.onload = () => resolve(true);
-      link.onerror = () => {{ i++; tryNext(); }};
-      document.head.appendChild(link);
-    }};
-    tryNext();
-  }});
-}}
-function loadScripts(paths) {{
-  // 串行加载，每个脚本依次尝试各 CDN
-  return paths.reduce((p, path) => p.then(() => new Promise(resolve => {{
-    let i = 0;
-    const tryNext = () => {{
-      if (i >= CDNS.length) return resolve(false);
-      const s = document.createElement('script');
-      s.src = cssUrl(CDNS[i], path);
-      s.onload = () => resolve(true);
-      s.onerror = () => {{ i++; tryNext(); }};
-      document.body.appendChild(s);
-    }};
-    tryNext();
-  }})), Promise.resolve(true));
-}}
 const MD = {md_json};
 const MACROS_TEXT = {macros_json};
 const MATH_MACROS = parseMathMacros(MACROS_TEXT);
 const ANNOTATIONS = {annotations_json};
 {ann_script}
-(async () => {{
-  await loadCss(['katex@0.16.9/dist/katex.min.css']);
-  await loadScripts([
-    'marked@12.0.2/marked.min.js',
-    'katex@0.16.9/dist/katex.min.js'
-  ]);
-  if (window.marked) {{
-    document.getElementById('note').innerHTML = renderMd(MD);
-    applyAnnotations();
-  }} else {{
-    // CDN 全部不可用时降级为纯文本
-    document.getElementById('fallback').style.display = 'block';
-    document.getElementById('fallback').textContent = MD;
-  }}
-}})();
+if (window.marked) {{
+  document.getElementById('note').innerHTML = renderMd(MD);
+  applyAnnotations();
+}} else {{
+  // markdown 渲染库缺失时降级为纯文本（正常情况下不会发生：资源已内嵌）
+  document.getElementById('fallback').style.display = 'block';
+  document.getElementById('fallback').textContent = MD;
+}}
 </script>
 </body>
 </html>
@@ -737,7 +691,10 @@ const ANNOTATIONS = {annotations_json};
         macros_json = macros_json,
         annotations_json = annotations_json,
         ann_css = ANN_CSS,
-        ann_script = ANN_SCRIPT
+        ann_script = ANN_SCRIPT,
+        katex_css = KATEX_CSS_INLINE,
+        marked_js = MARKED_JS,
+        katex_js = KATEX_JS
     )
 }
 
@@ -812,4 +769,31 @@ pub(crate) fn convert_inline_math_delims(md: &str) -> String {
         out.push_str(&converted);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 导出的 HTML 必须自带渲染资源（离线可用），而不是引用 CDN。
+    #[test]
+    fn html_export_embeds_offline_assets() {
+        let note = crate::notes::parse_markdown_note("# 测试笔记\n\n正文 $x^2$", "");
+        let conv = Conversation::default();
+        let html = to_html(&note, &conv, &[]);
+        assert!(html.contains("data:font/woff2;base64,"), "KaTeX 字体应内联为 data URI");
+        assert!(!html.contains("cdn.jsdelivr.net"), "不应再引用 CDN");
+        assert!(!html.contains("url(fonts/"), "字体 URL 应全部替换");
+        assert!(html.contains("marked"), "marked 应内联");
+        assert!(html.contains("katex"), "KaTeX 应内联");
+    }
+
+    /// KaTeX 内联样式不应残留 woff/ttf 备源引用（build.rs 会删除）。
+    #[test]
+    fn katex_inline_css_has_no_external_refs() {
+        assert!(KATEX_CSS_INLINE.contains("data:font/woff2;base64,"));
+        assert!(!KATEX_CSS_INLINE.contains("url(fonts/"));
+        assert!(!KATEX_CSS_INLINE.contains("format('woff')"));
+        assert!(!KATEX_CSS_INLINE.contains("format('truetype')"));
+    }
 }

@@ -226,7 +226,7 @@ brew install tesseract tesseract-lang                    # macOS
 git clone <仓库地址> && cd paperhelper
 cargo build                 # 独立 crate 直接构建
 cargo build -p paperhelper  # 在 workspace 下时加 -p
-cargo test                  # 运行测试（75 个）
+cargo test                  # 运行测试（78 个）
 ```
 
 编译产物在 `./target/debug/paperhelper`。
@@ -365,14 +365,18 @@ endpoints = ["https://api.deepseek.com/v1/chat/completions", "https://api.openai
 - **Web / CLI 双前端**：业务输出经 `output::Emitter` 抽象，同一套代码分别写终端与 SSE（`src/web.rs` 为 axum 服务，前端原生 JS 内嵌）
 - **错误归类 + 日志**：HTTP/网络错误映射成中文摘要与排查建议（原始响应进错误链与日志）；`src/logging.rs` 轻量日志写 stderr 与 `.paperhelper/logs/`
 - **健壮性**：网络抖动自动重试（2 次退避）、上下文超长自动截断早期对话、token 预算到上限自动中断、上传流式写盘并限 200MB；PDF/OCR 文本自动清洗字体缺失映射产生的私有区占位字符（避免豆腐块与噪声）
-- **HTML 导出**：marked + KaTeX（CDN 带 npmmirror 备源），离线降级纯文本
+- **HTML 导出 / 前端渲染完全离线**：marked + KaTeX（含字体）编译期内嵌，导出的 HTML 单文件自包含、断网也能渲染公式；主界面优先用本地 `/vendor/*`，仅失败才回退 CDN
 
 ## 开发
 
 ```bash
 cargo build -p paperhelper          # 构建
-cargo test  -p paperhelper          # 75 个单元测试
+cargo test  -p paperhelper          # 78 个单元测试
 cargo build -p paperhelper --release  # 发布构建
 ```
 
 二进制产物：`./target/debug/paperhelper`（或 `./target/release/paperhelper`）。
+
+第三方前端资源（marked / KaTeX，MIT 许可）放在 `web/vendor/` 并随仓库提交；
+`build.rs` 会把它们编译进二进制（`/vendor/*` 路由 + HTML 导出的内联样式与字体，
+woff2 转 data URI）。升级 = 替换 `web/vendor/` 下的文件后重新构建，无需联网。

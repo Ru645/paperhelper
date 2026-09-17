@@ -51,6 +51,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/shutdown", post(api_shutdown))
         .route("/api/open-data-dir", post(api_open_data_dir))
         .route("/api/presets", get(api_presets))
+        .route("/vendor/*path", get(api_vendor))
         .route("/api/note", get(api_note))
         .route("/api/styles", get(api_styles))
         .route("/api/styles/save", post(api_style_save))
@@ -265,6 +266,27 @@ async fn script() -> impl IntoResponse {
         ],
         include_str!("../web/app.js"),
     )
+}
+
+/// 编译期内嵌的第三方前端资源（marked / KaTeX，含字体）——断网也能渲染公式。
+mod vendor_assets {
+    include!(concat!(env!("OUT_DIR"), "/vendor_files.rs"));
+}
+
+/// `/vendor/*`：按路径查嵌入表返回资源（长缓存：升级随二进制版本变化）。
+async fn api_vendor(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let path = path.trim_start_matches('/');
+    match vendor_assets::VENDOR_FILES.iter().find(|f| f.path == path) {
+        Some(f) => (
+            [
+                (header::CONTENT_TYPE, f.mime),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            f.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, format!("vendor 资源不存在: {path}")).into_response(),
+    }
 }
 
 // ===== 命令执行（SSE） =====
@@ -2148,5 +2170,22 @@ mod tests {
             .await
             .expect("wait 未被唤醒")
             .unwrap();
+    }
+
+    /// /vendor 嵌入表：关键资源齐全、MIME 正确（离线渲染公式的前提）。
+    #[test]
+    fn vendor_assets_embedded() {
+        let find = |p: &str| vendor_assets::VENDOR_FILES.iter().find(|f| f.path == p);
+        assert!(find("marked.min.js").is_some(), "缺少 marked");
+        assert!(find("katex.min.js").is_some(), "缺少 katex js");
+        assert_eq!(
+            find("katex.min.css").expect("缺少 katex css").mime,
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            find("fonts/KaTeX_Main-Regular.woff2").expect("缺少字体").mime,
+            "font/woff2"
+        );
+        assert!(find("marked.min.js").unwrap().bytes.len() > 10_000);
     }
 }

@@ -733,53 +733,51 @@ function scrollNoteTo(anchor) {
 
 // ===== 概念 / 论文详情标签页 =====
 
-// 主页面按需加载 marked + KaTeX（带 CDN 备源），并复用与笔记相同的“公式保护”策略，
+// 主页面按需加载 marked + KaTeX：优先本地内嵌资源（/vendor/*，离线可用），
+// 失败再回退 CDN（jsdelivr → npmmirror）。复用与笔记相同的“公式保护”策略，
 // 使概念详情里的 $...$ / $$...$$ 能正确渲染。
 let mathLibsPromise = null;
 function loadMathLibs() {
   if (mathLibsPromise) return mathLibsPromise;
-  const CDNS = ["https://cdn.jsdelivr.net/npm", "https://registry.npmmirror.com"];
-  const url = (cdn, path) => {
-    if (cdn.includes("npmmirror")) {
+  const SOURCES = ["/vendor", "https://cdn.jsdelivr.net/npm", "https://registry.npmmirror.com"];
+  const remotePath = {
+    "katex.min.css": "katex@0.16.9/dist/katex.min.css",
+    "marked.min.js": "marked@12.0.2/marked.min.js",
+    "katex.min.js": "katex@0.16.9/dist/katex.min.js",
+  };
+  const url = (src, name) => {
+    if (src === "/vendor") return `/vendor/${name}`;
+    const path = remotePath[name];
+    if (src.includes("npmmirror")) {
       const slash = path.indexOf("/");
-      const pkg = path.slice(0, slash);
+      const parts = path.slice(0, slash).split("@");
       const rest = path.slice(slash + 1);
-      const parts = pkg.split("@");
       return `https://registry.npmmirror.com/${parts[0]}/${parts[parts.length - 1]}/files/${rest}`;
     }
-    return cdn + "/" + path;
+    return src + "/" + path;
   };
-  const loadCss = (path) =>
+  const load = (tag, name) =>
     new Promise((resolve) => {
       let i = 0;
       const next = () => {
-        if (i >= CDNS.length) return resolve(false);
-        const l = document.createElement("link");
-        l.rel = "stylesheet";
-        l.href = url(CDNS[i], path);
-        l.onload = () => resolve(true);
-        l.onerror = () => { i++; next(); };
-        document.head.appendChild(l);
-      };
-      next();
-    });
-  const loadScript = (path) =>
-    new Promise((resolve) => {
-      let i = 0;
-      const next = () => {
-        if (i >= CDNS.length) return resolve(false);
-        const s = document.createElement("script");
-        s.src = url(CDNS[i], path);
-        s.onload = () => resolve(true);
-        s.onerror = () => { i++; next(); };
-        document.body.appendChild(s);
+        if (i >= SOURCES.length) return resolve(false);
+        const el = document.createElement(tag);
+        if (tag === "link") {
+          el.rel = "stylesheet";
+          el.href = url(SOURCES[i], name);
+        } else {
+          el.src = url(SOURCES[i], name);
+        }
+        el.onload = () => resolve(true);
+        el.onerror = () => { el.remove(); i++; next(); };
+        (tag === "link" ? document.head : document.body).appendChild(el);
       };
       next();
     });
   mathLibsPromise = (async () => {
-    await loadCss("katex@0.16.9/dist/katex.min.css");
-    await loadScript("marked@12.0.2/marked.min.js");
-    await loadScript("katex@0.16.9/dist/katex.min.js");
+    await load("link", "katex.min.css");
+    await load("script", "marked.min.js");
+    await load("script", "katex.min.js");
   })();
   return mathLibsPromise;
 }
