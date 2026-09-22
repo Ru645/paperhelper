@@ -70,6 +70,9 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/config/test", post(api_config_test))
         .route("/api/update/check", get(api_update_check))
         .route("/api/update/skip", post(api_update_skip))
+        .route("/api/update/status", get(api_update_status))
+        .route("/api/update/download", post(api_update_download))
+        .route("/api/update/apply", post(api_update_apply))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
         .route("/api/sessions/save", post(api_session_save))
@@ -945,6 +948,33 @@ async fn api_update_skip(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     update::skip(&req.version)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// `GET /api/update/status`：安装包下载/安装进度（前端轮询）。
+async fn api_update_status() -> Json<serde_json::Value> {
+    Json(serde_json::to_value(update::download_status()).unwrap_or_default())
+}
+
+/// `POST /api/update/download`：后台下载安装包（进度见 status；重复请求不重开任务）。
+async fn api_update_download(State(app): State<SharedApp>) -> Json<serde_json::Value> {
+    let (client, cfg) = {
+        let a = app.lock().await;
+        (a.client.clone(), a.config.update.clone())
+    };
+    let phase = update::download_status().phase;
+    if phase == "downloading" || phase == "verifying" {
+        return Json(json!({ "ok": true, "phase": phase }));
+    }
+    tokio::spawn(async move {
+        let _ = update::download_setup(&client, &cfg).await;
+    });
+    Json(json!({ "ok": true, "phase": "downloading" }))
+}
+
+/// `POST /api/update/apply`：通知桌面壳退出并静默安装（仅桌面安装版）。
+async fn api_update_apply() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    update::apply_update().map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true })))
 }
 

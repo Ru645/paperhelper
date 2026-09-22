@@ -693,6 +693,10 @@ ul.outline li.para { color: #888; font-size: 12px; }
 .update-body { font-size: 13.5px; color: #333; line-height: 1.8; margin-bottom: 4px; }
 .update-body a { color: var(--blue); }
 .update-body .muted { font-size: 12.5px; }
+.dl-progress { margin: 12px 0 2px; }
+.dl-bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.dl-fill { height: 100%; width: 0; border-radius: 4px; background: var(--blue); transition: width .3s; }
+.dl-text { margin: 6px 0 0; font-size: 12px; }
 .update-row {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;

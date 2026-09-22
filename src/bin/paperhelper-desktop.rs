@@ -8,7 +8,9 @@
 //!    用 Job Object（KILL_ON_JOB_CLOSE）保证壳退出/崩溃时子进程一起结束；
 //! 4. 轮询端口文件拿到实际端口后，用 tao 建窗口 + wry 加载 `http://127.0.0.1:<port>/`；
 //! 5. 关窗：先 `/api/interrupt`（停掉在途 LLM 任务）再 `/api/shutdown`（优雅退出），
-//!    等待子进程退出（超时强杀）并清理端口文件。
+//!    等待子进程退出（超时强杀）并清理端口文件；
+//! 6. 一键更新：服务写入更新标记后，壳复制自身到临时目录并以 `--run-updater` 启动，
+//!    更新器等壳退出 → 静默运行安装包 `/S` → 重新启动新版本 → 自删临时副本。
 //!
 //! 其他平台编译为空壳，保证 `cargo build` / `cargo test` 跨平台可用。
 
@@ -21,6 +23,11 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    // 更新器模式：等旧壳退出 → 静默安装 → 重新启动（不能再走单实例/窗口逻辑）
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a.as_str()) == Some("--run-updater") {
+        std::process::exit(win::run_updater(&args[2..]));
+    }
     if let Err(e) = win::run() {
         win::fatal(&format!("{e:#}"));
         std::process::exit(1);
@@ -219,7 +226,7 @@ mod win {
     }
 
     /// 启动服务子进程，返回（子进程, 实际端口）。
-    fn spawn_server(cli: &Path, data_dir: &Path) -> anyhow::Result<(Child, u16)> {
+    fn spawn_server(cli: &Path, data_dir: &Path, marker: &Path) -> anyhow::Result<(Child, u16)> {
         let port_file = std::env::temp_dir().join(format!(
             "paperhelper-desktop-{}.port",
             std::process::id()
@@ -231,6 +238,12 @@ mod win {
             .open(log_path())?;
         let err_file = log_file.try_clone()?;
 
+        // 是否安装版（安装目录含 uninstall.exe）：决定 Web 端是否提供「一键更新」
+        let installed = cli
+            .parent()
+            .map(|d| d.join("uninstall.exe").is_file())
+            .unwrap_or(false);
+
         let mut cmd = Command::new(cli);
         cmd.arg("web")
             .arg("--port")
@@ -238,6 +251,9 @@ mod win {
             .arg("--port-file")
             .arg(&port_file)
             .env("PAPERHELPER_DATA_DIR", data_dir)
+            .env("PAPERHELPER_DESKTOP", "1")
+            .env("PAPERHELPER_INSTALLED", if installed { "1" } else { "0" })
+            .env("PAPERHELPER_UPDATE_MARKER", marker)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
@@ -279,6 +295,139 @@ mod win {
         log(&format!("已请求 {path}（端口 {port}）"));
     }
 
+    /// 优雅关闭服务：先停掉在途任务，再请求退出。
+    fn request_shutdown(port: u16) {
+        post(port, "/api/interrupt");
+        post(port, "/api/shutdown");
+    }
+
+    /// 更新标记文件：服务（子进程）写入，桌面壳轮询到后启动更新器。
+    fn update_marker_path() -> PathBuf {
+        std::env::temp_dir().join(format!("paperhelper-update-{}.marker", std::process::id()))
+    }
+
+    /// 读取更新标记（两行：版本号、安装包路径）；内容不完整或安装包不存在返回 None。
+    fn read_marker(path: &Path) -> Option<(String, PathBuf)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let mut lines = text.lines();
+        let version = lines.next()?.trim().to_string();
+        let setup = PathBuf::from(lines.next()?.trim());
+        if version.is_empty() || setup.as_os_str().is_empty() {
+            return None;
+        }
+        if !setup.is_file() {
+            log(&format!("更新标记里的安装包不存在：{}", setup.display()));
+            return None;
+        }
+        Some((version, setup))
+    }
+
+    /// 启动更新器：把自己复制到临时目录再运行（安装器要覆盖原 exe，运行中的文件不能占用）。
+    fn launch_updater(setup: &Path) -> anyhow::Result<()> {
+        let self_exe = std::env::current_exe()?;
+        let copy = std::env::temp_dir()
+            .join(format!("paperhelper-updater-{}.exe", std::process::id()));
+        let _ = std::fs::remove_file(&copy);
+        std::fs::copy(&self_exe, &copy).map_err(|e| {
+            anyhow::anyhow!("复制更新器失败（{}）：{e}", copy.display())
+        })?;
+        Command::new(&copy)
+            .arg("--run-updater")
+            .arg(std::process::id().to_string())
+            .arg(&self_exe)
+            .arg(setup)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("启动更新器失败：{e}"))?;
+        log(&format!(
+            "更新器已启动（{} → 安装包 {}）",
+            copy.display(),
+            setup.display()
+        ));
+        Ok(())
+    }
+
+    /// 等待进程退出（最多 timeout）；进程已不存在也算退出。
+    fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+        /// SYNCHRONIZE（PROCESS_ACCESS_RIGHTS），避免为一个常量开启额外 feature。
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return true;
+            }
+            let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            let r = WaitForSingleObject(h, ms);
+            CloseHandle(h);
+            r == WAIT_OBJECT_0
+        }
+    }
+
+    /// 更新器模式（`--run-updater <壳PID> <壳exe> <安装包> [版本]`）：
+    /// 等旧壳退出 → 静默安装 → 重新启动 → 自删临时副本。返回值为进程退出码。
+    pub fn run_updater(args: &[String]) -> i32 {
+        log("更新器启动");
+        if args.len() < 3 {
+            log("更新器参数不足，退出");
+            return 2;
+        }
+        let pid: u32 = args[0].parse().unwrap_or(0);
+        let shell = PathBuf::from(&args[1]);
+        let setup = PathBuf::from(&args[2]);
+        let version = args.get(3).cloned().unwrap_or_default();
+
+        if pid != 0 {
+            log(&format!("等待旧桌面壳（PID {pid}）退出"));
+            if !wait_for_process_exit(pid, Duration::from_secs(120)) {
+                log("等待超时，继续安装");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500)); // 留点时间让文件句柄释放
+
+        let mut installed = false;
+        if setup.is_file() {
+            log(&format!("静默安装 v{version}：{}", setup.display()));
+            match Command::new(&setup).arg("/S").status() {
+                Ok(st) if st.success() => installed = true,
+                Ok(st) => log(&format!("安装包返回 {st}")),
+                Err(e) => log(&format!("运行安装包失败：{e}")),
+            }
+            if installed {
+                let _ = std::fs::remove_file(&setup);
+            }
+        } else {
+            log(&format!("安装包不存在：{}", setup.display()));
+        }
+
+        // 不管安装结果如何都重新启动，避免用户「点了更新后什么都没打开」
+        if shell.is_file() {
+            log(&format!("重新启动：{}", shell.display()));
+            if let Err(e) = Command::new(&shell).spawn() {
+                log(&format!("重新启动失败：{e}"));
+            }
+        }
+
+        // 自删：借一个短暂存活的 cmd 在更新器退出后删除临时副本
+        if let Ok(me) = std::env::current_exe() {
+            if me
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.starts_with("paperhelper-updater-"))
+            {
+                let cmdline = format!("ping -n 2 127.0.0.1 >nul & del /f /q \"{}\"", me.display());
+                let _ = Command::new("cmd")
+                    .arg("/C")
+                    .arg(cmdline)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+            }
+        }
+        log("更新器退出");
+        0
+    }
+
     pub fn run() -> anyhow::Result<()> {
         log("桌面壳启动");
 
@@ -298,7 +447,9 @@ mod win {
         let data_dir = resolve_data_dir();
         log(&format!("CLI={} 数据目录={}", cli.display(), data_dir.display()));
 
-        let (mut child, port) = spawn_server(&cli, &data_dir)?;
+        let marker = update_marker_path();
+        let _ = std::fs::remove_file(&marker);
+        let (mut child, port) = spawn_server(&cli, &data_dir, &marker)?;
         log(&format!("服务已就绪：端口 {port}"));
 
         let mut event_loop = EventLoop::new();
@@ -323,16 +474,40 @@ mod win {
         })?;
 
         event_loop.run_return(|event, _, control_flow| {
-            *control_flow = ControlFlow::Wait;
+            *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
             if let Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } = event
             {
                 log("窗口关闭请求：通知服务退出");
-                post(port, "/api/interrupt");
-                post(port, "/api/shutdown");
+                request_shutdown(port);
                 *control_flow = ControlFlow::Exit;
+                return;
+            }
+            // 服务端写入更新标记 → 启动更新器并退出（更新器负责安装与重启）
+            if marker.is_file() {
+                let parsed = read_marker(&marker);
+                let _ = std::fs::remove_file(&marker);
+                match parsed {
+                    Some((version, setup)) => {
+                        log(&format!("收到更新请求：v{version}"));
+                        match launch_updater(&setup) {
+                            Ok(()) => {
+                                request_shutdown(port);
+                                *control_flow = ControlFlow::Exit;
+                            }
+                            Err(e) => {
+                                log(&format!("启动更新器失败：{e:#}"));
+                                info_box(&format!(
+                                    "无法启动更新程序：{e:#}\n\n请到下载页手动更新：\n{}",
+                                    "https://github.com/Ru645/paperhelper/releases/latest"
+                                ));
+                            }
+                        }
+                    }
+                    None => log("更新标记内容不完整，已忽略"),
+                }
             }
         });
 
@@ -358,6 +533,7 @@ mod win {
         let _ = std::fs::remove_file(
             std::env::temp_dir().join(format!("paperhelper-desktop-{}.port", std::process::id())),
         );
+        let _ = std::fs::remove_file(&marker);
         log("桌面壳退出");
         Ok(())
     }

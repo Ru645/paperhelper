@@ -36,7 +36,7 @@ PaperHelper 用**树形对话 + 笔记批注**解决这个问题：每次追问�
 - **等待不挡手**：生成期间可自由切换会话、看笔记与批注；结果自动写回**发起它的会话**
 - **随时可停**：LLM 请求、PDF / OCR 子进程都能一键中止（Web「停止」/ `Ctrl-C`）
 - **出错能排查**：错误给中文摘要与建议（Key 无效 / 限流 / 超上下文…），可展开原始响应；内置「测试连接」；所有操作有运行日志
-- **更新不打扰**：启动时静默检查新版本（每天至多一次），有新版本才在顶栏出现「发现新版本」，点开可看更新说明、手动下载，也可「跳过此版本」；「设置」里随时可手动检查
+- **更新不打扰**：启动时静默检查新版本（每天至多一次），有新版本才在顶栏出现「发现新版本」，点开可看更新说明、手动下载，也可「跳过此版本」；「设置」里随时可手动检查。**Windows 安装版支持一键更新**：点「立即更新」自动下载、校验 SHA-256、静默安装并重启（笔记与会话都在本机，不受影响）
 
 ## Web 界面
 
@@ -238,7 +238,7 @@ paperhelper                  # CLI REPL
 
 ### 5. Windows 安装包 / 绿色版（维护者）
 
-普通用户直接用 Release 的两个产物即可：`paperhelper-setup.exe`（安装到 `%LOCALAPPDATA%\PaperHelper`，桌面 + 开始菜单快捷方式，免管理员）或 `paperhelper-windows-x64.zip`（解压后双击 `paperhelper-desktop.exe`）。两者都内置 Python 与 PyMuPDF，用户机**不需要装 Python**；包内附《快速开始.html》。
+普通用户直接用 Release 的两个产物即可：`paperhelper-setup.exe`（安装到 `%LOCALAPPDATA%\PaperHelper`，桌面 + 开始菜单快捷方式，免管理员）或 `paperhelper-windows-x64.zip`（解压后双击 `paperhelper-desktop.exe`）。两者都内置 Python 与 PyMuPDF，用户机**不需要装 Python**；包内附《快速开始.html》。安装版支持应用内一键更新（自动下载安装包、校验后静默安装并重启）；绿色版点「手动下载」到发布页下载新版 zip。
 
 自己出包（Windows 上）：
 ```powershell

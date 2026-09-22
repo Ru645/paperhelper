@@ -10,13 +10,17 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use crate::config::UpdateConfig;
+use crate::interrupt;
 use crate::logging;
 use crate::paths;
 
@@ -206,7 +210,8 @@ impl Sha256 {
     }
 }
 
-/// 计算内存数据的 SHA-256 十六进制摘要。
+/// 计算内存数据的 SHA-256 十六进制摘要（单测校验实现用）。
+#[cfg(test)]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
@@ -423,6 +428,220 @@ pub fn skip(version: &str) -> Result<()> {
     state.save()
 }
 
+// ===== 一键更新：下载与安装（Windows 桌面安装版） =====
+
+/// 下载/安装进度（全局，供 `GET /api/update/status` 轮询；独立于会话锁）。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DownloadStatus {
+    /// `idle` / `downloading` / `verifying` / `ready` / `error`
+    pub phase: String,
+    pub version: String,
+    pub downloaded: u64,
+    pub total: u64,
+    /// 就绪后的安装包路径。
+    pub path: String,
+    pub error: String,
+}
+
+impl DownloadStatus {
+    fn idle() -> Self {
+        DownloadStatus {
+            phase: "idle".into(),
+            ..Default::default()
+        }
+    }
+}
+
+static DOWNLOAD: LazyLock<Mutex<DownloadStatus>> =
+    LazyLock::new(|| Mutex::new(DownloadStatus::idle()));
+
+fn set_download(f: impl FnOnce(&mut DownloadStatus)) {
+    if let Ok(mut st) = DOWNLOAD.lock() {
+        f(&mut st);
+    }
+}
+
+/// 当前下载状态快照。
+pub fn download_status() -> DownloadStatus {
+    DOWNLOAD.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// 安装包缓存路径：`%TEMP%/paperhelper-update/paperhelper-setup-<version>.exe`。
+fn setup_cache_path(version: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("paperhelper-update")
+        .join(format!("paperhelper-setup-{version}.exe"))
+}
+
+/// 下载安装包并校验 SHA-256（Web 后台任务调用）；进度与错误写入全局下载状态。
+pub async fn download_setup(client: &reqwest::Client, cfg: &UpdateConfig) -> Result<PathBuf> {
+    // 清掉上次任务残留的打断标志，使本次下载可正常开始（下载中按「停止」可取消）。
+    interrupt::reset();
+    set_download(|st| {
+        *st = DownloadStatus {
+            phase: "downloading".into(),
+            ..DownloadStatus::default()
+        }
+    });
+    let result = download_setup_inner(client, cfg).await;
+    if let Err(e) = &result {
+        let msg = format!("{e:#}");
+        logging::warn(format!("下载更新安装包失败：{msg}"));
+        set_download(|st| {
+            st.phase = "error".into();
+            st.error = msg;
+        });
+    }
+    result
+}
+
+async fn download_setup_inner(client: &reqwest::Client, cfg: &UpdateConfig) -> Result<PathBuf> {
+    let source = effective_source(cfg);
+    let manifest = fetch_manifest(client, &source).await?;
+    let asset = manifest.setup.clone().ok_or_else(|| {
+        anyhow!("这个版本没有可用的安装包，请到 {RELEASES_PAGE} 手动下载")
+    })?;
+    set_download(|st| {
+        st.version = manifest.version.clone();
+        st.total = asset.size;
+    });
+
+    let dest = setup_cache_path(&manifest.version);
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("创建下载目录失败: {}", dir.display()))?;
+    }
+    if dest.is_file() {
+        set_download(|st| st.phase = "verifying".into());
+        if verify_asset(&dest, &asset.sha256) {
+            set_download(|st| {
+                st.phase = "ready".into();
+                st.downloaded = dest.metadata().map(|m| m.len()).unwrap_or(0);
+                st.path = dest.display().to_string();
+            });
+            return Ok(dest);
+        }
+        // 上次没下完或已损坏：删掉重下
+        let _ = fs::remove_file(&dest);
+    }
+
+    let part = dest.with_extension("exe.part");
+    let _ = fs::remove_file(&part);
+    if let Err(e) = download_stream(client, &asset, &part).await {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    set_download(|st| st.phase = "verifying".into());
+    let (check_path, expected) = (part.clone(), asset.sha256.clone());
+    let verified = tokio::task::spawn_blocking(move || verify_asset(&check_path, &expected))
+        .await
+        .unwrap_or(false);
+    if !verified {
+        let _ = fs::remove_file(&part);
+        bail!("安装包校验失败（可能下载不完整），请重试或手动下载");
+    }
+    fs::rename(&part, &dest)
+        .with_context(|| format!("保存安装包失败: {}", dest.display()))?;
+
+    set_download(|st| {
+        st.phase = "ready".into();
+        st.downloaded = dest.metadata().map(|m| m.len()).unwrap_or(0);
+        st.path = dest.display().to_string();
+    });
+    logging::info(format!(
+        "更新安装包已就绪：{}（v{}）",
+        dest.display(),
+        manifest.version
+    ));
+    Ok(dest)
+}
+
+/// 下载到 `<dest>.part`，边下边更新进度；被打断（Web「停止」/Ctrl-C）则中止。
+async fn download_stream(client: &reqwest::Client, asset: &Asset, dest: &Path) -> Result<()> {
+    let resp = client
+        .get(&asset.url)
+        .header("User-Agent", format!("paperhelper/{}", current_version()))
+        .send()
+        .await
+        .map_err(|e| anyhow!("下载安装包失败（{e}），请检查网络后重试"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("下载安装包失败：服务器返回 HTTP {status}");
+    }
+    let total = resp.content_length().unwrap_or(asset.size);
+    if total > 0 {
+        set_download(|st| st.total = total);
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("创建下载文件失败: {}", dest.display()))?;
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
+    loop {
+        let chunk = tokio::select! {
+            c = stream.next() => c,
+            _ = interrupt::wait() => {
+                let _ = file.shutdown().await;
+                bail!("下载已取消");
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        let chunk = chunk.map_err(|e| anyhow!("下载中断（{e}），请重试"))?;
+        file.write_all(&chunk).await.context("写入安装包失败")?;
+        downloaded += chunk.len() as u64;
+        set_download(|st| st.downloaded = downloaded);
+    }
+    let _ = file.flush().await;
+    if total > 0 && downloaded != total {
+        bail!("下载不完整（{downloaded}/{total} 字节），请重试");
+    }
+    Ok(())
+}
+
+/// 校验文件 SHA-256；清单未提供摘要时放行（只记日志）。
+fn verify_asset(path: &Path, expected: &str) -> bool {
+    let expected = expected.trim();
+    if expected.is_empty() {
+        logging::warn("更新清单未提供 sha256，跳过安装包校验");
+        return true;
+    }
+    sha256_file(path)
+        .map(|actual| actual.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+/// 写入「更新标记」，桌面壳看到后退出并启动安装器（仅桌面安装版可用）。
+pub fn apply_update() -> Result<()> {
+    if !is_desktop() {
+        bail!("当前不是桌面版，无法自动安装，请手动下载");
+    }
+    if !is_installed() {
+        bail!("当前为免安装版，无法自动安装，请手动下载");
+    }
+    let marker = std::env::var("PAPERHELPER_UPDATE_MARKER").unwrap_or_default();
+    if marker.trim().is_empty() {
+        bail!("找不到更新标记路径（请重启软件后重试）");
+    }
+    let st = download_status();
+    if st.phase != "ready" || st.path.trim().is_empty() {
+        bail!("安装包尚未下载完成，请先下载");
+    }
+    let marker_path = Path::new(marker.trim());
+    if let Some(dir) = marker_path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    // 先写临时文件再改名：桌面壳读到的内容总是完整的
+    let tmp = marker_path.with_extension("tmp");
+    fs::write(&tmp, format!("{}\n{}\n", st.version, st.path))
+        .with_context(|| format!("写入更新标记失败: {}", tmp.display()))?;
+    fs::rename(&tmp, marker_path)
+        .with_context(|| format!("写入更新标记失败: {}", marker_path.display()))?;
+    logging::info(format!(
+        "已请求更新到 v{}（安装包 {}），等待桌面壳重启安装",
+        st.version, st.path
+    ));
+    Ok(())
+}
+
 async fn fetch_manifest(client: &reqwest::Client, url: &str) -> Result<Manifest> {
     let resp = client
         .get(url)
@@ -565,5 +784,43 @@ mod tests {
         assert!(s.ok && s.newer && s.skipped && s.from_cache);
         assert_eq!(s.checked_at, 123);
         assert_eq!(s.notes_url, RELEASES_PAGE, "notes_url 缺省应回落下载页");
+    }
+
+    #[test]
+    fn setup_cache_path_is_in_temp_with_version() {
+        let p = setup_cache_path("0.2.0");
+        assert_eq!(p.file_name().unwrap(), "paperhelper-setup-0.2.0.exe");
+        assert!(p.to_string_lossy().contains("paperhelper-update"));
+        assert!(p.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn verify_asset_checks_sha_and_allows_empty() {
+        let dir = std::env::temp_dir().join("paperhelper-test-verify");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        fs::write(&file, b"hello update").unwrap();
+        let sha = sha256_hex(b"hello update");
+        assert!(verify_asset(&file, &sha));
+        assert!(verify_asset(&file, &sha.to_uppercase()), "大小写不敏感");
+        assert!(!verify_asset(&file, "deadbeef"));
+        assert!(verify_asset(&file, ""), "清单缺摘要时放行");
+        assert!(!verify_asset(&dir.join("missing.bin"), &sha), "文件不存在不 panic");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_update_requires_desktop_and_ready() {
+        // 测试进程未设 PAPERHELPER_DESKTOP：应直接拒绝，且不写任何标记文件
+        let err = apply_update().unwrap_err().to_string();
+        assert!(err.contains("桌面版"), "错误提示应说明需要桌面版：{err}");
+    }
+
+    #[test]
+    fn download_status_default_is_idle() {
+        let st = DownloadStatus::default();
+        assert_eq!(st.phase, "");
+        assert_eq!(st.downloaded, 0);
+        assert!(st.error.is_empty());
     }
 }

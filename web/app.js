@@ -3377,6 +3377,10 @@ function showUpdateModal(r) {
   body.innerHTML = "";
   $("btn-update-apply").classList.add("hidden");
   $("btn-update-skip").classList.add("hidden");
+  if (!updateDownloading && !updateBusy) {
+    setUpdateButtonsDisabled(false);
+    $("btn-update-cancel").classList.add("hidden");
+  }
   updateStatus("");
 
   if (!info.ok) {
@@ -3422,6 +3426,113 @@ function openUpdateDownload() {
   const info = updateInfo || {};
   const url = info.manual_url || info.notes_url;
   if (url) window.open(url, "_blank", "noopener");
+}
+
+// ----- 一键更新（Windows 安装版）：下载 → 校验 → 静默安装并重启 -----
+
+let updateDownloading = false;  // 下载进度轮询进行中
+let updateBusy = false;         // 安装请求已发出（界面进入只读）
+
+function setUpdateButtonsDisabled(disabled) {
+  ["btn-update-apply", "btn-update-skip", "btn-update-manual"].forEach((id) => {
+    $(id).disabled = disabled;
+  });
+}
+
+/// 在弹窗里创建/更新下载进度条。
+function renderDownloadProgress(st, text) {
+  const body = $("update-body");
+  let box = body.querySelector(".dl-progress");
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "dl-progress";
+    box.innerHTML = '<div class="dl-bar"><div class="dl-fill"></div></div><p class="muted dl-text"></p>';
+    body.appendChild(box);
+  }
+  const pct = st.total > 0 ? Math.min(100, Math.round((st.downloaded / st.total) * 100)) : 0;
+  box.querySelector(".dl-fill").style.width = pct + "%";
+  const mb = (n) => (n > 0 ? (n / 1048576).toFixed(1) + " MB" : "—");
+  box.querySelector(".dl-text").textContent =
+    text || `已下载 ${mb(st.downloaded)} / ${mb(st.total)}（${pct}%）`;
+}
+
+/// 点「立即更新」：启动后台下载并轮询进度，就绪后请求安装。
+async function startUpdateDownload() {
+  if (updateDownloading || updateBusy) return;
+  if (!(updateInfo && updateInfo.auto_install)) {
+    updateStatus("当前版本不支持自动安装，请点「手动下载」", "err");
+    return;
+  }
+  updateDownloading = true;
+  setUpdateButtonsDisabled(true);
+  $("btn-update-cancel").classList.remove("hidden");
+  updateStatus("正在连接下载服务器…", "ok");
+  try {
+    await fetch("/api/update/download", { method: "POST" });
+  } catch (e) {
+    updateDownloading = false;
+    $("btn-update-cancel").classList.add("hidden");
+    setUpdateButtonsDisabled(false);
+    updateStatus("❌ 无法开始下载：" + e.message, "err");
+    return;
+  }
+  while (updateDownloading) {
+    let st;
+    try {
+      st = await (await fetch("/api/update/status")).json();
+    } catch (e) {
+      updateDownloading = false;
+      $("btn-update-cancel").classList.add("hidden");
+      setUpdateButtonsDisabled(false);
+      updateStatus("❌ 读取下载进度失败：" + e.message + "，可重试", "err");
+      return;
+    }
+    if (st.phase === "downloading") {
+      renderDownloadProgress(st);
+      updateStatus("正在下载安装包…", "ok");
+    } else if (st.phase === "verifying") {
+      renderDownloadProgress(st, "下载完成，正在校验安装包…");
+      updateStatus("正在校验安装包…", "ok");
+    } else if (st.phase === "ready") {
+      renderDownloadProgress(st, "安装包已就绪");
+      updateDownloading = false;
+      $("btn-update-cancel").classList.add("hidden");
+      await applyUpdateNow();
+      return;
+    } else if (st.phase === "error") {
+      updateDownloading = false;
+      $("btn-update-cancel").classList.add("hidden");
+      setUpdateButtonsDisabled(false);
+      updateStatus("❌ " + (st.error || "下载失败，请重试"), "err");
+      return;
+    } else {
+      updateStatus("正在准备下载…", "ok");
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/// 请求桌面壳退出并静默安装（成功后窗口会自动关闭并在新版本重启）。
+async function applyUpdateNow() {
+  updateBusy = true;
+  setUpdateButtonsDisabled(true);
+  updateStatus("正在安装更新，软件将自动重启，请稍候…", "ok");
+  try {
+    const r = await (await fetch("/api/update/apply", { method: "POST" })).json();
+    if (!r.ok) throw new Error(r.error || "无法开始安装");
+    $("update-title").textContent = "正在安装更新";
+  } catch (e) {
+    updateBusy = false;
+    setUpdateButtonsDisabled(false);
+    updateStatus("❌ " + e.message + "；可点「手动下载」更新", "err");
+  }
+}
+
+/// 取消下载：服务端收到打断信号后停止（已下载的部分会作废）。
+function cancelUpdateDownload() {
+  if (!updateDownloading) return;
+  updateStatus("正在取消下载…", "");
+  fetch("/api/interrupt", { method: "POST" }).catch(() => {});
 }
 
 /// 设置页「检查更新」：结果显示在版本行。
@@ -3979,6 +4090,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-update-close").onclick = () => $("update-modal").classList.add("hidden");
   $("btn-update-manual").onclick = openUpdateDownload;
   $("btn-update-skip").onclick = skipUpdate;
+  $("btn-update-apply").onclick = startUpdateDownload;
+  $("btn-update-cancel").onclick = cancelUpdateDownload;
   $("btn-update-check").onclick = checkUpdateFromSettings;
 
   // 导入弹窗：模式 + 动态风格 + 临时额外要求 + 风格管理
