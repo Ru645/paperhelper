@@ -86,6 +86,7 @@ paperhelper web --port 9000  # 指定端口
 paperhelper                 # 新会话
 paperhelper -l              # 列出所有已保存会话（编号+标题）
 paperhelper -s 20260909_020452   # 按编号恢复（支持唯一前缀，如 -s 20260909_02）
+paperhelper --version       # 查看版本号（排查 / 反馈时用）
 ```
 
 会话编号是**首次保存时的时间戳**，此后不变（每次 exit 覆盖保存同一编号）。`--completions` 可安装 bash 补全（含 `-s` 时间戳补全）。
