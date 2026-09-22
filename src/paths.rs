@@ -82,6 +82,11 @@ pub fn pins_path_in(dir: &Path) -> PathBuf {
     dir.join("pins.json")
 }
 
+/// 更新检查状态文件（`.paperhelper/update_state.json`）。
+pub fn update_state_path() -> PathBuf {
+    data_dir().join("update_state.json")
+}
+
 /// 上传文件目录（Web 端导入 PDF 等）。
 pub fn uploads_dir() -> PathBuf {
     data_dir().join("uploads")

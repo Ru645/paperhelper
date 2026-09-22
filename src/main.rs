@@ -6,6 +6,7 @@
 //!   - `--completions`：输出 bash 补全脚本（`-s` 后补全会话编号）
 //!   - `-s <编号>`：按会话文件名精确/唯一前缀匹配，恢复会话后进入 REPL
 //!   - `-l`：列出所有会话（编号+标题）
+//!   - `--version` / `-V`：打印版本号
 //! - 其余参数按单次 REPL 命令执行（便于脚本化调用）
 
 mod app;
@@ -24,6 +25,7 @@ mod presets;
 mod prompts;
 mod session;
 mod transfer;
+mod update;
 mod web;
 
 use anyhow::{anyhow, Result};
@@ -39,7 +41,7 @@ const BASH_COMPLETION: &str = r#"_paperhelper() {
     sess=$(ls .paperhelper/sessions/*.json 2>/dev/null | xargs -r -n1 basename | sed 's/\.json$//')
     COMPREPLY=( $(compgen -W "$sess" -- "$cur") )
   else
-    COMPREPLY=( $(compgen -W "-s -l --completions" -- "$cur") )
+    COMPREPLY=( $(compgen -W "-s -l --completions --version" -- "$cur") )
   fi
 }
 complete -F _paperhelper paperhelper
@@ -111,6 +113,12 @@ async fn main() -> Result<()> {
             }
         }
         return web::serve(app, port, open, port_file).await;
+    }
+
+    // --version / -V：打印版本号后退出（供脚本与排查使用）
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("PaperHelper v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
 
     // 仅 CLI 路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。

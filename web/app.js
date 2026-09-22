@@ -3213,6 +3213,9 @@ async function openConfig(tab = "model") {
     showBar("cfg-test-bar", false);
     $("btn-config-test-stop").classList.add("hidden");
     $("btn-config-test").disabled = false;
+    $("cfg-version").textContent = lastState && lastState.version
+      ? `当前版本 v${lastState.version}`
+      : "当前版本 —";
     if (tab === "style") await loadStylesPane();
     setSettingsTab(tab);
     $("config-modal").classList.remove("hidden");
@@ -3324,6 +3327,117 @@ function stopConfigTest() {
   fetch("/api/interrupt", { method: "POST" }).catch(() => {});
   if (cfgTestAbort) {
     try { cfgTestAbort.abort(); } catch (e) { /* 忽略 */ }
+  }
+}
+
+// ===== 版本更新（启动自动检查；Windows 安装版支持一键更新）=====
+
+let updateInfo = null;   // 最近一次 /api/update/check 结果
+let updateSeq = 0;       // 丢弃过期的异步检查结果
+
+/// 检查更新：force=true 为手动检查（跳过 24h 节流）。
+async function checkUpdate(force) {
+  const seq = ++updateSeq;
+  try {
+    const r = await (await fetch("/api/update/check" + (force ? "?force=1" : ""))).json();
+    if (seq !== updateSeq) return null;
+    updateInfo = r;
+    renderUpdatePill(r);
+    if (force) showUpdateModal(r);
+    return r;
+  } catch (e) {
+    if (force) updateStatus("❌ 检查更新失败：" + e.message, "err");
+    return null;
+  }
+}
+
+/// 顶栏提示：有新版本且未跳过时才出现。
+function renderUpdatePill(r) {
+  const btn = $("btn-update");
+  const show = !!(r && r.ok && r.newer && !r.skipped);
+  btn.classList.toggle("hidden", !show);
+  if (show) {
+    btn.textContent = "发现新版本 v" + r.latest;
+    btn.title = `当前 v${r.current}，点击查看 v${r.latest} 的更新说明`;
+  }
+}
+
+function updateStatus(msg, cls = "") {
+  const el = $("update-status");
+  el.textContent = msg || "";
+  el.className = "status" + (cls ? " " + cls : "");
+}
+
+/// 打开更新弹窗：展示版本对比、说明链接与可用操作。
+function showUpdateModal(r) {
+  if (r) updateInfo = r;
+  const info = updateInfo;
+  if (!info) return;
+  const body = $("update-body");
+  body.innerHTML = "";
+  $("btn-update-apply").classList.add("hidden");
+  $("btn-update-skip").classList.add("hidden");
+  updateStatus("");
+
+  if (!info.ok) {
+    $("update-title").textContent = "检查更新失败";
+    body.innerHTML = `<p>${esc(info.error || "无法连接更新服务器")}</p>` +
+      `<p class="muted">不影响正常使用；可稍后重试，或点「手动下载」到发布页查看最新版本。</p>`;
+  } else if (!info.newer) {
+    $("update-title").textContent = "已是最新版本";
+    body.innerHTML = `<p>当前版本 v${esc(info.current)}，没有发现新版本。</p>`;
+  } else {
+    $("update-title").textContent = "发现新版本 v" + esc(info.latest);
+    body.innerHTML =
+      `<p>当前 v${esc(info.current)} → 新版本 <b>v${esc(info.latest)}</b>${info.skipped ? "（此版本已被跳过，仍可更新）" : ""}</p>` +
+      (info.released_at ? `<p class="muted">发布时间：${esc(info.released_at)}</p>` : "") +
+      `<p><a href="${esc(info.notes_url)}" target="_blank" rel="noopener">查看这个版本改了什么 ↗</a></p>` +
+      (info.auto_install
+        ? `<p class="muted">点「立即更新」会自动下载并安装，完成后软件自动重启；笔记与会话都在本机，不会丢失。</p>`
+        : `<p class="muted">点「手动下载」打开下载页，下载新版安装包后直接安装即可；笔记与会话都在本机，不会丢失。</p>`);
+    $("btn-update-skip").classList.remove("hidden");
+    if (info.auto_install) $("btn-update-apply").classList.remove("hidden");
+  }
+  $("update-modal").classList.remove("hidden");
+}
+
+/// 跳过此版本：不再主动提示（设置里手动检查仍能看到）。
+async function skipUpdate() {
+  const info = updateInfo || {};
+  if (info.latest) {
+    try {
+      await fetch("/api/update/skip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: info.latest }),
+      });
+    } catch (e) { /* 忽略：仅影响提示，不影响使用 */ }
+    info.skipped = true;
+  }
+  $("update-modal").classList.add("hidden");
+  renderUpdatePill(updateInfo);
+}
+
+function openUpdateDownload() {
+  const info = updateInfo || {};
+  const url = info.manual_url || info.notes_url;
+  if (url) window.open(url, "_blank", "noopener");
+}
+
+/// 设置页「检查更新」：结果显示在版本行。
+async function checkUpdateFromSettings() {
+  const el = $("cfg-version");
+  const old = el.textContent;
+  el.textContent = "正在检查更新…";
+  const r = await checkUpdate(true);
+  if (!r) {
+    el.textContent = old;
+  } else if (!r.ok) {
+    el.textContent = `当前 v${r.current} · 检查失败（可稍后重试）`;
+  } else if (r.newer) {
+    el.textContent = `当前 v${r.current} · 发现新版本 v${r.latest}`;
+  } else {
+    el.textContent = `当前 v${r.current} · 已是最新版本`;
   }
 }
 
@@ -3860,6 +3974,13 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config-test-stop").onclick = stopConfigTest;
   $("btn-config-save").onclick = saveConfig;
 
+  // 版本更新：顶栏提示 / 更新弹窗 / 设置页手动检查
+  $("btn-update").onclick = () => showUpdateModal(null);
+  $("btn-update-close").onclick = () => $("update-modal").classList.add("hidden");
+  $("btn-update-manual").onclick = openUpdateDownload;
+  $("btn-update-skip").onclick = skipUpdate;
+  $("btn-update-check").onclick = checkUpdateFromSettings;
+
   // 导入弹窗：模式 + 动态风格 + 临时额外要求 + 风格管理
   $("btn-import-cancel").onclick = () => closeImportModal(null);
   $("btn-import-ok").onclick = () =>
@@ -3902,4 +4023,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   refreshState();
   setInterval(refreshState, 15000);
+  // 启动自动检查更新（24h 节流；失败静默，不影响使用）
+  checkUpdate(false);
 });

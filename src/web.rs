@@ -33,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::App;
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer};
+use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer, update};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -68,6 +68,8 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/config/test", post(api_config_test))
+        .route("/api/update/check", get(api_update_check))
+        .route("/api/update/skip", post(api_update_skip))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
         .route("/api/sessions/save", post(api_session_save))
@@ -749,6 +751,9 @@ fn build_state(a: &App) -> serde_json::Value {
             .unwrap_or_default(),
         "session_id": a.session.session_id,
         "export_path": a.export_path,
+        "version": update::current_version(),
+        "desktop": update::is_desktop(),
+        "installed": update::is_installed(),
         "current": a.session.conversation.current_label(),
         "current_input_tokens": current_input_tokens,
         "context_length": a.config.llm.context_length,
@@ -891,6 +896,56 @@ async fn install_pymupdf(emitter: &Emitter) -> anyhow::Result<()> {
              可用 PAPERHELPER_PYTHON 指定解释器路径后重试"
         )),
     }
+}
+
+// ===== 版本更新 =====
+
+#[derive(Deserialize)]
+struct UpdateCheckQuery {
+    /// 带 force 参数（任意值）= 手动检查，跳过 24h 节流。
+    #[serde(default)]
+    force: Option<String>,
+}
+
+/// `GET /api/update/check[?force=1]`：检查新版本（自动检查走节流、失败静默）。
+async fn api_update_check(
+    State(app): State<SharedApp>,
+    Query(q): Query<UpdateCheckQuery>,
+) -> Json<serde_json::Value> {
+    let (client, cfg) = {
+        let a = app.lock().await;
+        (a.client.clone(), a.config.update.clone())
+    };
+    let force = q.force.is_some();
+    if !force && !cfg.auto_check {
+        return Json(json!({
+            "ok": true,
+            "disabled": true,
+            "current": update::current_version(),
+        }));
+    }
+    let status = update::check(&client, &cfg, force).await;
+    let mut v = serde_json::to_value(&status).unwrap_or_default();
+    v["desktop"] = json!(update::is_desktop());
+    v["installed"] = json!(update::is_installed());
+    v["auto_install"] = json!(update::is_desktop()
+        && update::is_installed()
+        && !status.setup_url.is_empty());
+    Json(v)
+}
+
+#[derive(Deserialize)]
+struct UpdateSkipReq {
+    version: String,
+}
+
+/// `POST /api/update/skip`：跳过某版本，不再主动提示（手动检查仍能看到）。
+async fn api_update_skip(
+    Json(req): Json<UpdateSkipReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    update::skip(&req.version)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// 服务商预设（先启向导卡片；与 CLI `config presets` 同一份数据）。

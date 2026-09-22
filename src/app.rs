@@ -99,6 +99,8 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
     ConfigKeyDef { key: "pricing.input_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "pricing.output_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "update.auto_check", is_bool: true, from_presets: None },
+    ConfigKeyDef { key: "update.source_url", is_bool: false, from_presets: None },
 ];
 
 /// 命令补全器：
@@ -1010,6 +1012,8 @@ PaperHelper 命令：
             "pricing.input_price_per_1m" => self.config.pricing.input_price_per_1m = val.parse().context("需要数字")?,
             "pricing.output_price_per_1m" => self.config.pricing.output_price_per_1m = val.parse().context("需要数字")?,
             "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
+            "update.auto_check" => self.config.update.auto_check = parse_bool(val),
+            "update.source_url" => self.config.update.source_url = val.trim().into(),
             _ => {
                 let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
                 bail!("未知配置项: {key}。可设: {}", keys.join(" "));

@@ -21,6 +21,33 @@ pub struct Config {
     /// 补全用的预设（模型名/端点候选），用户可在 config.toml 里增删。
     #[serde(default)]
     pub presets: PresetsConfig,
+    /// 更新检查（旧配置缺 `[update]` 节时用默认：自动检查开、官方源）。
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// 版本更新检查配置（`[update]` 节）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// 启动时自动检查新版本（24h 节流；失败静默，不影响使用）。
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+    /// 更新源地址（update.json）；留空用官方 GitHub Releases，可指向镜像。
+    #[serde(default)]
+    pub source_url: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            auto_check: true,
+            source_url: String::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +133,7 @@ impl Default for Config {
                 token_budget: 0,
             },
             presets: PresetsConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -159,6 +187,15 @@ impl Config {
             if let Ok(n) = v.parse() {
                 cfg.budget.token_budget = n;
             }
+        }
+        // 更新源可用环境变量覆盖（镜像/内网/测试用）
+        if let Ok(v) = std::env::var("PAPERHELPER_UPDATE_SOURCE") {
+            if !v.trim().is_empty() {
+                cfg.update.source_url = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("PAPERHELPER_AUTO_UPDATE") {
+            cfg.update.auto_check = matches!(v.as_str(), "1" | "true" | "TRUE");
         }
 
         Ok(cfg)

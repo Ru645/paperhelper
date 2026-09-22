@@ -686,3 +686,14 @@ ul.outline li.para { color: #888; font-size: 12px; }
   color: var(--danger); border: 1px solid var(--danger); border-radius: 8px;
   vertical-align: 1px; cursor: pointer;
 }
+
+/* 顶栏「发现新版本」提示 + 更新弹窗 */
+.update-pill { color: var(--ok); border-color: var(--ok); font-weight: 600; }
+.update-pill.hidden { display: none; }
+.update-body { font-size: 13.5px; color: #333; line-height: 1.8; margin-bottom: 4px; }
+.update-body a { color: var(--blue); }
+.update-body .muted { font-size: 12.5px; }
+.update-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;
+}
