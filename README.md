@@ -246,7 +246,7 @@ pwsh scripts/package-windows.ps1                  # 编译 + 下载 Python/PyMuP
 pwsh scripts/package-windows.ps1 -SkipInstaller   # 只要绿色 zip
 ```
 
-CI：`.github/workflows/windows-release.yml` 推 `v*` tag 自动「编译 → 冒烟测试（`--port-file` 握手 + 探活）→ 打包 → 发 Release」。
+CI：`.github/workflows/windows-release.yml` 推 `v*` tag 自动「编译 → 冒烟测试（`--port-file` 握手 + 探活）→ 打包 → 生成 update.json（含 sha256，供应用内一键更新读取）→ 发 Release」。`scripts/make-update-json.ps1` 会校验 tag 与 `Cargo.toml` 版本一致后再出清单。
 
 ## 配置项
 
@@ -262,7 +262,7 @@ CI：`.github/workflows/windows-release.yml` 推 `v*` tag 自动「编译 → �
 | `pricing.output_price_per_1m` | 输出单价 | 0.60 |
 | `budget.token_budget` | token 预算（0=不限） | 0 |
 | `update.auto_check` | 启动时自动检查新版本（每天至多一次） | true |
-| `update.source_url` | 更新源地址（留空用官方；可填镜像 / 内网） | 空 |
+| `update.source_url` | 更新清单地址（留空用官方 `update.json`；可填镜像 / 内网，指向同样格式的 JSON） | 空 |
 
 配置存储在 `.paperhelper/config.toml`（被 gitignore，不含密钥以外敏感项；Web 端「设置」直接改）。
 

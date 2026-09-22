@@ -87,6 +87,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      - name: 生成一键更新清单 update.json
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v') {
+            # 手动触发（非 tag）：用 Cargo.toml 版本号生成，仅用于校验脚本本身
+            $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+            $tag = "v$v"
+            Write-Host "::warning::非 tag 触发，update.json 以 $tag 生成（回调地址仅为占位，不会发布）"
+          }
+          ./scripts/make-update-json.ps1 -Tag $tag `
+            -SetupPath dist-win/paperhelper-setup.exe `
+            -ZipPath   dist-win/paperhelper-windows-x64.zip `
+            -OutPath   dist-win/update.json
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -94,6 +110,7 @@ jobs:
           path: |
             dist-win/paperhelper-windows-x64.zip
             dist-win/paperhelper-setup.exe
+            dist-win/update.json
           if-no-files-found: error
           retention-days: 14
 
@@ -104,5 +121,6 @@ jobs:
           files: |
             dist-win/paperhelper-windows-x64.zip
             dist-win/paperhelper-setup.exe
+            dist-win/update.json
           generate_release_notes: true
           fail_on_unmatched_files: true
