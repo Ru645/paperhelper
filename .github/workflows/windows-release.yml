@@ -13,6 +13,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # 防止任何步骤卡死（编译 / 冒烟 / 打包）把 CI 时长耗满（默认上限 6 小时）
+    timeout-minutes: 45
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
