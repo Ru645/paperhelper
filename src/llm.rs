@@ -37,10 +37,36 @@ pub fn is_interrupted_error(e: &anyhow::Error) -> bool {
 }
 
 /// 一次对话消息（OpenAI roles: system / user / assistant）。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// 附加给本条消息的图片（data URL，如 `data:image/png;base64,...`）。
+    /// 仅用于「PDF 页面提问」等在途请求，**不写入会话历史**；为空时按纯文本发送。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+}
+
+impl Message {
+    /// 纯文本消息。
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// 追加一张图片（data URL）。
+    pub fn with_image(mut self, data_url: impl Into<String>) -> Self {
+        self.images.push(data_url.into());
+        self
+    }
+
+    /// 附加图片数量（估算 token 用）。
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
 }
 
 /// 一次完成的 LLM 结果：正文 + 精确/估算的 token 计数与成本核算依据。
@@ -91,6 +117,19 @@ struct Usage {
     completion_tokens: Option<u64>,
 }
 
+/// 单条消息 → OpenAI JSON。带图片时 `content` 用多模态数组（text + image_url）。
+fn message_json(m: &Message) -> serde_json::Value {
+    if m.images.is_empty() {
+        json!({ "role": m.role, "content": m.content })
+    } else {
+        let mut parts = vec![json!({ "type": "text", "text": m.content })];
+        for url in &m.images {
+            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
+        json!({ "role": m.role, "content": parts })
+    }
+}
+
 fn build_body(
     cfg: &LlmConfig,
     messages: &[Message],
@@ -98,10 +137,7 @@ fn build_body(
     thinking: bool,
     extras: bool,
 ) -> serde_json::Value {
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| json!({ "role": m.role, "content": m.content }))
-        .collect();
+    let msgs: Vec<serde_json::Value> = messages.iter().map(message_json).collect();
     let mut body = json!({
         "model": cfg.model,
         "messages": msgs,
@@ -257,7 +293,13 @@ fn estimate_tokens(s: &str) -> u64 {
 }
 
 fn estimate_input_tokens(messages: &[Message]) -> u64 {
-    messages.iter().map(|m| estimate_tokens(&m.content)).sum()
+    // 图片 token 依赖分辨率，这里按固定的每张约 1000 token 粗估（仅用于
+    // 服务端不返回 usage 的本地模型；正常情况以 usage 为准）。
+    const TOKENS_PER_IMAGE: u64 = 1000;
+    messages
+        .iter()
+        .map(|m| estimate_tokens(&m.content) + m.image_count() as u64 * TOKENS_PER_IMAGE)
+        .sum()
 }
 
 /// SSE 行缓冲：按**字节**累积，只在行边界做 UTF-8 解码。
@@ -612,6 +654,30 @@ mod tests {
         let d2 = ch2.choices[0].delta.as_ref().unwrap();
         assert_eq!(d2.content.as_deref(), Some("答"));
         assert!(d2.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn message_json_is_text_without_image_and_multimodal_with_image() {
+        let plain = Message::text("user", "你好");
+        let v = message_json(&plain);
+        assert_eq!(v["content"], "你好");
+
+        let with_img = Message::text("user", "看图").with_image("data:image/png;base64,AAA");
+        let v = message_json(&with_img);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "看图");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA");
+        assert_eq!(with_img.image_count(), 1);
+    }
+
+    #[test]
+    fn estimate_input_tokens_counts_images() {
+        let plain = vec![Message::text("user", "abcd")];
+        let with_img = vec![Message::text("user", "abcd").with_image("data:image/png;base64,AAA")];
+        assert!(estimate_input_tokens(&with_img) > estimate_input_tokens(&plain));
     }
 
     #[test]

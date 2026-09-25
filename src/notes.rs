@@ -90,6 +90,10 @@ pub struct Note {
     /// 常见于 HTML/讲义导入（MathJax 的宏块），普通笔记为空。
     #[serde(default)]
     pub math_macros: Option<String>,
+    /// 源文件路径（导入时的 PDF/MD/TXT 原件）。阅读器据此读取 PDF 原件；
+    /// 旧的已存会话没有该字段，缺省为空。
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 impl Note {
@@ -556,6 +560,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         raw_text: raw_text.to_string(),
         material_kind: String::new(),
         math_macros: macros,
+        source_path: None,
     };
     assign_numbers(&mut note);
     note
@@ -593,6 +598,7 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
         raw_text: String::new(),
         material_kind: String::new(),
         math_macros: macros,
+        source_path: None,
     };
     assign_numbers(&mut note);
     note

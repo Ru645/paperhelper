@@ -1,5 +1,6 @@
-//! 构建脚本：把 `web/vendor/` 下的第三方前端资源（marked / KaTeX，MIT 许可，
-//! 随仓库提交）编译进二进制，供离线使用：
+//! 构建脚本：把 `web/vendor/` 下的第三方前端资源（marked / KaTeX，MIT 许可；
+//! PDF.js，Apache-2.0，含 cmaps/standard_fonts/wasm，随仓库提交）
+//! 编译进二进制，供离线使用：
 //!
 //! 1. `$OUT_DIR/vendor_files.rs`：`/vendor/*` 路由的嵌入表（`include_bytes!`）
 //! 2. `$OUT_DIR/katex_inline.css`：KaTeX 样式，woff2 字体转 data URI、
@@ -69,12 +70,15 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) {
 
 fn mime_of(rel: &str) -> &'static str {
     match rel.rsplit('.').next().unwrap_or("") {
-        "js" => "text/javascript; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "woff2" => "font/woff2",
         "woff" => "font/woff",
         "ttf" => "font/ttf",
         "map" => "application/json",
+        // PDF.js 的 CMaps / 字体 / wasm 运行时数据
+        "bcmap" | "pfb" | "icc" => "application/octet-stream",
+        "wasm" => "application/wasm",
         _ => "text/plain; charset=utf-8",
     }
 }

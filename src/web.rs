@@ -43,6 +43,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/", get(index))
         .route("/style.css", get(stylesheet))
         .route("/app.js", get(script))
+        .route("/pdf-viewer.js", get(pdf_viewer_script))
         .route("/api/run", post(api_run))
         .route("/api/interrupt", post(api_interrupt))
         .route("/api/state", get(api_state))
@@ -92,7 +93,10 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/kb/paper/delete", post(api_paper_delete))
         .route("/api/kb/concept/pin", post(api_concept_pin))
         .route("/api/kb/concept/delete", post(api_concept_delete))
-        .route("/api/annotate", post(api_annotate))
+        .route(
+            "/api/annotate",
+            post(api_annotate).layer(DefaultBodyLimit::max(MAX_IMAGE_BODY_BYTES as usize)),
+        )
         .route("/api/annotate/answer", post(api_annotate_answer))
         .route("/api/annotate/reply", post(api_annotate_reply))
         .route("/api/annotate/delete", post(api_annotation_delete))
@@ -103,12 +107,16 @@ pub fn router(app: SharedApp) -> Router {
         )
         .route("/api/samples", get(api_samples))
         .route("/api/samples/import", post(api_sample_import))
+        .route("/api/pdf/file", get(api_pdf_file))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
 
 /// 上传大小上限（200MB，与前端提示一致）。
 const MAX_UPLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+/// 批注请求体上限（PDF 页渲染图以 data URL 随请求发送，可能达数 MB）。
+const MAX_IMAGE_BODY_BYTES: u64 = 32 * 1024 * 1024;
 
 /// serde 默认值：字段缺省时按 true（保持旧前端/旧会话的原有行为）。
 fn default_true() -> bool {
@@ -299,6 +307,17 @@ async fn script() -> impl IntoResponse {
     )
 }
 
+/// PDF.js 阅读器适配层（按需加载：打开「原文」时才请求本文件）。
+async fn pdf_viewer_script() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("../web/pdf-viewer.js"),
+    )
+}
+
 /// 编译期内嵌的第三方前端资源（marked / KaTeX，含字体）——断网也能渲染公式。
 mod vendor_assets {
     include!(concat!(env!("OUT_DIR"), "/vendor_files.rs"));
@@ -381,6 +400,34 @@ async fn api_samples() -> Json<serde_json::Value> {
         })
         .collect();
     Json(json!({ "samples": list }))
+}
+
+/// 当前会话 PDF 原件的字节流（供前端 PDF.js 阅读器加载）。
+/// 只读取 `App::pdf_source()` 解析出的路径，**不接受前端传入的任意路径**，
+/// 避免任意文件读取；无源或文件不存在返回 404。
+async fn api_pdf_file(State(app): State<SharedApp>) -> Response {
+    let src = {
+        let a = app.lock().await;
+        a.pdf_source()
+    };
+    let Some(path) = src else {
+        return (StatusCode::NOT_FOUND, "当前会话没有可阅读的 PDF 原件").into_response();
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let mut resp = ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response();
+            resp.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("private, max-age=3600"),
+            );
+            resp
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("读取 PDF 失败：{e}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -661,6 +708,15 @@ fn build_state(a: &App) -> serde_json::Value {
     let g = &a.kb.stats;
     let used = s.total_tokens() + g.total_tokens();
 
+    // 当前会话是否可打开 PDF 原件（前端据此显示「原文」阅读器入口）
+    let pdf_src = a.pdf_source();
+    let pdf_name = pdf_src
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+
     // 当前节点上次真实请求的精确 input_tokens（API 返回的 usage，非估算）
     let current_input_tokens = a
         .session
@@ -745,6 +801,10 @@ fn build_state(a: &App) -> serde_json::Value {
         },
         "has_note": a.session.notes.is_some(),
         "note_title": a.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
+        "pdf": {
+            "available": pdf_src.is_some(),
+            "name": pdf_name,
+        },
         // 数学宏定义（HTML/讲义导入时收集）；前端渲染公式时注册给 KaTeX
         "math_macros": a
             .session
@@ -2110,6 +2170,24 @@ struct AnnotateReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// PDF 批注锚点（笔记批注缺省）。
+    #[serde(default)]
+    pdf: Option<PdfAnchorReq>,
+    /// 该页渲染图（data URL）。仅 PDF 批注用，随本次请求发给模型，不入历史。
+    #[serde(default)]
+    image: Option<String>,
+}
+
+/// PDF 阅读器批注锚点：页码 + 页面内归一化矩形 + 类型。
+#[derive(Deserialize)]
+struct PdfAnchorReq {
+    #[serde(default)]
+    page: u32,
+    #[serde(default)]
+    rects: Vec<[f32; 4]>,
+    /// `text`（默认）/ `image` / `page`。
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn api_annotate(
@@ -2125,14 +2203,27 @@ async fn api_annotate(
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
-            let r = g.prepare_annotate(
-                &req.block_id,
-                &req.quote,
-                req.quote_tex.as_deref(),
-                &req.question,
-                is_check,
-                req.record_concept,
-            );
+            let r = if let Some(pdf) = &req.pdf {
+                g.prepare_annotate_pdf(
+                    pdf.page,
+                    pdf.rects.clone(),
+                    pdf.kind.as_deref().unwrap_or("text"),
+                    &req.quote,
+                    &req.question,
+                    is_check,
+                    req.record_concept,
+                    req.image.as_deref(),
+                )
+            } else {
+                g.prepare_annotate(
+                    &req.block_id,
+                    &req.quote,
+                    req.quote_tex.as_deref(),
+                    &req.question,
+                    is_check,
+                    req.record_concept,
+                )
+            };
             g.emitter = Emitter::terminal();
             r
         };
@@ -2341,6 +2432,9 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
                 "quote": ann.quote,
                 "quote_tex": ann.quote_tex,
                 "root_node_id": ann.root_node_id,
+                "page": ann.page,
+                "rects": ann.rects,
+                "kind": ann.kind,
                 "thread": build_thread(&a.session.conversation, &ann.root_node_id, &summary_map),
             })
         })

@@ -211,6 +211,61 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
   font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: #333;
 }
+#pane-note { position: relative; flex-direction: column; }
+/* 笔记 / 原文 阅读模式切换栏（仅当前会话有 PDF 时显示） */
+.note-mode {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-bottom: 1px solid var(--line); background: #fafafa;
+}
+.note-mode.hidden { display: none; }
+.note-mode-btn {
+  font-size: 13px; padding: 4px 14px; border: 1px solid var(--line); background: #fff;
+  color: #555; border-radius: 6px; cursor: pointer;
+}
+.note-mode-btn:hover { background: #f0f0f0; }
+.note-mode-btn.active { background: var(--accent, #2f6fed); border-color: var(--accent, #2f6fed); color: #fff; }
+.pdf-mode-name { margin-left: 6px; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* PDF 阅读器 */
+.pdf-view { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #525659; }
+.pdf-view.hidden { display: none; }
+.pdf-toolbar {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; background: #fafafa; border-bottom: 1px solid var(--line);
+}
+.pdf-toolbar .mini { padding: 3px 9px; }
+.pdf-page-input {
+  width: 52px; text-align: center; font-size: 13px; padding: 3px 4px;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.pdf-page-total { font-size: 13px; color: var(--muted); }
+.pdf-sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+.pdf-zoom { font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.pdf-spacer { flex: 1; }
+.pdf-status { font-size: 12.5px; color: var(--muted); }
+.pdf-toc {
+  flex: 0 0 auto; max-height: 38%; overflow-y: auto; background: #fff;
+  border-bottom: 1px solid var(--line); padding: 6px 10px;
+}
+.pdf-toc.hidden { display: none; }
+.pdf-toc-item { display: block; width: 100%; text-align: left; font-size: 13px; color: #333; background: none; border: none; padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+.pdf-toc-item:hover { background: #eef2f8; }
+.pdf-pages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 0; text-align: center; }
+/* 单页容器：canvas + 透明文本层叠放 */
+.pdf-page { position: relative; margin: 0 auto 16px; background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.35); }
+.pdf-page canvas { display: block; }
+.pdf-text-layer {
+  position: absolute; inset: 0; overflow: hidden; line-height: 1;
+  text-align: initial; -webkit-user-select: text; user-select: text;
+}
+.pdf-text-layer span { position: absolute; white-space: pre; color: transparent; transform-origin: 0 0; }
+.pdf-text-layer span[role="presentation"] {
+  font-size: calc(var(--font-height) * var(--total-scale-factor));
+  transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1));
+  cursor: text;
+}
+.pdf-text-layer ::selection { background: rgba(47,111,237,.35); }
+.pdf-text-layer .pdf-hl { background: rgba(255,214,0,.45); color: transparent; border-radius: 2px; }
+.pdf-page-msg { font-size: 13px; color: #ccc; padding: 60px 0; }
 #note-frame { flex: 1; border: none; width: 100%; background: #fff; }
 #note-frame.hidden { display: none; }
 

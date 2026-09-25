@@ -75,7 +75,7 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Annotation {
     pub id: String,
-    /// 引用文字所在的笔记块 id（回答批注为空）。
+    /// 引用文字所在的笔记块 id（回答批注 / PDF 批注为空）。
     pub block_id: String,
     /// 选中的引用文字（可见文本，用于高亮匹配）。
     pub quote: String,
@@ -89,6 +89,17 @@ pub struct Annotation {
     pub root_node_id: String,
     #[serde(default)]
     pub created_at: String,
+    /// PDF 批注：原件页码（从 1 开始；非 PDF 批注为 None）。
+    #[serde(default)]
+    pub page: Option<u32>,
+    /// PDF 批注：页面内归一化矩形 `[x0,y0,x1,y1]`（相对页宽/页高，0..1），
+    /// 支持多行选区（多条）。非 PDF 批注为空。
+    #[serde(default)]
+    pub rects: Vec<[f32; 4]>,
+    /// PDF 批注类型：`text`（选中文本）/ `image`（图片或框选区域）/ `page`（整页）；
+    /// 非 PDF 批注为 None。
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl Session {
@@ -406,6 +417,9 @@ mod tests {
         assert_eq!(ann.quote, "x");
         assert!(ann.quote_tex.is_none(), "旧数据 quote_tex 应为 None");
         assert!(ann.node_id.is_none(), "旧数据 node_id 应为 None");
+        assert!(ann.page.is_none(), "旧数据 page 应为 None");
+        assert!(ann.rects.is_empty(), "旧数据 rects 应为空");
+        assert!(ann.kind.is_none(), "旧数据 kind 应为 None");
 
         // 新字段可正常往返
         let ann = Annotation {
@@ -416,9 +430,25 @@ mod tests {
             node_id: Some("n9".into()),
             root_node_id: "n10".into(),
             created_at: String::new(),
+            ..Default::default()
         };
         let back: Annotation = serde_json::from_str(&serde_json::to_string(&ann).unwrap()).unwrap();
         assert_eq!(back.quote_tex.as_deref(), Some("$y$"));
         assert_eq!(back.node_id.as_deref(), Some("n9"));
+
+        // PDF 批注字段可正常往返
+        let pdf = Annotation {
+            id: "a3".into(),
+            quote: "第 3 页正文".into(),
+            root_node_id: "n11".into(),
+            page: Some(3),
+            rects: vec![[0.1, 0.2, 0.5, 0.25], [0.1, 0.3, 0.6, 0.35]],
+            kind: Some("text".into()),
+            ..Default::default()
+        };
+        let back: Annotation = serde_json::from_str(&serde_json::to_string(&pdf).unwrap()).unwrap();
+        assert_eq!(back.page, Some(3));
+        assert_eq!(back.rects.len(), 2);
+        assert_eq!(back.kind.as_deref(), Some("text"));
     }
 }

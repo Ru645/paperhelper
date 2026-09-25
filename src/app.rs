@@ -328,6 +328,9 @@ pub struct AskJob {
     quote: Option<String>,
     record_concept: bool,
     approx_tokens: usize,
+    /// 是否把解释写进笔记树（普通 ask/check 为 true；PDF 页面提问为 false，
+    /// 只建独立对话线程 + 批注，不改动生成的笔记）。
+    attach_note: bool,
 }
 
 impl AskJob {
@@ -359,6 +362,8 @@ impl AskJob {
 pub enum AnnAnchor {
     Note { block_id: String, quote: String, quote_tex: Option<String> },
     Answer { node_id: String, quote: String, quote_tex: Option<String> },
+    /// PDF 阅读器里针对某页选区/图片/整页的提问（不写入笔记树）。
+    Pdf { page: u32, rects: Vec<[f32; 4]>, kind: String, quote: String },
 }
 
 /// ingest（LLM 生成路径）的任务：prepare 在持锁时构造，`run()` 可在锁外流式执行。
@@ -507,6 +512,35 @@ impl App {
     /// 某个会话当前的版本号（没记录过为 0）。
     pub fn session_epoch(&self, key: &str) -> u64 {
         self.session_revs.get(key).copied().unwrap_or(0)
+    }
+
+    /// 当前会话对应的 PDF 原件路径（仅当存在且确为 `.pdf` 文件时返回）。
+    /// 优先用笔记记录的源路径，回退到知识库里当前论文的路径；用于
+    /// `/api/pdf/file` 把原件喂给前端 PDF.js 阅读器。
+    pub fn pdf_source(&self) -> Option<std::path::PathBuf> {
+        let by_note = self
+            .session
+            .notes
+            .as_ref()
+            .and_then(|n| n.source_path.clone());
+        let by_paper = self.session.current_paper_id.as_ref().and_then(|id| {
+            self.kb
+                .papers
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| p.path.clone())
+        });
+        for cand in [by_note, by_paper].into_iter().flatten() {
+            let p = std::path::PathBuf::from(&cand);
+            let is_pdf = p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("pdf"))
+                .unwrap_or(false);
+            if is_pdf && p.is_file() {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// 递增**当前会话**的版本号（改动其内容后调用，见 `session_revs`）。
@@ -736,10 +770,7 @@ impl App {
         let prompt = format!(
             "请用不超过20个中文字/英文单词概括以下会话主题，只输出名字，不要解释：\n{summary}"
         );
-        let msgs = vec![Message {
-            role: "user".into(),
-            content: prompt,
-        }];
+        let msgs = vec![Message::text("user", prompt)];
         match llm::chat(&self.client, &self.config.llm, &msgs, false, false, &mut |_| {}, None).await {
             Ok(res) => {
                 let name = res.content.trim().to_string();
@@ -1311,8 +1342,8 @@ PaperHelper 命令：
         };
         let prompt = crate::prompts::compose_style_prompt(&style, &raw_text, &extra)?;
         let msgs = vec![
-            Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
-            Message { role: "user".into(), content: prompt },
+            Message::text("system", "你是笔记生成助手，只输出 Markdown。"),
+            Message::text("user", prompt),
         ];
         // 有笔记/对话的会话先分配 id：在途任务完成时按此 key 写回发起会话
         self.ensure_session_id();
@@ -1499,6 +1530,7 @@ PaperHelper 命令：
         };
         self.bump_epoch();
         note.paper_id = paper_id.clone();
+        note.source_path = Some(file_path.to_string());
         self.session.notes = Some(note);
         self.session.current_paper_id = Some(paper_id.clone());
         self.kb.add_paper(Paper {
@@ -1688,6 +1720,7 @@ PaperHelper 命令：
             quote: quote.map(|s| s.to_string()),
             record_concept,
             approx_tokens,
+            attach_note: true,
         })
     }
 
@@ -1744,7 +1777,7 @@ PaperHelper 命令：
         let mut explanation_id: Option<String> = None;
         let mut is_nested = false;
 
-        if !job.is_check {
+        if !job.is_check && job.attach_note {
             let expl_id = uuid::Uuid::new_v4().to_string();
             let parent_expl_id = job
                 .parent
@@ -2093,7 +2126,7 @@ PaperHelper 命令：
             .replace("{target}", &target)
             .replace("{instruction}", instruction)
             .replace("{task}", task);
-        Ok(vec![Message { role: "user".into(), content: prompt }])
+        Ok(vec![Message::text("user", prompt)])
     }
 
     /// 「按风格重写全文」的提示词：以论文原文（若有）或当前笔记为素材，
@@ -2107,8 +2140,8 @@ PaperHelper 命令：
         };
         let prompt = crate::prompts::compose_style_prompt(style, &material, extra)?;
         Ok(vec![
-            Message { role: "system".into(), content: "你是笔记生成助手，只输出 Markdown。".into() },
-            Message { role: "user".into(), content: prompt },
+            Message::text("system", "你是笔记生成助手，只输出 Markdown。"),
+            Message::text("user", prompt),
         ])
     }
 
@@ -2242,6 +2275,47 @@ PaperHelper 命令：
         Ok((job, anchor))
     }
 
+    /// PDF 页面批注的 **prepare 段**（持锁）：针对某页的选区文本/图片/整页提问，
+    /// 作为独立线程的根节点；把该页渲染图（data URL）附在本次请求中（不进历史）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_annotate_pdf(
+        &mut self,
+        page: u32,
+        rects: Vec<[f32; 4]>,
+        kind: &str,
+        quote: &str,
+        question: &str,
+        is_check: bool,
+        record_concept: bool,
+        image: Option<&str>,
+    ) -> Result<(AskJob, AnnAnchor)> {
+        let saved = self.session.conversation.current.clone();
+        self.session.conversation.current = None; // 独立线程：新根
+        let ctx = if quote.trim().is_empty() { None } else { Some(quote) };
+        let mut job = match self.prepare_ask(question, None, is_check, ctx, record_concept) {
+            Ok(j) => j,
+            Err(e) => {
+                self.session.conversation.current = saved;
+                return Err(e);
+            }
+        };
+        // PDF 提问不写笔记树：只建对话节点 + 批注
+        job.attach_note = false;
+        if let Some(img) = image.filter(|s| !s.trim().is_empty()) {
+            if let Some(last) = job.msgs.pop() {
+                job.msgs.push(if last.role == "user" { last.with_image(img) } else { last });
+            }
+        }
+        job.restore_current = saved.clone();
+        let anchor = AnnAnchor::Pdf {
+            page,
+            rects,
+            kind: kind.to_string(),
+            quote: quote.to_string(),
+        };
+        Ok((job, anchor))
+    }
+
     /// 批注的 **落地段**（持锁）：写问答节点 + 批注记录。
     /// 用户已切走时把批注写回发起会话；发起会话被改动/删除则拒写。
     pub fn commit_annotate(
@@ -2293,6 +2367,7 @@ PaperHelper 命令：
                 node_id: None,
                 root_node_id: node_id.clone(),
                 created_at: Utc::now().to_rfc3339(),
+                ..Default::default()
             },
             AnnAnchor::Answer { node_id: anchor_node, quote, quote_tex } => Annotation {
                 id: ann_id.clone(),
@@ -2302,6 +2377,19 @@ PaperHelper 命令：
                 node_id: Some(anchor_node),
                 root_node_id: node_id.clone(),
                 created_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+            AnnAnchor::Pdf { page, rects, kind, quote } => Annotation {
+                id: ann_id.clone(),
+                block_id: String::new(),
+                quote,
+                quote_tex: None,
+                node_id: None,
+                root_node_id: node_id.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                page: Some(page),
+                rects,
+                kind: Some(kind),
             },
         };
         self.session.annotations.push(annotation);
@@ -2472,8 +2560,8 @@ PaperHelper 命令：
              只输出总结本身。\n\n{qa}"
         );
         let msgs = vec![
-            Message { role: "system".into(), content: "你是学习总结助手，只输出总结正文。".into() },
-            Message { role: "user".into(), content: prompt },
+            Message::text("system", "你是学习总结助手，只输出总结正文。"),
+            Message::text("user", prompt),
         ];
         self.ensure_session_id();
         let session = self.session_key();
@@ -2739,14 +2827,11 @@ PaperHelper 命令：
     /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
     fn build_context_messages(&self, question: &str, block_id: Option<&str>, quote: Option<&str>) -> (Vec<Message>, Option<String>) {
-        let (raw_text, notes_md, block_id) = {
-            let note = self.session.notes.as_ref().unwrap();
-            (
-                note.raw_text.clone(),
-                note.to_markdown(),
-                block_id.map(|s| s.to_string()),
-            )
+        let (raw_text, notes_md) = match self.session.notes.as_ref() {
+            Some(note) => (note.raw_text.clone(), note.to_markdown()),
+            None => (String::new(), String::new()),
         };
+        let block_id = block_id.map(|s| s.to_string());
 
         let path: Vec<(String, String)> = self
             .session
@@ -2780,17 +2865,14 @@ PaperHelper 命令：
         }
 
         // 论文/资料原文；直接导入的笔记 raw_text 为空 → 省略该段（只发笔记本身）
-        let mut msgs = vec![Message { role: "system".into(), content: sys_ask() }];
+        let mut msgs = vec![Message::text("system", sys_ask())];
         if !raw_text.trim().is_empty() {
-            msgs.push(Message { role: "user".into(), content: format!("【原文材料】\n{raw_text}") });
+            msgs.push(Message::text("user", format!("【原文材料】\n{raw_text}")));
         }
-        msgs.push(Message {
-            role: "assistant".into(),
-            content: format!("【已生成笔记】\n{notes_md}"),
-        });
+        msgs.push(Message::text("assistant", format!("【已生成笔记】\n{notes_md}")));
         for (q, a) in &kept_pairs {
-            msgs.push(Message { role: "user".into(), content: q.clone() });
-            msgs.push(Message { role: "assistant".into(), content: a.clone() });
+            msgs.push(Message::text("user", q.clone()));
+            msgs.push(Message::text("assistant", a.clone()));
         }
 
         let related = self.kb.search(question);
@@ -2811,7 +2893,7 @@ PaperHelper 命令：
                 q_final.push_str(&format!("\n- {}（来自《{}》）: {}", c.name, c.paper_title, d));
             }
         }
-        msgs.push(Message { role: "user".into(), content: q_final });
+        msgs.push(Message::text("user", q_final));
         (msgs, block_id)
     }
 }

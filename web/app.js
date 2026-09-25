@@ -580,6 +580,7 @@ async function refreshState() {
     renderPapers(st);
     renderConcepts(st);
     renderNoteEmpty(st);
+    renderPdfMode(st);
     maybeAutoWizard(st);
   } catch (e) {
     console.error(e);
@@ -596,7 +597,62 @@ function renderNoteEmpty(st) {
   if (!empty) return;
   const has = !!(st && st.has_note);
   empty.classList.toggle("hidden", has);
-  noteFrame.classList.toggle("hidden", !has);
+  noteFrame.classList.toggle("hidden", !has || noteMode === "pdf");
+}
+
+// ===== 笔记 / 原文（PDF 阅读器）切换 =====
+let noteMode = "note";        // note | pdf
+let pdfViewerLoaded = false;  // /pdf-viewer.js 是否已注入
+let pdfLoadedName = null;     // 当前阅读器已加载的 PDF 文件名（会话切换时用于重置）
+
+function loadPdfViewer() {
+  if (pdfViewerLoaded) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "/pdf-viewer.js";
+    s.onload = () => { pdfViewerLoaded = true; res(); };
+    s.onerror = () => rej(new Error("加载 PDF 阅读器失败"));
+    document.body.appendChild(s);
+  });
+}
+
+function setNoteMode(mode) {
+  noteMode = mode;
+  const isPdf = mode === "pdf";
+  const noteBtn = $("note-mode-note"), pdfBtn = $("note-mode-pdf");
+  if (noteBtn) noteBtn.classList.toggle("active", !isPdf);
+  if (pdfBtn) pdfBtn.classList.toggle("active", isPdf);
+  noteFrame.classList.toggle("hidden", isPdf || !(lastState && lastState.has_note));
+  $("pdf-view").classList.toggle("hidden", !isPdf);
+  if (isPdf) {
+    loadPdfViewer()
+      .then(() => window.phPdf && window.phPdf.open())
+      .catch((e) => appendConsole("❌ " + e, "err"));
+  } else if (window.phPdf) {
+    window.phPdf.close();
+  }
+}
+
+/// 顶栏状态刷新时同步阅读模式入口：无 PDF 隐藏切换栏，PDF 变化时重置阅读器。
+function renderPdfMode(st) {
+  const bar = $("note-mode-bar");
+  if (!bar) return;
+  const info = (st && st.pdf) || {};
+  const avail = !!info.available;
+  bar.classList.toggle("hidden", !avail);
+  $("pdf-mode-name").textContent = avail && info.name ? info.name : "";
+  if (!avail) {
+    if (noteMode === "pdf") setNoteMode("note");
+    pdfLoadedName = null;
+    return;
+  }
+  const name = info.name || "";
+  if (pdfLoadedName === null) { pdfLoadedName = name; return; }
+  if (pdfLoadedName !== name) {
+    pdfLoadedName = name;
+    if (window.phPdf) window.phPdf.reset();
+    if (noteMode === "pdf" && window.phPdf) window.phPdf.open();
+  }
 }
 
 function renderModel(st) {
@@ -989,6 +1045,7 @@ async function refreshAnnotations() {
   } catch (e) {
     console.error(e);
   }
+  if (window.phPdfRefresh) window.phPdfRefresh();
 }
 
 /// 笔记 iframe 加载后：绑定交互（选区/点击高亮）+ 渲染高亮。
@@ -1905,16 +1962,19 @@ function clearAnnSubquote() {
   $("ann-subquote-text").textContent = "";
 }
 
-/// 新建批注：anchor = { block_id?, node_id?, quote（可见文本）, context（给 LLM，公式为 TeX）, rect? }。
-/// 笔记批注：`block_id` 锚定笔记块；回答批注：`node_id` 锚定弹窗里的某条回答。
+/// 新建批注：anchor = { block_id?, node_id?, pdf?, quote（可见文本）, context（给 LLM，公式为 TeX）, rect?, image? }。
+/// 笔记批注：`block_id` 锚定笔记块；回答批注：`node_id` 锚定弹窗里的某条回答；PDF 批注：`pdf` 锚定页码/矩形。
 async function openAnnotationCreate(anchor) {
   const isAnswer = !!anchor.node_id;
+  const isPdf = !!anchor.pdf;
   currentAnnotation = {
     id: null,
     block_id: anchor.block_id || "",
     node_id: anchor.node_id || null,
     quote: anchor.quote,
     quote_tex: anchor.context || anchor.quote,
+    pdf: anchor.pdf || null,
+    image: anchor.image || null,
   };
   if (!isAnswer) annSelectedNode = null;
   await loadMathLibs();
@@ -1924,7 +1984,7 @@ async function openAnnotationCreate(anchor) {
     $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
   }
   $("ann-popup").classList.remove("hidden");
-  if (isAnswer && anchor.rect) {
+  if ((isAnswer || isPdf) && anchor.rect) {
     positionPopup(anchor.rect.left, anchor.rect.bottom + 10);
   } else {
     const doc = noteFrame.contentDocument;
@@ -1948,6 +2008,8 @@ async function openAnnotationView(annId, opts = {}) {
     node_id: ann.node_id || null,
     quote: ann.quote,
     quote_tex: ann.quote_tex || ann.quote,
+    pdf: ann.page != null ? { page: ann.page, rects: ann.rects || [], kind: ann.kind || "text" } : null,
+    image: null,
   };
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
   await loadMathLibs();
@@ -1955,6 +2017,13 @@ async function openAnnotationView(annId, opts = {}) {
   $("ann-quote").textContent = cleanQuote(ann.quote);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
+  if (ann.page != null) {
+    // PDF 批注：高亮在阅读器里（不在笔记 iframe），用点击位置或居中定位
+    if (opts.rect) positionPopup(opts.rect.left, opts.rect.bottom + 10);
+    else positionPopup(window.innerWidth / 2 - 190, 120);
+    $("ann-q").focus();
+    return;
+  }
   const doc = noteFrame.contentDocument;
   const mark = doc && doc.querySelector(`mark.ann-mark[data-ann-id="${annId}"]`);
   if (mark && opts.scroll) mark.scrollIntoView({ block: "center" });
@@ -2186,6 +2255,10 @@ async function sendAnnotation() {
         mode: annMode,
         record_concept: recordConceptOn(),
       };
+      if (currentAnnotation.pdf) {
+        body.pdf = currentAnnotation.pdf;
+        if (currentAnnotation.image) body.image = currentAnnotation.image;
+      }
     }
   } else {
     const nodeId = annSelectedNode;
@@ -2256,15 +2329,19 @@ async function sendAnnotation() {
         node_id: ann.node_id || null,
         quote: ann.quote,
         quote_tex: ann.quote_tex || ann.quote,
+        pdf: currentAnnotation.pdf,
+        image: null,
       };
       renderAnnThread(ann.thread);
     }
   } else {
-    // 新建：匹配最新一条（同块/同节点 + 同引用）
+    // 新建：匹配最新一条（同块/同节点/同页 + 同引用）
     const latest = annotationsCache[annotationsCache.length - 1];
+    const curPage = currentAnnotation.pdf ? currentAnnotation.pdf.page : null;
     const sameAnchor = latest &&
       (latest.block_id || "") === (currentAnnotation.block_id || "") &&
-      (latest.node_id || "") === (currentAnnotation.node_id || "");
+      (latest.node_id || "") === (currentAnnotation.node_id || "") &&
+      ((latest.page == null ? null : latest.page) === curPage);
     if (sameAnchor && latest.quote === currentAnnotation.quote) {
       currentAnnotation = {
         id: latest.id,
@@ -2272,6 +2349,8 @@ async function sendAnnotation() {
         node_id: latest.node_id || null,
         quote: latest.quote,
         quote_tex: latest.quote_tex || latest.quote,
+        pdf: currentAnnotation.pdf,
+        image: null,
       };
       annSelectedNode = latest.thread ? latest.thread.node_id : null;
       renderAnnThread(latest.thread);
@@ -3951,6 +4030,10 @@ function setupSidebar() {
 document.addEventListener("DOMContentLoaded", () => {
   setupSidebar();
   setupAnnDrag();
+
+  // 笔记 / 原文（PDF）阅读模式切换
+  $("note-mode-note").onclick = () => setNoteMode("note");
+  $("note-mode-pdf").onclick = () => setNoteMode("pdf");
 
   // 中止：进度条旁的停止按钮 / 批注弹窗停止按钮（等同 Ctrl-C）
   $("btn-stop").onclick = stopCurrent;

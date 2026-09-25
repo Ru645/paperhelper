@@ -81,7 +81,33 @@
 
     <div class="panes" id="panes">
       <div id="pane-note" class="pane active" data-key="note">
+        <div id="note-mode-bar" class="note-mode hidden">
+          <button id="note-mode-note" class="note-mode-btn active" data-mode="note">笔记</button>
+          <button id="note-mode-pdf" class="note-mode-btn" data-mode="pdf">原文</button>
+          <span id="pdf-mode-name" class="pdf-mode-name"></span>
+        </div>
         <iframe id="note-frame" src="/api/note?format=html" title="笔记"></iframe>
+        <div id="pdf-view" class="pdf-view hidden">
+          <div id="pdf-toolbar" class="pdf-toolbar">
+            <button id="pdf-prev" class="mini ghost" title="上一页">‹</button>
+            <input id="pdf-page-input" class="pdf-page-input" inputmode="numeric" title="跳到页码" />
+            <span id="pdf-page-total" class="pdf-page-total">/ 0</span>
+            <button id="pdf-next" class="mini ghost" title="下一页">›</button>
+            <span class="pdf-sep"></span>
+            <select id="pdf-zoom" class="pdf-zoom" title="缩放">
+              <option value="fit">贴合宽度</option>
+              <option value="1">100%</option>
+              <option value="1.5">150%</option>
+              <option value="2">200%</option>
+            </select>
+            <button id="pdf-toc-btn" class="mini ghost hidden" title="章节目录">☰ 目录</button>
+            <button id="pdf-ask-page" class="mini ghost" title="就当前整页向 AI 提问">提问本页</button>
+            <span class="pdf-spacer"></span>
+            <span id="pdf-status" class="pdf-status"></span>
+          </div>
+          <div id="pdf-toc" class="pdf-toc hidden"></div>
+          <div id="pdf-pages" class="pdf-pages"></div>
+        </div>
         <!-- 导入/生成笔记时的实时反馈（阶段、思考过程、流式笔记文本） -->
         <div id="note-gen" class="note-gen hidden">
           <div class="ng-head">
