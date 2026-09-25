@@ -388,6 +388,36 @@ pub enum IngestPrep {
     Llm(Box<IngestJob>),
 }
 
+/// 「仅阅读」抽取文本的结果分类（见 `readonly_extract_notice`）。
+#[derive(Debug, PartialEq)]
+enum ExtractOutcome {
+    /// 正常抽到文本（无需打扰用户）
+    Text,
+    /// 未抽到文本：可能是扫描/图片版
+    Empty,
+    /// 解析失败（原始错误只写日志，不给用户看技术堆栈）
+    Failed,
+}
+
+/// 根据抽取结果给出要提示给用户的文案（`None` = 正常，无需提示）。
+/// 仅阅读模式抽不到文字并不影响阅读，故只提示、不拦截；文案说明原因并给出建议。
+fn readonly_extract_notice(outcome: &ExtractOutcome) -> Option<String> {
+    match outcome {
+        ExtractOutcome::Text => None,
+        ExtractOutcome::Empty => Some(
+            "未能从该 PDF 提取到文字：它可能是扫描/图片版，文字在图片里而不是可直接提取的文本层。\
+             你仍可阅读原文并选中内容提问（提问会发送该页截图）；\
+             如需文字版笔记，可用 OCR 方式重新导入。"
+                .to_string(),
+        ),
+        ExtractOutcome::Failed => Some(
+            "读取该 PDF 的文字失败（仍可阅读原件，提问将依赖页面截图）。\
+             可能是文件损坏或不是有效的 PDF；若原文也无法显示，请更换文件后重试。"
+                .to_string(),
+        ),
+    }
+}
+
 /// 简单 LLM 任务（AI 重写 / 按风格重写全文）：只生成内容，不改会话（除用量统计）。
 pub struct SimpleJob {
     msgs: Vec<Message>,
@@ -1526,14 +1556,28 @@ PaperHelper 命令：
     /// 扫描件 / 解析失败也照样可读（阅读器走页面截图提问）。
     pub(crate) async fn import_readonly(&mut self, file_path: &str) -> Result<()> {
         self.emitter.progress("解析 PDF…");
-        let raw_text = match pdf::extract_pages(Path::new(file_path)).await {
-            Ok(pages) => pages.join("\n\n"),
+        let (raw_text, outcome) = match pdf::extract_pages_lenient(Path::new(file_path)).await {
+            Ok(pages) => {
+                let text = pages.join("\n\n");
+                let outcome = if text.trim().is_empty() {
+                    crate::logging::warn(format!(
+                        "仅阅读模式未抽到文本，可能是扫描/图片版: {file_path}"
+                    ));
+                    ExtractOutcome::Empty
+                } else {
+                    ExtractOutcome::Text
+                };
+                (text, outcome)
+            }
             Err(e) => {
                 crate::logging::warn(format!("仅阅读模式抽取文本失败（仍可阅读）: {e:#}"));
-                String::new()
+                (String::new(), ExtractOutcome::Failed)
             }
         };
         self.emitter.progress_done();
+        if let Some(notice) = readonly_extract_notice(&outcome) {
+            self.emitter.stderr(format!("⚠️  {notice}"));
+        }
         let stem = Path::new(file_path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -3394,6 +3438,31 @@ mod tests {
         assert!(e.to_string().contains("只支持 PDF"), "错误应说明仅支持 PDF: {e}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 仅阅读抽文本的提示文案：正常不打扰；空/失败要说明原因与建议。
+    #[test]
+    fn readonly_extract_notice_covers_three_cases() {
+        assert_eq!(
+            super::readonly_extract_notice(&super::ExtractOutcome::Text),
+            None,
+            "抽到文本时不应打扰用户"
+        );
+        let empty = super::readonly_extract_notice(&super::ExtractOutcome::Empty).unwrap();
+        assert!(
+            empty.contains("扫描") && empty.contains("OCR"),
+            "空文本应说明是扫描/图片版并建议 OCR: {empty}"
+        );
+        assert!(
+            !empty.contains("tesseract"),
+            "仅阅读提示不应把依赖名塞给用户: {empty}"
+        );
+        let failed = super::readonly_extract_notice(&super::ExtractOutcome::Failed)
+            .expect("失败必须提示用户");
+        assert!(
+            failed.contains("失败") && !failed.contains("Traceback"),
+            "失败提示应友好、不含技术堆栈: {failed}"
+        );
     }
 }
 

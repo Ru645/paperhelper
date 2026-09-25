@@ -242,7 +242,21 @@ fn clean_extracted(text: String, what: &str) -> String {
 
 /// 用 PyMuPDF（Python 子进程）抽取 PDF 全文，按页用 form-feed 分隔。
 /// 需要环境里装了 pymupdf：`pip install pymupdf`。
+/// 抽不到任何文本（扫描件/纯图片）时返回 `Err`，提示改用 OCR。
 pub async fn extract_pages(path: &Path) -> Result<Vec<String>> {
+    let pages = extract_pages_lenient(path).await?;
+    if pages.is_empty() {
+        return Err(anyhow!(
+            "PDF 没有解析出任何文本（可能是扫描件/纯图片）。\
+             可改用 `ingest --ocr <pdf>`（需 tesseract）或 `ingest --text <txt>`（自备文本）。"
+        ));
+    }
+    Ok(pages)
+}
+
+/// 宽松版全文抽取：**空文本不报错**（空 = 可能是扫描/图片版），仅在子进程 / PDF
+/// 解析失败时返回 `Err`。供「仅阅读」等场景使用（抽不到文字仍可阅读原件）。
+pub async fn extract_pages_lenient(path: &Path) -> Result<Vec<String>> {
     let t0 = std::time::Instant::now();
     let (py, args) = python_command().await;
     let mut cmd = Command::new(&py);
@@ -264,12 +278,6 @@ pub async fn extract_pages(path: &Path) -> Result<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if pages.is_empty() {
-        return Err(anyhow!(
-            "PDF 没有解析出任何文本（可能是扫描件/纯图片）。\
-             可改用 `ingest --ocr <pdf>`（需 tesseract）或 `ingest --text <txt>`（自备文本）。"
-        ));
-    }
     logging::info(format!(
         "PDF 解析完成：{} 页，用时 {:.1}s（{}）",
         pages.len(),
@@ -311,10 +319,11 @@ pub async fn ocr_extract(path: &Path) -> Result<String> {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(anyhow!(
-                "未安装 tesseract，无法 OCR。安装方式：\n  \
+                "未安装 tesseract，无法 OCR。请先安装该依赖（含中文语言包）：\n  \
+                 Windows:       安装 Tesseract OCR，并将安装目录加入 PATH\n  \
                  Debian/Ubuntu: sudo apt install tesseract-ocr tesseract-ocr-chi-sim\n  \
                  macOS:         brew install tesseract tesseract-lang\n  \
-                 或改用 `ingest <pdf>`（文本层提取）或 `ingest --text <txt>`（自备文本）"
+                 安装后重试；也可改用 `ingest <pdf>`（文本层提取）或 `ingest --text <txt>`（自备文本）"
             ));
         }
         Err(e) => return Err(anyhow!("无法运行 tesseract: {e}")),
@@ -327,7 +336,8 @@ pub async fn ocr_extract(path: &Path) -> Result<String> {
             "chi_sim+eng".to_string()
         } else {
             let msg = "未检测到中文语言包（chi_sim），OCR 将只用英文（eng）。\
-                       中文论文效果会差，建议安装：sudo apt install tesseract-ocr-chi-sim";
+                       中文论文效果会差，建议安装：sudo apt install tesseract-ocr-chi-sim\
+                       （Windows 安装 Tesseract 时勾选中文语言包）";
             logging::warn(msg);
             eprintln!("⚠️  {msg}");
             "eng".to_string()
