@@ -380,9 +380,11 @@ pub struct IngestJob {
     kind: String,
 }
 
-/// ingest 的两种执行方式：直接导入（无 LLM，立即执行）或 LLM 生成（可锁外流式执行）。
+/// ingest 的三种执行方式：直接导入（无 LLM）、仅阅读 PDF（无 LLM、不生成笔记）
+/// 或 LLM 生成（可锁外流式执行）。
 pub enum IngestPrep {
     Direct { file_path: String, mode: String, kind: String },
+    Read { file_path: String },
     Llm(Box<IngestJob>),
 }
 
@@ -855,6 +857,7 @@ impl App {
 PaperHelper 命令：
   ingest <pdf>            解析 PDF 并按风格生成笔记（--style <风格id>，默认 four）
   ingest --note <文件>    直接导入笔记/讲义（不调 LLM；--kind paper|note|lecture）
+  ingest --read <pdf>     仅阅读 PDF 原件（不调 LLM、不生成笔记；扫描件也能读）
   ingest --text <txt>     直接读取文本文件（跳过PDF解析）
   ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
   ingest --extra 「要求」   本次额外要求（拼到所选风格提示词之后）
@@ -1261,6 +1264,7 @@ PaperHelper 命令：
         let (extra, rest) = take_value_arg(&rest, "extra");
         let (kind_raw, rest) = take_value_arg(&rest, "kind");
         let (direct_import, rest) = take_bool_arg(&rest, "note");
+        let (read_only, rest) = take_bool_arg(&rest, "read");
         let rest = rest.trim();
         // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
         let (mode, file_path) = if let Some(r) = rest.strip_prefix("--text ") {
@@ -1274,11 +1278,18 @@ PaperHelper 命令：
         };
 
         if file_path.is_empty() {
-            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
+            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --read <pdf路径>  仅阅读原件（不生成笔记）\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
         let p = Path::new(&file_path);
         if !p.exists() {
             bail!("文件不存在: {file_path}");
+        }
+        // --read：仅阅读 PDF 原件（不调 LLM、不生成笔记；扫描件也能读）
+        if read_only {
+            if !file_path.to_ascii_lowercase().ends_with(".pdf") {
+                bail!("--read 只支持 PDF 文件（当前: {file_path}）");
+            }
+            return Ok(IngestPrep::Read { file_path });
         }
         // --note：直接导入笔记/讲义（不调 LLM，0 token）
         if direct_import {
@@ -1404,7 +1415,7 @@ PaperHelper 命令：
         let title = note.title.clone();
         let nblocks = note.count_blocks();
         outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
-        self.register_note(note, &job.source_path, &job.export_file, res.input_tokens, res.output_tokens)
+        self.register_note(note, &job.source_path, &job.export_file, res.input_tokens, res.output_tokens, false, false)
             .with_context(|| format!("导入《{title}》"))
     }
 
@@ -1458,6 +1469,7 @@ PaperHelper 命令：
             IngestPrep::Direct { file_path, mode, kind } => {
                 self.import_note(&file_path, &mode, &kind).await
             }
+            IngestPrep::Read { file_path } => self.import_readonly(&file_path).await,
             IngestPrep::Llm(job) => {
                 let emitter = self.emitter.clone();
                 match job.run(&emitter).await {
@@ -1504,14 +1516,41 @@ PaperHelper 命令：
             _ => "笔记",
         };
         outln!(self, "{} 已导入: 《{}》({} 个结构块，不调 LLM)", "✓".green().bold(), title, nblocks);
-        self.register_note(note, file_path, &export_file, 0, 0)
+        self.register_note(note, file_path, &export_file, 0, 0, false, false)
             .with_context(|| format!("导入{kind_label}《{title}》"))?;
+        self.update_completions();
+        Ok(())
+    }
+
+    /// 仅阅读 PDF 原件（不调 LLM、不生成笔记）：尽力抽文本作 ask 上下文，
+    /// 扫描件 / 解析失败也照样可读（阅读器走页面截图提问）。
+    pub(crate) async fn import_readonly(&mut self, file_path: &str) -> Result<()> {
+        self.emitter.progress("解析 PDF…");
+        let raw_text = match pdf::extract_pages(Path::new(file_path)).await {
+            Ok(pages) => pages.join("\n\n"),
+            Err(e) => {
+                crate::logging::warn(format!("仅阅读模式抽取文本失败（仍可阅读）: {e:#}"));
+                String::new()
+            }
+        };
+        self.emitter.progress_done();
+        let stem = Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("paper");
+        let title: String = stem.chars().take(40).collect();
+        let note = notes::readonly_note(title.as_str(), raw_text);
+        outln!(self, "{} 已打开: 《{}》(仅阅读，不生成笔记，不调 LLM)", "✓".green().bold(), title);
+        self.register_note(note, file_path, "", 0, 0, true, true)
+            .with_context(|| format!("打开《{title}》"))?;
         self.update_completions();
         Ok(())
     }
 
     /// 登记笔记到知识库与会话（ingest / import_note 共用）：
     /// 写 KB Paper（kind 取自 note.material_kind）、重建会话根节点、写导出文件。
+    /// `skip_export`：仅阅读模式不写导出文件；`read_only`：标记为仅阅读会话。
+    #[allow(clippy::too_many_arguments)]
     fn register_note(
         &mut self,
         mut note: notes::Note,
@@ -1519,6 +1558,8 @@ PaperHelper 命令：
         export_file: &str,
         input_tokens: u64,
         output_tokens: u64,
+        skip_export: bool,
+        read_only: bool,
     ) -> Result<()> {
         let paper_id = uuid::Uuid::new_v4().to_string();
         let title = note.title.clone();
@@ -1533,6 +1574,7 @@ PaperHelper 命令：
         note.source_path = Some(file_path.to_string());
         self.session.notes = Some(note);
         self.session.current_paper_id = Some(paper_id.clone());
+        self.session.read_only = read_only;
         self.kb.add_paper(Paper {
             id: paper_id.clone(),
             title: title.clone(),
@@ -1550,7 +1592,11 @@ PaperHelper 命令：
         self.session.conversation.add_exchange(ConvNode {
             id: root_id.clone(),
             parent: None,
-            question: format!("（已导入《{}》，{} 个结构块）", title, nblocks),
+            question: if read_only {
+                format!("（已打开《{}》，仅阅读，未生成笔记）", title)
+            } else {
+                format!("（已导入《{}》，{} 个结构块）", title, nblocks)
+            },
             quote: None,
             answer: String::new(),
             block_id: None,
@@ -1559,9 +1605,17 @@ PaperHelper 命令：
             output_tokens,
             cost,
             created_at: Utc::now().to_rfc3339(),
-            label: format!("导入《{}》", title),
+            label: if read_only {
+                format!("打开《{}》", title)
+            } else {
+                format!("导入《{}》", title)
+            },
         });
         self.session.conversation.current = Some(root_id);
+        if skip_export {
+            self.export_path = None;
+            return Ok(());
+        }
         // 导出 markdown 笔记
         if let Some(parent) = Path::new(export_file).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -1895,6 +1949,10 @@ PaperHelper 命令：
 
     /// 自动同步导出笔记（ask/批注后调用）；终端下必要时询问导出文件名。
     fn sync_export(&mut self, block_id_for_hint: Option<&str>) -> Result<()> {
+        // 仅阅读会话不生成笔记，也就不自动导出
+        if self.session.read_only {
+            return Ok(());
+        }
         if self.export_path.is_none() {
             let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
             let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
@@ -3307,6 +3365,34 @@ mod tests {
             let normalized = normalize_path_arg(&form);
             assert!(std::path::Path::new(&normalized).exists(), "应存在: {normalized} (from {form})");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ingest --read`：仅接受 PDF 且走 Read 分支（不进入 LLM 抽取流程）。
+    #[tokio::test]
+    async fn prepare_ingest_read_only_routes() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        let mut app = super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        let dir = std::env::temp_dir().join("paperhelper_read_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("paper.pdf");
+        let txt = dir.join("note.txt");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        std::fs::write(&txt, b"hello").unwrap();
+
+        let prep = app.prepare_ingest(&format!("--read {}", pdf.display())).await.unwrap();
+        assert!(
+            matches!(prep, super::IngestPrep::Read { .. }),
+            "--read PDF 应走 Read 分支"
+        );
+
+        let e = match app.prepare_ingest(&format!("--read {}", txt.display())).await {
+            Ok(_) => panic!("--read 非 PDF 应报错"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("只支持 PDF"), "错误应说明仅支持 PDF: {e}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

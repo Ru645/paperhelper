@@ -69,6 +69,9 @@ pub struct Session {
     /// 该会话的笔记导出文件路径（ingest/ask 自动同步用；随会话持久化）。
     #[serde(default)]
     pub export_path: Option<String>,
+    /// 仅阅读会话：只挂 PDF 原件、未生成笔记（不自动导出、默认进「原文」）。
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// 一条批注：笔记里的一段引用文字 + 其对话线程（以 `root_node_id` 为根的会话子树）。
@@ -396,6 +399,7 @@ mod tests {
             session_id: String::new(),
             annotations: Vec::new(),
             export_path: None,
+            read_only: true,
         };
         sess.session_id = "20260101_000000".into();
         sess.save(&path).unwrap();
@@ -403,6 +407,7 @@ mod tests {
         let loaded = Session::load(&path).unwrap();
         assert_eq!(loaded.session_id, "20260101_000000", "session_id 应随会话持久化");
         assert!(loaded.notes.is_some());
+        assert!(loaded.read_only, "read_only 应随会话持久化");
         assert_eq!(loaded.conversation.nodes.len(), 1);
         assert_eq!(loaded.stats.calls, 1);
         assert_eq!(loaded.conversation.current.as_deref(), Some("n1"));
@@ -450,5 +455,13 @@ mod tests {
         assert_eq!(back.page, Some(3));
         assert_eq!(back.rects.len(), 2);
         assert_eq!(back.kind.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn read_only_defaults_false_for_old_session() {
+        // 旧存档没有 read_only 字段，加载后应为 false（向后兼容）
+        let old = r#"{"session_id":"20250101_000000","notes":null}"#;
+        let sess: Session = serde_json::from_str(old).unwrap();
+        assert!(!sess.read_only, "旧会话 read_only 默认应为 false");
     }
 }

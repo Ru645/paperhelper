@@ -525,6 +525,16 @@ async fn api_run(
                     emit_result(&g.emitter, result, &what, t0);
                     g.emitter = Emitter::terminal();
                 }
+                Ok(crate::app::IngestPrep::Read { file_path }) => {
+                    let mut g = app2.lock().await;
+                    g.emitter = Emitter::channel(tx.clone());
+                    let result = g.import_readonly(&file_path).await;
+                    if result.is_ok() {
+                        let _ = g.auto_persist();
+                    }
+                    emit_result(&g.emitter, result, &what, t0);
+                    g.emitter = Emitter::terminal();
+                }
                 Ok(crate::app::IngestPrep::Llm(job)) => {
                     let res = match LLM_GATE.try_lock() {
                         Ok(_guard) => {
@@ -800,6 +810,7 @@ fn build_state(a: &App) -> serde_json::Value {
             "global":  { "calls": g.calls, "input": g.total_input, "output": g.total_output, "cost": g.total_cost },
         },
         "has_note": a.session.notes.is_some(),
+        "read_only": a.session.read_only,
         "note_title": a.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
         "pdf": {
             "available": pdf_src.is_some(),

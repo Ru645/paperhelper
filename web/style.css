@@ -355,7 +355,7 @@ input, select, button {
   border: 1px solid var(--line); border-radius: 6px; background: #fff;
 }
 input:focus, select:focus { outline: 2px solid var(--blue-light); border-color: var(--blue); }
-button { cursor: pointer; }
+button { cursor: pointer; white-space: nowrap; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
 button.ghost { background: #fff; color: #333; }
@@ -400,7 +400,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 
 /* 导入弹窗：模式切换 + 动态风格 + 临时额外要求 */
 .import-box { width: 560px; }
-.mode-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.mode-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
 .mode-tab {
   border: 1px solid var(--line); background: #fff; border-radius: 6px;
   padding: 5px 12px; font-size: 13px; cursor: pointer; color: #555;
@@ -420,7 +420,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 
 /* 设置弹窗：模型设置 / 笔记风格 两个页签 */
 .settings-box { width: 660px; }
-.settings-tabs { display: flex; gap: 6px; margin: 2px 0 14px; border-bottom: 1px solid var(--line); }
+.settings-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 14px; border-bottom: 1px solid var(--line); }
 .settings-tab {
   border: 1px solid var(--line); border-bottom: none; background: #fff; border-radius: 8px 8px 0 0;
   padding: 7px 16px; font-size: 14px; cursor: pointer; color: #555; margin-bottom: -1px;
@@ -466,7 +466,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 
 /* 笔记块编辑弹窗 */
 .edit-box { width: 760px; max-width: 94vw; }
-.edit-tabs { display: flex; gap: 6px; margin: 8px 0 10px; }
+.edit-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; }
 .edit-tab {
   border: 1px solid var(--line); background: #fff; border-radius: 6px;
   padding: 4px 14px; font-size: 13px; cursor: pointer; color: #555;

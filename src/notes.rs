@@ -604,6 +604,20 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
     note
 }
 
+/// 「仅阅读」会话的笔记占位：不含任何结构块（不生成笔记），只保留原文全文
+/// （供 ask 作为上下文）；阅读器据此通过 `source_path` 打开 PDF 原件。
+pub fn readonly_note(title: impl Into<String>, raw_text: impl Into<String>) -> Note {
+    Note {
+        paper_id: String::new(),
+        title: title.into(),
+        blocks: Vec::new(),
+        raw_text: raw_text.into(),
+        material_kind: "paper".to_string(),
+        math_macros: None,
+        source_path: None,
+    }
+}
+
 /// 无标题文本：按空行切分为多个段落块。
 fn split_into_paragraphs(md: &str) -> Vec<Block> {
     let mut out = Vec::new();
@@ -844,6 +858,16 @@ fn strip_fences(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_note_is_blockless() {
+        let note = readonly_note("论文A", "第一页正文\n\n第二页正文");
+        assert!(note.blocks.is_empty(), "仅阅读笔记不应有任何结构块");
+        assert_eq!(note.count_blocks(), 0);
+        assert_eq!(note.material_kind, "paper");
+        assert_eq!(note.title, "论文A");
+        assert_eq!(note.raw_text, "第一页正文\n\n第二页正文", "原文全文应保留作 ask 上下文");
+    }
 
     #[test]
     fn parse_basic_markdown() {

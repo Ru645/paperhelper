@@ -498,25 +498,31 @@ async function stopCurrent() {
 async function runCommand(command, opts = {}) {
   if (!command || !command.trim()) return;
   // LLM 任务互斥；非 LLM 命令（撤销/跳转/查看等）在 LLM 任务期间仍可执行
-  const isLlm = LLM_CMD_RE.test(command.trim());
+  const cmdTrim = command.trim();
+  // `ingest --read`：不调模型（可离线阅读），但仍占任务锁，避免与在途任务并发改同一会话
+  const isReadIngest = /^(ingest|pdf)\b/.test(cmdTrim) && /(^|\s)--read(\s|$)/.test(cmdTrim);
+  const isLlm = LLM_CMD_RE.test(cmdTrim) && !isReadIngest;
+  const needsLock = isLlm || isReadIngest;
   // 未配置模型：弹向导（原样导入 `ingest --note` 不调模型，直接放行）
-  if (isLlm && lastState && !lastState.llm_ready && !/--note\b/.test(command)) {
+  if (isLlm && lastState && !lastState.llm_ready && !/--note\b/.test(cmdTrim)) {
     openWizard(2);
     wizardStatus("还没有配置模型服务：先在向导里选服务商、填 API Key", "err");
     return;
   }
-  if (isLlm && (running || llmBusyTask)) {
+  if (needsLock && (running || llmBusyTask)) {
     showBusyHint();
     return;
   }
-  if (isLlm) {
-    llmBusyTask = command.trim().startsWith("ingest") ? "生成笔记" : "处理当前提问";
+  if (needsLock) {
+    llmBusyTask = isReadIngest
+      ? "解析 PDF"
+      : (cmdTrim.startsWith("ingest") ? "生成笔记" : "处理当前提问");
     setRunning(true);
   }
   if (!opts.quiet) appendConsole("> " + command, "ok");
   // 不自动跳控制台；仅出错时（handleFrame 的 error）切过去
   const controller = new AbortController();
-  if (isLlm) currentAbort = controller;
+  if (needsLock) currentAbort = controller;
   try {
     const res = await fetch("/api/run", {
       method: "POST",
@@ -551,8 +557,8 @@ async function runCommand(command, opts = {}) {
       switchTab("console");
     }
   } finally {
-    if (isLlm && currentAbort === controller) currentAbort = null;
-    if (isLlm) {
+    if (needsLock && currentAbort === controller) currentAbort = null;
+    if (needsLock) {
       setRunning(false);
       llmBusyTask = "";
     }
@@ -604,6 +610,7 @@ function renderNoteEmpty(st) {
 let noteMode = "note";        // note | pdf
 let pdfViewerLoaded = false;  // /pdf-viewer.js 是否已注入
 let pdfLoadedName = null;     // 当前阅读器已加载的 PDF 文件名（会话切换时用于重置）
+let lastPdfSessionId = null;  // 上次渲染的会话 id（判断是否切换会话）
 
 function loadPdfViewer() {
   if (pdfViewerLoaded) return Promise.resolve();
@@ -637,6 +644,9 @@ function setNoteMode(mode) {
 function renderPdfMode(st) {
   const bar = $("note-mode-bar");
   if (!bar) return;
+  const sid = (st && st.session_id) || null;
+  const switched = sid !== lastPdfSessionId;
+  lastPdfSessionId = sid;
   const info = (st && st.pdf) || {};
   const avail = !!info.available;
   bar.classList.toggle("hidden", !avail);
@@ -647,12 +657,14 @@ function renderPdfMode(st) {
     return;
   }
   const name = info.name || "";
-  if (pdfLoadedName === null) { pdfLoadedName = name; return; }
-  if (pdfLoadedName !== name) {
+  if (pdfLoadedName === null) { pdfLoadedName = name; }
+  else if (pdfLoadedName !== name) {
     pdfLoadedName = name;
     if (window.phPdf) window.phPdf.reset();
     if (noteMode === "pdf" && window.phPdf) window.phPdf.open();
   }
+  // 仅阅读会话：切换进来时默认进「原文」（用户手动切回笔记后不再强行改回）
+  if (switched && st.read_only) setNoteMode("pdf");
 }
 
 function renderModel(st) {
@@ -2879,6 +2891,15 @@ function setImportMode(mode) {
     t.classList.toggle("active", t.dataset.mode === mode)
   );
   renderImportStyles();
+  updateImportOptions();
+}
+
+/// 按当前模式切换弹窗字段：仅阅读隐藏风格/文件名/额外要求，显示说明。
+function updateImportOptions() {
+  const read = importCtx && importCtx.mode === "read";
+  $("import-note-opts").classList.toggle("hidden", !!read);
+  $("import-read-hint").classList.toggle("hidden", !read);
+  $("btn-import-ok").textContent = read ? "打开阅读" : "导入";
 }
 
 /// 弹出导入弹窗，返回 {name, mode, style, extra} 或 null（取消）。
@@ -2891,13 +2912,18 @@ async function promptImport(file, defaultName) {
     $("import-file").textContent = "文件：" + file.name + "（可直接拖拽多个文件逐个导入）";
     $("import-name").value = defaultName;
     $("import-extra").value = "";
-    document.querySelectorAll("#import-modes .mode-tab").forEach((t) =>
-      t.classList.toggle("active", t.dataset.mode === importCtx.mode)
-    );
+    document.querySelectorAll("#import-modes .mode-tab").forEach((t) => {
+      t.classList.toggle("active", t.dataset.mode === importCtx.mode);
+      // 「仅阅读」只接受 PDF：非 PDF 时禁用该选项
+      if (t.dataset.mode === "read") t.disabled = !isPdf;
+    });
     renderImportStyles();
+    updateImportOptions();
     $("import-modal").classList.remove("hidden");
-    $("import-name").focus();
-    $("import-name").select();
+    if (importCtx.mode !== "read") {
+      $("import-name").focus();
+      $("import-name").select();
+    }
   });
 }
 
@@ -2947,11 +2973,15 @@ async function importFile(file) {
   const opts = await promptImport(file, "笔记_" + stem + ".md");
   if (!opts) return; // 取消
   const exportName = opts.name.trim() || ("笔记_" + stem + ".md");
+  const isRead = opts.mode === "read";
   try {
+    if (isRead && !/\.pdf$/i.test(file.name)) {
+      throw new Error("「仅阅读」只支持 PDF 文件（请选 PDF，或改用其他导入方式）");
+    }
     // HTML：浏览器端先转成 Markdown（公式按 KaTeX 隐藏层还原），再当 md 上传
     let uploadTarget = file;
     let isText = /\.(txt|md|markdown)$/i.test(file.name);
-    if (/\.html?$/i.test(file.name)) {
+    if (!isRead && /\.html?$/i.test(file.name)) {
       setProgress("转换 HTML…");
       const conv = htmlToMarkdown(await file.text());
       if (!conv.md.trim()) throw new Error("HTML 里没有提取到正文");
@@ -2962,31 +2992,40 @@ async function importFile(file) {
       uploadTarget = new File([withMacros], stem + ".md", { type: "text/markdown" });
       isText = true;
     }
-    setProgress("上传中…");
+    setProgress(isRead ? "解析 PDF…" : "上传中…");
     // 反馈全部进「笔记区」覆盖层（阶段/思考/流式笔记），不占用控制台
     switchTab("note");
     noteGenReset();
-    noteGenPhase("上传中…");
+    noteGenPhase(isRead ? "解析 PDF…" : "上传中…");
     const isRaw = opts.mode === "note" && opts.style === "__raw__";
-    const modeLabel = opts.mode === "paper" ? "论文 → 生成笔记" : isRaw ? "原样导入" : "风格 " + opts.style;
+    const modeLabel = isRead
+      ? "PDF → 仅阅读（不生成笔记）"
+      : opts.mode === "paper" ? "论文 → 生成笔记" : isRaw ? "原样导入" : "风格 " + opts.style;
     noteGenLog("导入文件：" + file.name + "（" + modeLabel + "）");
     const j = await uploadFile(uploadTarget, (p) => setUploadPct(p));
     setProgress("");
-    const extra = (opts.extra || "").trim();
-    const extraArg = extra ? " --extra " + shellQuote(extra) : "";
-    const textArg = isText ? "--text " : "";
-    // PDF 讲义标为 lecture，md/txt/html 笔记标为 note
-    const kind = opts.mode === "note" ? (/\.pdf$/i.test(file.name) ? "lecture" : "note") : "paper";
-    const cmd = isRaw
-      ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
-      : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
+    let cmd;
+    if (isRead) {
+      cmd = `ingest --read ` + shellQuote(j.path);
+    } else {
+      const extra = (opts.extra || "").trim();
+      const extraArg = extra ? " --extra " + shellQuote(extra) : "";
+      const textArg = isText ? "--text " : "";
+      // PDF 讲义标为 lecture，md/txt/html 笔记标为 note
+      const kind = opts.mode === "note" ? (/\.pdf$/i.test(file.name) ? "lecture" : "note") : "paper";
+      cmd = isRaw
+        ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
+        : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
+    }
     // 记录发起会话：用户切走再切回时恢复实时反馈覆盖层
     importRun = { sessionId: (lastState && lastState.session_id) || "" };
     try {
-      await runCommand(cmd, { export: exportName, ui: "import", quiet: true });
+      await runCommand(cmd, isRead ? { ui: "import", quiet: true } : { export: exportName, ui: "import", quiet: true });
     } finally {
       importRun = null;
     }
+    // 仅阅读导入后默认切到「原文」视图，直接开始阅读
+    if (isRead) setNoteMode("pdf");
   } catch (e) {
     noteGenLog("❌ 导入失败: " + e.message, "err");
     appendConsole("❌ 导入失败: " + e.message, "err");

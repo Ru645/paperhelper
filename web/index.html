@@ -201,7 +201,9 @@
     <div class="mode-tabs" id="import-modes">
       <button class="mode-tab active" data-mode="paper">论文 → 生成笔记</button>
       <button class="mode-tab" data-mode="note">笔记 / 讲义 → 导入</button>
+      <button class="mode-tab" data-mode="read">PDF → 仅阅读（不生成笔记）</button>
     </div>
+    <div id="import-note-opts">
     <label>笔记文件名<input id="import-name" type="text" placeholder="笔记_xxx.md"></label>
     <label>笔记风格
       <span class="style-row">
@@ -216,6 +218,8 @@
     <div class="import-extra-actions">
       <button id="btn-import-save-style" class="mini ghost" title="把所选风格提示词 + 本次要求另存为新风格">另存为风格…</button>
     </div>
+    </div>
+    <p id="import-read-hint" class="hint hidden">直接在原文上阅读、选中文字提问；不调用模型、不生成笔记（扫描件也能看，提问时会发送该页截图）。</p>
     <div class="modal-actions">
       <button id="btn-import-cancel" class="ghost">取消</button>
       <button id="btn-import-ok" class="primary">导入</button>
