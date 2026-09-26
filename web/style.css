@@ -541,6 +541,25 @@ body.ann-docked .layout { padding-right: var(--ann-dock-w, 420px); }
 }
 .ann-node:hover { background: var(--blue-light); }
 .ann-node.selected { border-left-color: var(--blue); background: var(--blue-light); }
+/* 折叠按钮：节点左上角的小三角，点它折叠 / 展开该节点及子树 */
+.ann-node { position: relative; padding-left: 22px; }
+.ann-node > .ann-fold {
+  position: absolute; left: 5px; top: 7px;
+  width: 12px; text-align: center; color: var(--muted);
+  font-size: 10px; line-height: 1; cursor: pointer; user-select: none;
+}
+.ann-node > .ann-fold:hover { color: var(--blue); }
+/* 折叠态：整节点连同子树收成窄窄一行，只露开头一小段 + 省略号 */
+.ann-node.folded {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px; background: #f4f5f7; cursor: default;
+}
+.ann-node.folded:hover { background: #eef0f3; }
+.ann-node.folded > .ann-fold { position: static; left: auto; top: auto; }
+.ann-fold-text {
+  flex: 1; min-width: 0; font-size: 12px; color: #666;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .ann-q { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
 /* 节点引文：提问针对的原文/回答片段 */
 .ann-q-quote {
@@ -734,6 +753,12 @@ ul.outline li.para { color: #888; font-size: 12px; }
 .conv-row:hover { background: rgba(37, 99, 235, 0.08); color: var(--blue); }
 .conv-row.current { background: rgba(37, 99, 235, 0.14); color: var(--blue); font-weight: 600; }
 .conv-row.collapsed .conv-q { font-style: italic; }
+.conv-row.folded .conv-q { color: #999; }
+.conv-fold {
+  flex: none; width: 12px; text-align: center; color: var(--muted);
+  font-size: 10px; line-height: 1; cursor: pointer; user-select: none;
+}
+.conv-fold:hover { color: var(--blue); }
 .conv-num { flex: none; color: var(--blue); font-variant-numeric: tabular-nums; }
 .conv-num::before { content: "["; }
 .conv-num::after { content: "]"; }

@@ -31,6 +31,7 @@ let annSelectedNode = null;   // 弹窗内当前选中的节点（追问挂到�
 let annNavigated = false;     // 用户是否在弹窗对话树里点过节点（之后提问挂到选中节点）
 let annNewRoot = false;       // 用户点了对话树空白处：下一次提问作为新的对话根（森林）
 let annHostId = null;         // 回答批注发起时所在的基础批注 id（发送完回到它继续看整条森林）
+let annFolded = new Set();    // 弹窗对话里被手动折叠的节点 id（折叠后只留窄一行，不写入后端）
 
 // ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
 const SEL_SEP = "\u0001";
@@ -666,19 +667,30 @@ function renderPopupTree(threads) {
   }
   const add = (node, depth, container) => {
     if (!node) return;
+    const children = node.children || [];
+    const folded = children.length > 0 && annFolded.has(node.node_id);
     const row = document.createElement("div");
     row.className = "conv-row"
       + (node.collapsed ? " collapsed" : "")
+      + (folded ? " folded" : "")
       + (node.node_id === annSelectedNode ? " current" : "");
     row.style.paddingLeft = 6 + depth * 12 + "px";
     row.title = node.question || "";
+    if (children.length) {
+      const fold = document.createElement("span");
+      fold.className = "conv-fold";
+      fold.textContent = folded ? "▶" : "▼";
+      fold.title = folded ? "展开该节点及子树" : "折叠该节点及子树";
+      fold.onclick = (e) => { e.stopPropagation(); annNewRoot = false; toggleAnnFold(node.node_id); };
+      row.appendChild(fold);
+    }
     const text = document.createElement("span");
     text.className = "conv-q";
     text.textContent = node.summary || node.question || "";
     row.appendChild(text);
     row.onclick = (e) => { e.stopPropagation(); annNewRoot = false; annGotoNode(node); };
     container.appendChild(row);
-    (node.children || []).forEach((c) => add(c, depth + 1, container));
+    if (!folded) children.forEach((c) => add(c, depth + 1, container));
   };
   list.forEach((t) => add(t, 0, box));
 }
@@ -2510,9 +2522,33 @@ function renderAnnThread(roots) {
   if (!list.length) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
   const add = (node, depth, container) => {
     const div = document.createElement("div");
-    div.className = "ann-node" + (annSelectedNode === node.node_id ? " selected" : "");
+    const folded = annFolded.has(node.node_id);
+    div.className = "ann-node"
+      + (annSelectedNode === node.node_id ? " selected" : "")
+      + (folded ? " folded" : "");
     div.dataset.nodeId = node.node_id;
     div.style.marginLeft = depth * 10 + "px";
+
+    const foldBtn = document.createElement("span");
+    foldBtn.className = "ann-fold";
+    foldBtn.textContent = folded ? "▶" : "▼";
+    foldBtn.title = folded ? "展开该节点及子树" : "折叠该节点及子树";
+    foldBtn.onclick = (e) => { e.stopPropagation(); toggleAnnFold(node.node_id); };
+    div.appendChild(foldBtn);
+
+    if (folded) {
+      // 折叠：节点连同子树收成窄窄一行，只露开头一小段 + 省略号
+      const snip = document.createElement("span");
+      snip.className = "ann-fold-text";
+      snip.textContent = (node.summary || node.question || "") + "…";
+      div.appendChild(snip);
+      div.oncontextmenu = (e) => {
+        e.preventDefault();
+        showAnnNodeMenu(e.clientX, e.clientY, node);
+      };
+      container.appendChild(div);
+      return;
+    }
 
     const q = document.createElement("div");
     q.className = "ann-q";
@@ -2585,8 +2621,22 @@ function renderAnnThread(roots) {
   list.forEach((r) => add(r, 0, box));
 }
 
+/// 折叠 / 展开弹窗里的某个对话节点（连同子树），两处视图（左树 + 右正文）同步重渲染。
+function toggleAnnFold(nodeId) {
+  if (!nodeId) return;
+  if (annFolded.has(nodeId)) annFolded.delete(nodeId);
+  else annFolded.add(nodeId);
+  if (renderedThreads) renderAnnThread(renderedThreads);
+  renderPopupTree(popupThreads());
+}
+
 function showAnnNodeMenu(x, y, node) {
+  const folded = annFolded.has(node.node_id);
   showMenu(x, y, [
+    {
+      label: folded ? "展开该节点及子树" : "折叠该节点及子树",
+      fn: () => toggleAnnFold(node.node_id),
+    },
     { label: "删除该节点及子树", danger: true, fn: () => annDeleteNode(node) },
     { label: "总结该子树", fn: () => annSumNode(node) },
   ]);
