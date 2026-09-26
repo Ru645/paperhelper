@@ -333,6 +333,45 @@ pub struct AskJob {
     attach_note: bool,
 }
 
+/// 提问附件（在途发送，**不写入会话历史**）：文本注入 prompt，图片作为多模态输入。
+#[derive(Debug, Clone, Default)]
+pub struct ExtraInput {
+    /// 已拼接好的附件文本（含文件名与分隔），空表示无文本附件。
+    pub text: String,
+    /// 图片 data URL（如 PDF 页截图 / 用户上传图片）。
+    pub images: Vec<String>,
+}
+
+impl ExtraInput {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+
+    /// 把附件并入发给模型的消息列表：追加到末条 user 消息（正文 + 图片）。
+    fn apply_to(&self, msgs: &mut Vec<Message>) {
+        if self.is_empty() {
+            return;
+        }
+        let has_user = msgs.last().map(|m| m.role == "user").unwrap_or(false);
+        if !has_user {
+            let mut m = Message::text("user", self.text.clone());
+            for img in &self.images {
+                m = m.with_image(img.clone());
+            }
+            msgs.push(m);
+            return;
+        }
+        let mut last = msgs.pop().expect("has_user implies non-empty");
+        if !self.text.trim().is_empty() {
+            last.content.push_str(&self.text);
+        }
+        for img in &self.images {
+            last = last.with_image(img.clone());
+        }
+        msgs.push(last);
+    }
+}
+
 impl AskJob {
     /// 锁外执行 LLM 流式调用（进度/思考/正文都经 emitter 输出）。
     pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
@@ -2326,6 +2365,7 @@ PaperHelper 命令：
     /// 新建批注（Web）：在 block_id 处针对选中文字提问，作为独立线程的根节点。
     /// 返回 `(批注 id, 根节点 id, 解释 id 或 None)`。
     /// 笔记批注的 **prepare 段**（持锁）：校验块、切到独立线程、组装上下文。
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_annotate(
         &mut self,
         block_id: &str,
@@ -2334,6 +2374,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
+        extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         // 全文提问：block_id 用哨兵 __title__，解释挂到首个块（保证追问嵌套），
         // 但批注仍记录 __title__ 供前端高亮标题。
@@ -2368,6 +2409,7 @@ PaperHelper 命令：
                 return Err(e);
             }
         };
+        extra.apply_to(&mut job.msgs);
         job.restore_current = saved;
         let anchor = AnnAnchor::Note {
             block_id: block_id.to_string(),
@@ -2389,7 +2431,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
-        image: Option<&str>,
+        extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
@@ -2403,11 +2445,7 @@ PaperHelper 命令：
         };
         // PDF 提问不写笔记树：只建对话节点 + 批注
         job.attach_note = false;
-        if let Some(img) = image.filter(|s| !s.trim().is_empty()) {
-            if let Some(last) = job.msgs.pop() {
-                job.msgs.push(if last.role == "user" { last.with_image(img) } else { last });
-            }
-        }
+        extra.apply_to(&mut job.msgs);
         job.restore_current = saved.clone();
         let anchor = AnnAnchor::Pdf {
             page,
@@ -2506,6 +2544,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
+        extra: &ExtraInput,
     ) -> Result<AskJob> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
@@ -2520,6 +2559,7 @@ PaperHelper 命令：
                 return Err(e);
             }
         };
+        extra.apply_to(&mut job.msgs);
         job.restore_current = saved;
         Ok(job)
     }
@@ -2533,6 +2573,7 @@ PaperHelper 命令：
         question: &str,
         is_check: bool,
         record_concept: bool,
+        extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
             bail!("找不到对话节点");
@@ -2549,6 +2590,7 @@ PaperHelper 命令：
                 return Err(e);
             }
         };
+        extra.apply_to(&mut job.msgs);
         job.restore_current = saved;
         let anchor = AnnAnchor::Answer {
             node_id: node_id.to_string(),
@@ -3254,7 +3296,7 @@ pub fn mask_key(k: &str) -> String {
 mod tests {
     use super::{
         extract_concept, normalize_path_arg, strip_flag, take_bool_arg, take_style_arg, take_value_arg,
-        CommandCompleter,
+        CommandCompleter, ExtraInput,
     };
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
@@ -3271,6 +3313,32 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(r, "x.pdf");
         assert!(take_style_arg("--style").is_err(), "缺取值应报错");
+    }
+
+    /// 附件并入消息列表：追加到末条 user 消息；末条非 user 时新增一条；空附件无副作用。
+    #[test]
+    fn extra_input_appends_to_last_user_message() {
+        use crate::llm::Message;
+        let extra = ExtraInput {
+            text: "\n\n【附件：a.txt】\n内容".to_string(),
+            images: vec!["data:image/png;base64,AA".to_string()],
+        };
+        let mut msgs = vec![Message::text("user", "问题")];
+        extra.apply_to(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("问题") && msgs[0].content.contains("内容"));
+        assert_eq!(msgs[0].images.len(), 1);
+
+        let mut msgs = vec![Message::text("assistant", "答")];
+        extra.apply_to(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "user");
+
+        let mut msgs = vec![Message::text("user", "问")];
+        ExtraInput::default().apply_to(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "问");
+        assert!(msgs[0].images.is_empty());
     }
 
     #[test]

@@ -173,12 +173,15 @@
       <span id="ann-subquote-text" class="ann-subquote-text"></span>
       <button id="ann-subquote-clear" class="mini ghost" title="不引用这段">×</button>
     </div>
+    <div id="ann-chips" class="ann-chips hidden"></div>
     <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
     <div class="ann-input-row">
       <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
       <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
         <input type="checkbox" id="ann-record" checked> 记概念
       </label>
+      <button id="ann-attach" class="mini ghost" title="添加附件（图片 / txt / md / PDF），随本次提问发送，不写入历史">📎 附件</button>
+      <input type="file" id="ann-file" class="hidden" multiple accept="image/*,.txt,.md,.markdown,.pdf" />
       <span class="ann-input-spacer"></span>
       <button id="ann-send" class="mini primary">发送</button>
     </div>

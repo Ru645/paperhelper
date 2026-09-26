@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::app::App;
+use crate::app::{App, ExtraInput};
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
 use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer, update};
@@ -104,6 +104,10 @@ pub fn router(app: SharedApp) -> Router {
         .route(
             "/api/upload",
             post(api_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
+        )
+        .route(
+            "/api/attach/pdf",
+            post(api_attach_pdf).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
         )
         .route("/api/samples", get(api_samples))
         .route("/api/samples/import", post(api_sample_import))
@@ -2167,6 +2171,54 @@ async fn api_concept_delete(
 
 // ===== 批注（笔记选中文字提问） =====
 
+/// 提问附件（在途发送，不入会话历史）。`kind`：`"text"`（正文注入 prompt）
+/// 或 `"image"`（data URL，作为多模态输入）。
+#[derive(Deserialize, Default)]
+struct AttachmentReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    data: String,
+}
+
+/// 附件数量与文本总量上限（防止把上下文撑爆）。
+const MAX_ATTACH_FILES: usize = 8;
+const MAX_ATTACH_TEXT_CHARS: usize = 40_000;
+
+/// 把前端附件拆成「注入 prompt 的文本」+「图片 data URL」，超限返回中文原因。
+fn parse_attachments(list: Vec<AttachmentReq>) -> Result<ExtraInput, String> {
+    if list.len() > MAX_ATTACH_FILES {
+        return Err(format!("附件过多（最多 {MAX_ATTACH_FILES} 个）"));
+    }
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut chars = 0usize;
+    for a in list {
+        let name = if a.name.trim().is_empty() { "附件" } else { a.name.trim() };
+        if a.kind == "image" {
+            if !a.data.starts_with("data:image/") {
+                return Err(format!("图片「{name}」格式不正确"));
+            }
+            images.push(a.data);
+        } else {
+            let body = a.data.trim();
+            if body.is_empty() {
+                continue;
+            }
+            chars += body.chars().count();
+            if chars > MAX_ATTACH_TEXT_CHARS {
+                return Err(format!(
+                    "文本附件总长超过上限（约 {MAX_ATTACH_TEXT_CHARS} 字），请精简后再发送"
+                ));
+            }
+            text.push_str(&format!("\n\n【附件：{name}】\n{body}"));
+        }
+    }
+    Ok(ExtraInput { text, images })
+}
+
 #[derive(Deserialize)]
 struct AnnotateReq {
     block_id: String,
@@ -2187,6 +2239,9 @@ struct AnnotateReq {
     /// 该页渲染图（data URL）。仅 PDF 批注用，随本次请求发给模型，不入历史。
     #[serde(default)]
     image: Option<String>,
+    /// 用户上传的附件（图片 / 文本 / PDF 抽出的文本），仅本次请求，不入历史。
+    #[serde(default)]
+    attachments: Vec<AttachmentReq>,
 }
 
 /// PDF 阅读器批注锚点：页码 + 页面内归一化矩形 + 类型。
@@ -2211,6 +2266,16 @@ async fn api_annotate(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("批注提问「{}」", req.question);
         let t0 = std::time::Instant::now();
+        let mut extra = match parse_attachments(req.attachments) {
+            Ok(e) => e,
+            Err(msg) => {
+                emit_result_channel(&tx, Err(anyhow::anyhow!(msg)), &what, t0);
+                return;
+            }
+        };
+        if let Some(img) = req.image.as_deref().filter(|s| !s.trim().is_empty()) {
+            extra.images.push(img.to_string());
+        }
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
@@ -2223,7 +2288,7 @@ async fn api_annotate(
                     &req.question,
                     is_check,
                     req.record_concept,
-                    req.image.as_deref(),
+                    &extra,
                 )
             } else {
                 g.prepare_annotate(
@@ -2233,6 +2298,7 @@ async fn api_annotate(
                     &req.question,
                     is_check,
                     req.record_concept,
+                    &extra,
                 )
             };
             g.emitter = Emitter::terminal();
@@ -2285,6 +2351,9 @@ struct AnnotateAnswerReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// 用户上传的附件（仅本次请求，不入历史）。
+    #[serde(default)]
+    attachments: Vec<AttachmentReq>,
 }
 
 /// 回答批注：在某个回答里选中文字提问（新问答挂在该节点下，回答里高亮引用）。
@@ -2298,6 +2367,13 @@ async fn api_annotate_answer(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("回答批注「{}」", req.question);
         let t0 = std::time::Instant::now();
+        let extra = match parse_attachments(req.attachments) {
+            Ok(e) => e,
+            Err(msg) => {
+                emit_result_channel(&tx, Err(anyhow::anyhow!(msg)), &what, t0);
+                return;
+            }
+        };
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
@@ -2308,6 +2384,7 @@ async fn api_annotate_answer(
                 &req.question,
                 is_check,
                 req.record_concept,
+                &extra,
             );
             g.emitter = Emitter::terminal();
             r
@@ -2354,6 +2431,9 @@ struct AnnotateReplyReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// 用户上传的附件（仅本次请求，不入历史）。
+    #[serde(default)]
+    attachments: Vec<AttachmentReq>,
 }
 
 async fn api_annotate_reply(
@@ -2366,10 +2446,17 @@ async fn api_annotate_reply(
         let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("批注追问「{}」", req.question);
         let t0 = std::time::Instant::now();
+        let extra = match parse_attachments(req.attachments) {
+            Ok(e) => e,
+            Err(msg) => {
+                emit_result_channel(&tx, Err(anyhow::anyhow!(msg)), &what, t0);
+                return;
+            }
+        };
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
-            let r = g.prepare_annotate_reply(&req.node_id, &req.question, is_check, req.record_concept);
+            let r = g.prepare_annotate_reply(&req.node_id, &req.question, is_check, req.record_concept, &extra);
             g.emitter = Emitter::terminal();
             r
         };
@@ -2513,11 +2600,57 @@ fn upload_err(
     (code, Json(json!({ "error": msg.into() })))
 }
 
-/// 上传：**流式写盘**（不再整文件读进内存，避免大文件 OOM/静默失败），
-/// 超过 `MAX_UPLOAD_BYTES` 时删除半成品并返回明确中文错误。
+/// 流式把 multipart 的 `file` 字段写入上传目录：
+/// **不整文件读进内存**（避免大文件 OOM/静默失败），超 `MAX_UPLOAD_BYTES` 时
+/// 删除半成品并返回明确中文错误。成功返回 `(原始文件名, 落盘路径, 字节数)`。
+type UploadError = (StatusCode, Json<serde_json::Value>);
+
+async fn save_upload_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<(String, std::path::PathBuf, u64), UploadError> {
+    let filename = field.file_name().unwrap_or("upload.pdf").to_string();
+    paths::ensure_uploads_dir().map_err(|e| {
+        upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建上传目录失败: {e:#}"))
+    })?;
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let name = format!("{stamp}_{}", sanitize_upload_name(&filename));
+    let path = paths::uploads_dir().join(&name);
+
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建文件失败: {e}")))?;
+    let mut total: u64 = 0;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| upload_err(StatusCode::BAD_REQUEST, format!("读取上传数据失败: {e}")))?
+    {
+        total += chunk.len() as u64;
+        if total > MAX_UPLOAD_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            let limit_mb = MAX_UPLOAD_BYTES / 1024 / 1024;
+            logging::warn(format!("上传被拒（超过 {limit_mb}MB）：{filename}"));
+            return Err(upload_err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("文件超过 {limit_mb}MB 上限，已拒绝"),
+            ));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await.map_err(|e| {
+            upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("写入文件失败: {e}"))
+        })?;
+    }
+    if total == 0 {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(upload_err(StatusCode::BAD_REQUEST, "文件为空"));
+    }
+    Ok((filename, path, total))
+}
+
 async fn api_upload(
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, UploadError> {
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -2526,45 +2659,7 @@ async fn api_upload(
         if field.name() != Some("file") {
             continue;
         }
-        let filename = field.file_name().unwrap_or("upload.pdf").to_string();
-        paths::ensure_uploads_dir().map_err(|e| {
-            upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建上传目录失败: {e:#}"))
-        })?;
-        let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let name = format!("{stamp}_{}", sanitize_upload_name(&filename));
-        let path = paths::uploads_dir().join(&name);
-
-        let mut file = tokio::fs::File::create(&path)
-            .await
-            .map_err(|e| upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("创建文件失败: {e}")))?;
-        let mut total: u64 = 0;
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|e| upload_err(StatusCode::BAD_REQUEST, format!("读取上传数据失败: {e}")))?
-        {
-            total += chunk.len() as u64;
-            if total > MAX_UPLOAD_BYTES {
-                drop(file);
-                let _ = tokio::fs::remove_file(&path).await;
-                let limit_mb = MAX_UPLOAD_BYTES / 1024 / 1024;
-                logging::warn(format!("上传被拒（超过 {limit_mb}MB）：{filename}"));
-                return Err(upload_err(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("文件超过 {limit_mb}MB 上限，已拒绝"),
-                ));
-            }
-            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-                .await
-                .map_err(|e| {
-                    upload_err(StatusCode::INTERNAL_SERVER_ERROR, format!("写入文件失败: {e}"))
-                })?;
-        }
-        if total == 0 {
-            drop(file);
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(upload_err(StatusCode::BAD_REQUEST, "文件为空"));
-        }
+        let (filename, path, total) = save_upload_field(&mut field).await?;
         logging::info(format!(
             "上传完成：{filename}（{:.1}MB）→ {}",
             total as f64 / 1024.0 / 1024.0,
@@ -2574,6 +2669,47 @@ async fn api_upload(
             "path": path.to_string_lossy(),
             "name": filename,
             "size": total,
+        })));
+    }
+    Err(upload_err(StatusCode::BAD_REQUEST, "缺少 file 字段"))
+}
+
+/// 提问附件用：上传 PDF → 抽取文字 → 立即删临时文件，只回传文本（不落盘、不入会话）。
+async fn api_attach_pdf(
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, UploadError> {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| upload_err(StatusCode::BAD_REQUEST, format!("读取上传失败（连接可能中断）: {e}")))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let (filename, path, _) = save_upload_field(&mut field).await?;
+        let pages = pdf::extract_pages_lenient(&path).await;
+        let _ = tokio::fs::remove_file(&path).await;
+        let pages = match pages {
+            Ok(p) => p,
+            Err(e) => {
+                logging::error(format!("附件 PDF 解析失败：{filename}: {e:#}"));
+                return Err(upload_err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "无法解析该 PDF（文件可能已损坏，或不是有效的 PDF）",
+                ));
+            }
+        };
+        let text = pages.join("\n\n");
+        if text.trim().is_empty() {
+            return Err(upload_err(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "该 PDF 未提取到文字（可能是扫描件/图片版），请改用截图附件",
+            ));
+        }
+        return Ok(Json(json!({
+            "name": filename,
+            "text": text,
+            "pages": pages.len(),
         })));
     }
     Err(upload_err(StatusCode::BAD_REQUEST, "缺少 file 字段"))
@@ -2631,6 +2767,37 @@ mod tests {
             missing.is_empty(),
             "app.js 引用了 index.html 中不存在的元素 id（版本错配）: {missing:?}"
         );
+    }
+
+    /// 附件解析：文本拼接、图片校验、数量/长度上限、空内容处理。
+    #[test]
+    fn parse_attachments_validates_and_merges() {
+        let att = |name: &str, kind: &str, data: &str| AttachmentReq {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            data: data.to_string(),
+        };
+        let ok = parse_attachments(vec![
+            att("a.txt", "text", "hello"),
+            att("p.png", "image", "data:image/png;base64,AAA"),
+        ])
+        .unwrap();
+        assert!(ok.text.contains("a.txt") && ok.text.contains("hello"));
+        assert_eq!(ok.images, vec!["data:image/png;base64,AAA".to_string()]);
+        assert!(!ok.is_empty());
+
+        // 空白文本附件被忽略 → 与「无附件」等价
+        assert!(parse_attachments(vec![att("e", "text", "   ")]).unwrap().is_empty());
+        // 图片必须是 data URL
+        assert!(parse_attachments(vec![att("p", "image", "http://x/y.png")]).is_err());
+        // 数量超限
+        let many: Vec<_> = (0..MAX_ATTACH_FILES + 1)
+            .map(|i| att(&format!("f{i}"), "text", "x"))
+            .collect();
+        assert!(parse_attachments(many).is_err());
+        // 文本总量超限
+        let big = vec![att("b", "text", &"x".repeat(MAX_ATTACH_TEXT_CHARS + 1))];
+        assert!(parse_attachments(big).is_err());
     }
 
     /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。

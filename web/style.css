@@ -553,6 +553,23 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 }
 .ann-opt input { margin: 0; }
 .ann-input-spacer { flex: 1; }
+/* 附件 chips：本次提问随附的文件（图片 / 文本 / PDF 抽文本），发送后清空 */
+#ann-file.hidden { display: none; }
+.ann-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ann-chips.hidden { display: none; }
+.ann-chip {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 2px 6px; border: 1px solid var(--line); border-radius: 999px;
+  background: #f6f8fb; font-size: 12px; color: var(--fg);
+}
+.ann-chip.pending { opacity: .65; }
+.ann-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.ann-chip-wait { color: var(--muted); }
+.ann-chip-x {
+  border: none; background: transparent; cursor: pointer; padding: 0 2px;
+  font-size: 13px; line-height: 1; color: var(--muted);
+}
+.ann-chip-x:hover { color: #c0392b; }
 /* 引用附件条：提问所针对的选中文字（保留选区不便时，用它展示上下文） */
 .ann-subquote {
   display: flex; align-items: center; gap: 6px; padding: 4px 8px;

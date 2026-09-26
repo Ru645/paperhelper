@@ -2023,6 +2023,7 @@ async function openAnnotationCreate(anchor) {
   }
   $("ann-q").value = "";
   annInputGrow();
+  clearAnnAttachments();
   $("ann-q").focus();
 }
 
@@ -2042,6 +2043,7 @@ async function openAnnotationView(annId, opts = {}) {
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
   await loadMathLibs();
   clearAnnSubquote();
+  clearAnnAttachments();
   $("ann-quote").textContent = cleanQuote(ann.quote);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
@@ -2214,6 +2216,7 @@ function closeAnnPopup() {
   $("ann-popup").classList.add("hidden");
   $("ann-sel-btn").classList.add("hidden");
   clearAnnSubquote();
+  clearAnnAttachments();
   currentAnnotation = null;
   annSelectedNode = null;
 }
@@ -2247,6 +2250,148 @@ function recordConceptOn() {
   return el ? !!el.checked : true;
 }
 
+// ===== 提问附件（图片 / txt / md / PDF 抽文本）：仅随本次提问发送，不入会话历史 =====
+let annAttachments = []; // [{ name, kind: "text"|"image", data, pending? }]
+const MAX_ANN_ATTACH = 8;
+const MAX_ANN_ATTACH_TEXT = 40000;
+
+function annAttachTextLen() {
+  return annAttachments.reduce((n, a) => n + (a.kind === "text" ? a.data.length : 0), 0);
+}
+
+function renderAnnChips() {
+  const box = $("ann-chips");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!annAttachments.length) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  annAttachments.forEach((a, i) => {
+    const chip = document.createElement("span");
+    chip.className = "ann-chip" + (a.pending ? " pending" : "");
+    const name = document.createElement("span");
+    name.className = "ann-chip-name";
+    name.textContent = (a.kind === "image" ? "🖼 " : "📄 ") + a.name;
+    chip.appendChild(name);
+    if (a.pending) {
+      const wait = document.createElement("span");
+      wait.className = "ann-chip-wait";
+      wait.textContent = "解析中…";
+      chip.appendChild(wait);
+    } else {
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "ann-chip-x";
+      x.title = "移除附件";
+      x.textContent = "×";
+      x.onclick = () => { annAttachments.splice(i, 1); renderAnnChips(); };
+      chip.appendChild(x);
+    }
+    box.appendChild(chip);
+  });
+}
+
+function clearAnnAttachments() {
+  annAttachments = [];
+  const f = $("ann-file");
+  if (f) f.value = "";
+  renderAnnChips();
+}
+
+/// 发给后端的附件数组（过滤掉仍在解析的 PDF）。
+function currentAnnAttachments() {
+  return annAttachments
+    .filter((a) => !a.pending)
+    .map((a) => ({ name: a.name, kind: a.kind, data: a.data }));
+}
+
+function readAnnFile(file, asDataUrl) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(r.error || new Error("读取失败"));
+    if (asDataUrl) r.readAsDataURL(file); else r.readAsText(file);
+  });
+}
+
+async function addAnnFile(file) {
+  const name = file.name || "附件";
+  const lower = name.toLowerCase();
+  const tooMany = () => {
+    appendConsole(`❌ 附件过多（最多 ${MAX_ANN_ATTACH} 个）`, "err");
+  };
+  const isImage = (file.type || "").startsWith("image/");
+  if (isImage || lower.endsWith(".pdf")) {
+    if (annAttachments.length >= MAX_ANN_ATTACH) return tooMany();
+  }
+  if (isImage) {
+    try {
+      const data = await readAnnFile(file, true);
+      annAttachments.push({ name, kind: "image", data });
+      renderAnnChips();
+    } catch (e) {
+      appendConsole(`❌ 图片「${name}」读取失败：${e}`, "err");
+    }
+    return;
+  }
+  if (lower.endsWith(".pdf")) {
+    // PDF：登记占位 chip，交后端抽文本（扫描件会失败并提示改用截图）
+    const chip = { name, kind: "text", data: "", pending: true };
+    annAttachments.push(chip);
+    renderAnnChips();
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await fetch("/api/attach/pdf", { method: "POST", body: fd });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
+      let text = (j.text || "").trim();
+      chip.pending = false;
+      const budget = MAX_ANN_ATTACH_TEXT - annAttachTextLen();
+      if (!text) {
+        annAttachments = annAttachments.filter((a) => a !== chip);
+        appendConsole(`❌ 「${name}」未提取到文字（可能是扫描件），可改用截图附件`, "err");
+      } else if (text.length > budget) {
+        if (budget <= 0) {
+          annAttachments = annAttachments.filter((a) => a !== chip);
+          appendConsole(`❌ 附件文本已达上限，无法再添加 PDF「${name}」`, "err");
+        } else {
+          chip.data = text.slice(0, budget);
+          appendConsole(`⚠️ PDF「${name}」内容较长，已截断到约 ${budget} 字`, "warn");
+        }
+      } else {
+        chip.data = text;
+        appendConsole(`📎 已附加 PDF「${name}」（${j.pages || 1} 页）`);
+      }
+    } catch (e) {
+      annAttachments = annAttachments.filter((a) => a !== chip);
+      appendConsole(`❌ 解析 PDF「${name}」失败：${e}`, "err");
+    }
+    renderAnnChips();
+    return;
+  }
+  if (!lower.endsWith(".txt") && !lower.endsWith(".md") && !lower.endsWith(".markdown")) {
+    appendConsole(`❌ 不支持的附件类型：「${name}」（支持图片 / txt / md / PDF）`, "err");
+    return;
+  }
+  try {
+    const data = await readAnnFile(file, false);
+    if (annAttachTextLen() + data.length > MAX_ANN_ATTACH_TEXT) {
+      appendConsole(`❌ 文本附件总长超过上限（约 ${MAX_ANN_ATTACH_TEXT} 字），请精简后再添加`, "err");
+      return;
+    }
+    annAttachments.push({ name, kind: "text", data });
+    renderAnnChips();
+  } catch (e) {
+    appendConsole(`❌ 文本「${name}」读取失败：${e}`, "err");
+  }
+}
+
+function onAnnFiles(fileList) {
+  for (const f of Array.from(fileList || [])) addAnnFile(f);
+  const inp = $("ann-file");
+  if (inp) inp.value = "";
+}
+
 async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
@@ -2273,6 +2418,7 @@ async function sendAnnotation() {
         question: q,
         mode: annMode,
         record_concept: recordConceptOn(),
+        attachments: currentAnnAttachments(),
       };
     } else {
       url = "/api/annotate";
@@ -2283,6 +2429,7 @@ async function sendAnnotation() {
         question: q,
         mode: annMode,
         record_concept: recordConceptOn(),
+        attachments: currentAnnAttachments(),
       };
       if (currentAnnotation.pdf) {
         body.pdf = currentAnnotation.pdf;
@@ -2293,8 +2440,9 @@ async function sendAnnotation() {
     const nodeId = annSelectedNode;
     if (!nodeId) { $("ann-send").disabled = false; setAnnProgress(""); return; }
     url = "/api/annotate/reply";
-    body = { node_id: nodeId, question: q, mode: annMode, record_concept: recordConceptOn() };
+    body = { node_id: nodeId, question: q, mode: annMode, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
   }
+  clearAnnAttachments();
   let streamed = "";
   const controller = new AbortController();
   annAbort = controller;
@@ -4179,6 +4327,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   $("ann-subquote-clear").onclick = () => clearAnnSubquote();
   $("ann-send").onclick = sendAnnotation;
+  $("ann-attach").onclick = () => $("ann-file").click();
+  $("ann-file").onchange = () => onAnnFiles($("ann-file").files);
   // 弹窗线程内：选中回答文字浮出「提问」；回答里的高亮可点击/右键
   document.addEventListener("mouseup", () => setTimeout(showAnnSelButton, 0));
   $("ann-thread").addEventListener("click", (e) => {
