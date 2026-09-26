@@ -425,7 +425,7 @@ async fn api_pdf_file(State(app): State<SharedApp>) -> Response {
             let mut resp = ([(header::CONTENT_TYPE, "application/pdf")], bytes).into_response();
             resp.headers_mut().insert(
                 header::CACHE_CONTROL,
-                header::HeaderValue::from_static("private, max-age=3600"),
+                header::HeaderValue::from_static("private, no-cache"),
             );
             resp
         }
@@ -2919,6 +2919,53 @@ mod tests {
             missing.is_empty(),
             "app.js 引用了 index.html 中不存在的元素 id（版本错配）: {missing:?}"
         );
+    }
+
+    /// `/api/pdf/file`：只服务当前会话原件；无源 404，有源 200 且禁用缓存。
+    /// 若允许缓存，切换会话时浏览器会复用旧 PDF（「原文」切会话不更新的回归）。
+    #[tokio::test]
+    async fn pdf_file_endpoint_scoped_and_no_cache() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+
+        let make = || {
+            Arc::new(Mutex::new(App::new(
+                Config::default(),
+                KnowledgeBase::default(),
+                reqwest::Client::new(),
+            )))
+        };
+
+        // 无源会话 → 404
+        let resp = api_pdf_file(State(make())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 有源会话 → 200 + application/pdf + no-cache
+        let dir = std::env::temp_dir().join("paperhelper_pdf_file_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("a.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+
+        let shared = make();
+        {
+            let mut a = shared.lock().await;
+            let mut note = notes::readonly_note("t", "");
+            note.source_path = Some(pdf.to_string_lossy().to_string());
+            a.session.notes = Some(note);
+        }
+        let resp = api_pdf_file(State(shared)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 附件解析：文本拼接、图片校验、数量/长度上限、空内容处理。

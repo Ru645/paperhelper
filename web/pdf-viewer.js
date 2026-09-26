@@ -1,31 +1,43 @@
 // PDF 阅读器适配层（按需加载）。
 //
-// 后端 `GET /api/pdf/file` 只返回「当前会话」对应的 PDF 原件；渲染全部在前端完成，
-// 使用 vendored PDF.js（Apache-2.0，/vendor/pdfjs/）。本脚本由 app.js 在用户切到
-// 「原文」时动态注入，复用 app.js 的批注弹窗：
+// 后端 `GET /api/pdf/file?v=<会话标识>` 只返回「当前会话」对应的 PDF 原件；
+// 渲染全部在前端完成，使用 vendored PDF.js（Apache-2.0，/vendor/pdfjs/）。本脚本
+// 由 app.js 在用户切到「原文」时动态注入，复用 app.js 的批注弹窗：
 //   - 选中文字 → 复用 #sel-btn → openAnnotationCreate({ pdf, quote, image })
 //   - 「提问本页」→ openAnnotationCreate({ pdf, quote, image(kind=page) })
 //   - 页面上按 page/rects 重绘高亮；点高亮 → openAnnotationView(id, { rect })
+//   - 侧栏目录（可伸缩 / 折叠，宽度与折叠状态存 localStorage）
+//   - 缩放滑条 + ± 按钮 + Ctrl+滚轮（缩放比例存 localStorage）
 (function () {
   "use strict";
 
   const PAD = 24;               // 页面两侧留白（贴合宽度用）
   const MAX_IMG_WIDTH = 1600;   // 捕获图片最大宽度，控制 data URL 体积
   const RENDER_MARGIN = "800px"; // 预渲染视口外一屏
+  const ZOOM_MIN = 50, ZOOM_MAX = 300, ZOOM_STEP = 10;
+  const TOC_W_KEY = "ph.pdf.toc.w";
+  const TOC_OPEN_KEY = "ph.pdf.toc.open";
+  const ZOOM_KEY = "ph.pdf.zoom";
 
   let lib = null;               // pdf.js 模块
   let doc = null;               // PDFDocumentProxy
   let pages = [];               // [{ num, wrap, canvas, textLayer }]
   let pageCount = 0;
   let current = 1;
-  let zoom = "fit";             // "fit" | 数字字符串
+  let zoom = null;              // null = 贴合宽度；数字 = 百分比
   let baseWidth = 0;            // 第 1 页 scale=1 的 CSS 宽度
   let observer = null;
   let docPromise = null;        // 当前加载任务（去重）
+  let docKey = null;            // 当前加载的会话标识（区分不同会话的 PDF）
+  let resizeTimer = null;
 
   const $ = (id) => document.getElementById(id);
   const pagesEl = () => $("pdf-pages");
   const setStatus = (t) => { const el = $("pdf-status"); if (el) el.textContent = t || ""; };
+
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* 忽略 */ } }
+  function lsDel(k) { try { localStorage.removeItem(k); } catch (e) { /* 忽略 */ } }
 
   async function loadLib() {
     if (lib) return lib;
@@ -37,6 +49,7 @@
 
   function reset() {
     docPromise = null;
+    docKey = null;
     if (doc) { try { doc.destroy(); } catch (e) { /* 忽略 */ } doc = null; }
     if (observer) { observer.disconnect(); observer = null; }
     pages = [];
@@ -46,22 +59,23 @@
     const c = pagesEl();
     if (c) c.innerHTML = "";
     const toc = $("pdf-toc");
-    if (toc) { toc.innerHTML = ""; toc.classList.add("hidden"); }
-    const tocBtn = $("pdf-toc-btn");
-    if (tocBtn) tocBtn.classList.add("hidden");
+    if (toc) toc.innerHTML = "";
     setStatus("");
+    updateCurrentMarker();
   }
 
-  async function open() {
+  async function open(key) {
     if (docPromise) return docPromise;
+    docKey = key || null;
     const view = $("pdf-view");
     if (view) view.classList.remove("hidden");
     docPromise = (async () => {
       setStatus("正在加载 PDF…");
+      const url = "/api/pdf/file" + (docKey ? "?v=" + encodeURIComponent(docKey) : "");
       try {
         await loadLib();
         doc = await lib.getDocument({
-          url: "/api/pdf/file",
+          url,
           cMapUrl: "/vendor/pdfjs/cmaps/",
           cMapPacked: true,
           standardFontDataUrl: "/vendor/pdfjs/standard_fonts/",
@@ -77,8 +91,10 @@
         const p1 = await doc.getPage(1);
         baseWidth = p1.getViewport({ scale: 1 }).width;
       } catch (e) { baseWidth = 612; }
+      loadZoomPref();
       buildPages();
       loadToc();
+      syncZoomUi();
       setStatus("");
     })();
     return docPromise;
@@ -86,11 +102,55 @@
 
   function currentScale() {
     const c = pagesEl();
-    if (zoom === "fit") {
+    if (zoom == null) {
       const avail = (c ? c.clientWidth : 800) - PAD * 2;
       return Math.max(0.2, avail / (baseWidth || 612));
     }
-    return Number(zoom) || 1;
+    return Math.max(0.2, zoom / 100);
+  }
+
+  function effectivePercent() {
+    return Math.round(currentScale() * 100);
+  }
+
+  // ---- 缩放 ----
+  function loadZoomPref() {
+    let v = lsGet(ZOOM_KEY);
+    zoom = v ? Number(v) : null;
+    if (zoom != null) {
+      if (!Number.isFinite(zoom)) zoom = null;
+      else zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom));
+    }
+  }
+
+  function syncZoomUi() {
+    const pct = effectivePercent();
+    const r = $("pdf-zoom");
+    const lbl = $("pdf-zoom-label");
+    if (r) r.value = String(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, pct)));
+    if (lbl) lbl.textContent = zoom == null ? ("贴合宽度 " + pct + "%") : (pct + "%");
+  }
+
+  function setZoom(next) {
+    zoom = next;
+    if (next == null) lsDel(ZOOM_KEY);
+    else lsSet(ZOOM_KEY, String(next));
+    syncZoomUi();
+  }
+
+  function zoomToPercent(pct) {
+    const v = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(pct)));
+    setZoom(v);
+    rebuildForZoom();
+  }
+
+  function zoomBy(delta) {
+    zoomToPercent(effectivePercent() + delta);
+  }
+
+  function zoomFit() {
+    setZoom(null);
+    rebuildForZoom();
   }
 
   function buildPages() {
@@ -179,60 +239,146 @@
     }
   }
 
-  // ---- 目录 ----
-  async function loadToc() {
-    const btn = $("pdf-toc-btn");
-    const box = $("pdf-toc");
-    if (!btn || !box || !doc) return;
-    let outline = null;
-    try { outline = await doc.getOutline(); } catch (e) { outline = null; }
-    if (!outline || !outline.length) { btn.classList.add("hidden"); return; }
-    btn.classList.remove("hidden");
-    box.innerHTML = "";
-    for (const item of outline) {
+  // ---- 目录（左侧栏，可伸缩 + 折叠） ----
+  function tocSide() { return $("pdf-toc-side"); }
+  function tocResizer() { return $("pdf-toc-resizer"); }
+
+  function tocIsOpen() {
+    const s = tocSide();
+    return !!s && !s.classList.contains("hidden");
+  }
+
+  function tocOpen() {
+    const s = tocSide();
+    const r = tocResizer();
+    if (s) s.classList.remove("hidden");
+    if (r) r.classList.remove("hidden");
+    lsSet(TOC_OPEN_KEY, "1");
+  }
+
+  function tocClose() {
+    const s = tocSide();
+    const r = tocResizer();
+    if (s) s.classList.add("hidden");
+    if (r) r.classList.add("hidden");
+    lsSet(TOC_OPEN_KEY, "0");
+  }
+
+  function tocToggle() {
+    if (tocIsOpen()) tocClose();
+    else tocOpen();
+  }
+
+  function applyTocWidth(w) {
+    const v = Math.min(520, Math.max(140, Math.round(w)));
+    document.documentElement.style.setProperty("--pdf-toc-w", v + "px");
+    lsSet(TOC_W_KEY, String(v));
+  }
+
+  function loadTocPref() {
+    let w = 220;
+    const sw = lsGet(TOC_W_KEY);
+    if (sw) w = Number(sw) || 220;
+    applyTocWidth(w);
+    if (lsGet(TOC_OPEN_KEY) === "1") tocOpen();
+    else tocClose();
+  }
+
+  function bindTocResizer() {
+    const r = tocResizer();
+    if (!r || r.dataset.bound) return;
+    r.dataset.bound = "1";
+    r.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const side = tocSide();
+      const startW = side ? side.getBoundingClientRect().width : 220;
+      r.classList.add("dragging");
+      const move = (ev) => applyTocWidth(startW + (ev.clientX - startX));
+      const up = () => {
+        r.classList.remove("dragging");
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+    r.addEventListener("dblclick", () => applyTocWidth(220));
+  }
+
+  async function gotoDest(item) {
+    try {
+      const dest = typeof item.dest === "string" ? await doc.getDestination(item.dest) : item.dest;
+      if (dest && dest[0] != null) {
+        const ref = dest[0];
+        const pi = typeof ref === "object" ? await doc.getPageIndex(ref) : 0;
+        jumpTo(pi + 1, true);
+      }
+    } catch (e) { /* 目的页解析失败则忽略 */ }
+  }
+
+  function renderTocItems(items, depth, box) {
+    for (const item of items) {
       const b = document.createElement("button");
       b.className = "pdf-toc-item";
       b.textContent = item.title || "(未命名)";
-      b.style.paddingLeft = (6 + (item.depth || 0) * 14) + "px";
-      b.onclick = async () => {
-        try {
-          const dest = typeof item.dest === "string" ? await doc.getDestination(item.dest) : item.dest;
-          if (dest && dest[0]) {
-            const ref = dest[0];
-            const pi = typeof ref === "object" ? (await doc.getPageIndex(ref)) : 1;
-            jumpTo(pi + (typeof ref === "object" ? 1 : 0), true);
-          }
-        } catch (e) { /* 目的页解析失败则忽略 */ }
-      };
+      b.style.paddingLeft = (6 + depth * 14) + "px";
+      b.onclick = () => gotoDest(item);
       box.appendChild(b);
+      if (item.items && item.items.length) renderTocItems(item.items, depth + 1, box);
     }
   }
 
-  // ---- 翻页 / 缩放 ----
+  async function loadToc() {
+    const box = $("pdf-toc");
+    if (!box || !doc) return;
+    let outline = null;
+    try { outline = await doc.getOutline(); } catch (e) { outline = null; }
+    box.innerHTML = "";
+    if (!outline || !outline.length) {
+      const p = document.createElement("div");
+      p.className = "pdf-toc-empty";
+      p.textContent = "此 PDF 没有内置目录（可能是扫描版，或未嵌入书签）。";
+      box.appendChild(p);
+      return;
+    }
+    renderTocItems(outline, 0, box);
+  }
+
+  // ---- 翻页 / 当前页标记 ----
+  function updateCurrentMarker() {
+    for (const p of pages) {
+      if (p.wrap) p.wrap.classList.toggle("current", p.num === current);
+    }
+    const btn = $("pdf-ask-page");
+    if (btn) btn.textContent = pageCount ? ("提问第 " + current + " 页") : "提问本页";
+  }
+
   function jumpTo(num, scroll) {
     current = Math.max(1, Math.min(pageCount || 1, num || 1));
     const inp = $("pdf-page-input");
     if (inp) inp.value = String(current);
     const tot = $("pdf-page-total");
     if (tot) tot.textContent = "/ " + (pageCount || 0);
-    if (!scroll) {
-      const pc = pages[current - 1];
-      const c = pagesEl();
-      if (pc && c) c.scrollTop = pc.wrap.offsetTop - 8;
-    } else {
-      const pc = pages[current - 1];
-      if (pc) pc.wrap.scrollIntoView({ block: "start" });
+    const pc = pages[current - 1];
+    if (pc) {
+      if (!scroll) {
+        const c = pagesEl();
+        if (c) c.scrollTop = pc.wrap.offsetTop - 8;
+      } else {
+        pc.wrap.scrollIntoView({ block: "start" });
+      }
     }
+    updateCurrentMarker();
   }
 
-  function rebuildForZoom(newZoom) {
-    zoom = newZoom;
-    // 记住当前可见页
+  function rebuildForZoom() {
     syncCurrentFromScroll();
     const keep = current;
     buildPages();
     current = keep;
     jumpTo(current, false);
+    syncZoomUi();
   }
 
   function syncCurrentFromScroll() {
@@ -244,6 +390,7 @@
     }
     const inp = $("pdf-page-input");
     if (inp) inp.value = String(current);
+    updateCurrentMarker();
   }
 
   // ---- 选中文字 → 提问 ----
@@ -344,6 +491,8 @@
     const idx = current - 1;
     const pc = pages[idx];
     if (!pc) return;
+    pc.wrap.scrollIntoView({ block: "start" });
+    updateCurrentMarker();
     const image = captureImage(idx, null);
     const r = pc.wrap.getBoundingClientRect();
     openAnnotationCreate({
@@ -415,20 +564,37 @@
   function bindUi() {
     if (bound) return;
     bound = true;
+    loadTocPref();
+    bindTocResizer();
     const c = pagesEl();
     if (c) {
       c.addEventListener("mouseup", () => setTimeout(showSelBtn, 0));
       c.addEventListener("scroll", () => { syncCurrentFromScroll(); }, { passive: true });
+      c.addEventListener("wheel", (e) => {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        zoomBy(e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP);
+      }, { passive: false });
     }
     const prev = $("pdf-prev"), next = $("pdf-next");
     if (prev) prev.onclick = () => jumpTo(current - 1, true);
     if (next) next.onclick = () => jumpTo(current + 1, true);
     const inp = $("pdf-page-input");
     if (inp) inp.onchange = () => { const n = parseInt(inp.value, 10); if (n) jumpTo(n, true); };
-    const zl = $("pdf-zoom");
-    if (zl) zl.onchange = () => rebuildForZoom(zl.value);
+    const zr = $("pdf-zoom");
+    if (zr) {
+      zr.oninput = () => {
+        const lbl = $("pdf-zoom-label");
+        if (lbl) lbl.textContent = Math.round(Number(zr.value) || 100) + "%";
+      };
+      zr.onchange = () => { setZoom(Number(zr.value) || 100); rebuildForZoom(); };
+    }
+    const zo = $("pdf-zoom-out"), zi = $("pdf-zoom-in"), zf = $("pdf-zoom-fit");
+    if (zo) zo.onclick = () => zoomBy(-ZOOM_STEP);
+    if (zi) zi.onclick = () => zoomBy(ZOOM_STEP);
+    if (zf) zf.onclick = zoomFit;
     const tb = $("pdf-toc-btn");
-    if (tb) tb.onclick = () => { const box = $("pdf-toc"); if (box) box.classList.toggle("hidden"); };
+    if (tb) tb.onclick = tocToggle;
     const ap = $("pdf-ask-page");
     if (ap) ap.onclick = askPage;
     document.addEventListener("mouseup", (e) => {
@@ -438,10 +604,15 @@
       // 点到别处才收起（选区在 PDF 内时不收起，交给 showSelBtn 判断）
       if (!closestPage(e.target)) btn.classList.add("hidden");
     });
+    window.addEventListener("resize", () => {
+      if (zoom != null || !doc) return;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => rebuildForZoom(), 200);
+    });
   }
 
   window.phPdf = {
-    open: () => { bindUi(); return open(); },
+    open: (key) => { bindUi(); return open(key); },
     reset,
     close: () => {},
     applyHighlights,

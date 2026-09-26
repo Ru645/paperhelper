@@ -385,11 +385,19 @@ function showBusyHint(text) {
 
 // ===== 标签页 =====
 
+let currentTab = "note";   // 当前激活的标签（note | pdf | graph | console | 动态）
+
 function switchTab(key) {
+  currentTab = key;
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.key === key));
   document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.dataset.key === key));
   if (key === "graph") { if (graphCache) renderGraph(graphCache); }
   else hideGraphPopup();
+  if (key === "pdf") {
+    loadPdfViewer()
+      .then(() => window.phPdf && window.phPdf.open(pdfLoadedKey))
+      .catch((e) => appendConsole("❌ " + e, "err"));
+  }
 }
 
 function addDynamicTab(key, title, pane) {
@@ -913,13 +921,12 @@ function renderNoteEmpty(st) {
   if (!empty) return;
   const has = !!(st && st.has_note);
   empty.classList.toggle("hidden", has);
-  noteFrame.classList.toggle("hidden", !has || noteMode === "pdf");
+  noteFrame.classList.toggle("hidden", !has);
 }
 
-// ===== 笔记 / 原文（PDF 阅读器）切换 =====
-let noteMode = "note";        // note | pdf
+// ===== 「原文」（PDF 阅读器）标签 =====
 let pdfViewerLoaded = false;  // /pdf-viewer.js 是否已注入
-let pdfLoadedName = null;     // 当前阅读器已加载的 PDF 文件名（会话切换时用于重置）
+let pdfLoadedKey = null;      // 阅读器已加载的标识（会话 id + 文件名），变化时重置
 let lastPdfSessionId = null;  // 上次渲染的会话 id（判断是否切换会话）
 
 function loadPdfViewer() {
@@ -933,48 +940,34 @@ function loadPdfViewer() {
   });
 }
 
-function setNoteMode(mode) {
-  noteMode = mode;
-  const isPdf = mode === "pdf";
-  const noteBtn = $("note-mode-note"), pdfBtn = $("note-mode-pdf");
-  if (noteBtn) noteBtn.classList.toggle("active", !isPdf);
-  if (pdfBtn) pdfBtn.classList.toggle("active", isPdf);
-  noteFrame.classList.toggle("hidden", isPdf || !(lastState && lastState.has_note));
-  $("pdf-view").classList.toggle("hidden", !isPdf);
-  if (isPdf) {
-    loadPdfViewer()
-      .then(() => window.phPdf && window.phPdf.open())
-      .catch((e) => appendConsole("❌ " + e, "err"));
-  } else if (window.phPdf) {
-    window.phPdf.close();
-  }
-}
-
-/// 顶栏状态刷新时同步阅读模式入口：无 PDF 隐藏切换栏，PDF 变化时重置阅读器。
+/// 顶栏状态刷新时同步「原文」标签：无 PDF 隐藏标签，PDF（或会话）变化时重置阅读器。
 function renderPdfMode(st) {
-  const bar = $("note-mode-bar");
-  if (!bar) return;
+  const tab = $("tab-pdf");
   const sid = (st && st.session_id) || null;
   const switched = sid !== lastPdfSessionId;
   lastPdfSessionId = sid;
   const info = (st && st.pdf) || {};
   const avail = !!info.available;
-  bar.classList.toggle("hidden", !avail);
-  $("pdf-mode-name").textContent = avail && info.name ? info.name : "";
+  const nameEl = $("pdf-mode-name");
+  if (nameEl) nameEl.textContent = avail && info.name ? info.name : "";
+  if (tab) tab.classList.toggle("hidden", !avail);
   if (!avail) {
-    if (noteMode === "pdf") setNoteMode("note");
-    pdfLoadedName = null;
+    pdfLoadedKey = null;
+    if (currentTab === "pdf") switchTab("note");
     return;
   }
-  const name = info.name || "";
-  if (pdfLoadedName === null) { pdfLoadedName = name; }
-  else if (pdfLoadedName !== name) {
-    pdfLoadedName = name;
+  const key = sid + "|" + (info.name || "");
+  if (pdfLoadedKey !== key) {
+    pdfLoadedKey = key;
     if (window.phPdf) window.phPdf.reset();
-    if (noteMode === "pdf" && window.phPdf) window.phPdf.open();
+    if (currentTab === "pdf") {
+      loadPdfViewer()
+        .then(() => window.phPdf && window.phPdf.open(pdfLoadedKey))
+        .catch((e) => appendConsole("❌ " + e, "err"));
+    }
   }
-  // 仅阅读会话：切换进来时默认进「原文」（用户手动切回笔记后不再强行改回）
-  if (switched && st.read_only) setNoteMode("pdf");
+  // 仅阅读会话：切换进来时默认进「原文」（用户手动切回后不再强行改回）
+  if (switched && st.read_only) switchTab("pdf");
 }
 
 function renderModel(st) {
@@ -3693,7 +3686,7 @@ async function importFile(file) {
       importRun = null;
     }
     // 仅阅读导入后默认切到「原文」视图，直接开始阅读
-    if (isRead) setNoteMode("pdf");
+    if (isRead) switchTab("pdf");
   } catch (e) {
     noteGenLog("❌ 导入失败: " + e.message, "err");
     appendConsole("❌ 导入失败: " + e.message, "err");
@@ -4742,10 +4735,6 @@ function setupSidebar() {
 document.addEventListener("DOMContentLoaded", () => {
   setupSidebar();
   setupAnnDrag();
-
-  // 笔记 / 原文（PDF）阅读模式切换
-  $("note-mode-note").onclick = () => setNoteMode("note");
-  $("note-mode-pdf").onclick = () => setNoteMode("pdf");
 
   // 中止：进度条旁的停止按钮 / 批注弹窗停止按钮（等同 Ctrl-C）
   $("btn-stop").onclick = stopCurrent;

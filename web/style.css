@@ -212,6 +212,7 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: #333;
 }
 #pane-note { position: relative; flex-direction: column; }
+#pane-pdf { flex-direction: column; }
 /* 笔记 / 原文 阅读模式切换栏（仅当前会话有 PDF 时显示） */
 .note-mode {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
@@ -227,9 +228,8 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .pdf-mode-name { margin-left: 6px; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PDF 阅读器 */
 .pdf-view { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #525659; }
-.pdf-view.hidden { display: none; }
 .pdf-toolbar {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   padding: 6px 10px; background: #fafafa; border-bottom: 1px solid var(--line);
 }
 .pdf-toolbar .mini { padding: 3px 9px; }
@@ -239,19 +239,30 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 }
 .pdf-page-total { font-size: 13px; color: var(--muted); }
 .pdf-sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
-.pdf-zoom { font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.pdf-zoom-range { width: 120px; accent-color: var(--blue); cursor: pointer; }
+.pdf-zoom-label { font-size: 12.5px; color: var(--muted); min-width: 68px; text-align: center; }
 .pdf-spacer { flex: 1; }
 .pdf-status { font-size: 12.5px; color: var(--muted); }
-.pdf-toc {
-  flex: 0 0 auto; max-height: 38%; overflow-y: auto; background: #fff;
-  border-bottom: 1px solid var(--line); padding: 6px 10px;
+/* 正文区：左侧目录栏 + 页面滚动区 */
+.pdf-body { flex: 1; min-height: 0; display: flex; }
+.pdf-toc-side {
+  flex: 0 0 var(--pdf-toc-w, 220px); width: var(--pdf-toc-w, 220px); box-sizing: border-box;
+  overflow-y: auto; background: #fff; border-right: 1px solid var(--line); padding: 6px 4px;
 }
-.pdf-toc.hidden { display: none; }
-.pdf-toc-item { display: block; width: 100%; text-align: left; font-size: 13px; color: #333; background: none; border: none; padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+/* 目录宽度拖拽条（可伸缩） */
+.pdf-toc-resizer {
+  flex: 0 0 4px; width: 4px; cursor: col-resize; touch-action: none;
+  margin-left: -2px; background: transparent; z-index: 5;
+}
+.pdf-toc-resizer:hover, .pdf-toc-resizer.dragging { background: var(--blue); }
+.pdf-toc { display: flex; flex-direction: column; }
+.pdf-toc-empty { font-size: 12.5px; color: var(--muted); padding: 8px 6px; line-height: 1.7; }
+.pdf-toc-item { display: block; width: 100%; text-align: left; font-size: 13px; color: #333; background: none; border: none; padding: 4px 6px; border-radius: 4px; cursor: pointer; white-space: normal; }
 .pdf-toc-item:hover { background: #eef2f8; }
 .pdf-pages { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 0; text-align: center; }
 /* 单页容器：canvas + 透明文本层叠放 */
 .pdf-page { position: relative; margin: 0 auto 16px; background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.35); }
+.pdf-page.current { outline: 2px solid #2f6fed; outline-offset: 3px; }
 .pdf-page canvas { display: block; }
 .pdf-text-layer {
   position: absolute; inset: 0; overflow: hidden; line-height: 1;
@@ -869,3 +880,6 @@ ul.outline li.para { color: #888; font-size: 12px; }
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;
 }
+
+/* 通用兜底：任何带 .hidden 的元素都必须隐藏（历史上缺少逐元素规则导致按钮/字段漏隐） */
+.hidden { display: none !important; }
