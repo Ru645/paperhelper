@@ -723,11 +723,23 @@ ul.outline li.para { color: #888; font-size: 12px; }
 .graph-node text { font-size: 11px; fill: #334155; pointer-events: none; }
 .graph-node.dim { opacity: 0.22; }
 .graph-node.sel circle { fill: #1d4ed8; stroke: #1e3a8a; stroke-width: 1.5; }
-.graph-info { margin-top: 8px; font-size: 12.5px; line-height: 1.5; }
-.graph-info b { color: #1e293b; }
-.graph-def { color: #475569; margin: 2px 0 4px; }
-.graph-info ul { margin: 4px 0 0 16px; }
-.graph-info em { color: var(--blue); font-style: normal; }
+#pane-graph { flex-direction: column; padding: 14px 18px; overflow-y: auto; }
+.graph-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.graph-title { font-weight: 600; font-size: 14px; }
+.graph-actions { display: flex; gap: 6px; margin-left: auto; }
+.graph-popup {
+  position: fixed; z-index: 66; max-width: 340px;
+  background: #fff; border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.22); padding: 10px 12px;
+  font-size: 12.5px; line-height: 1.5;
+}
+.graph-popup.hidden { display: none; }
+.gp-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.gp-head b { color: #1e293b; }
+.gp-spacer { flex: 1; }
+.gp-def { color: #475569; margin: 2px 0 4px; }
+.graph-popup ul { margin: 4px 0 0 16px; }
+.graph-popup em { color: var(--blue); font-style: normal; }
 
 /* ===== 帮助 ===== */
 .help-list { margin: 8px 0 0 18px; }

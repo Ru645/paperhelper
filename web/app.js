@@ -377,6 +377,8 @@ function showBusyHint(text) {
 function switchTab(key) {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.key === key));
   document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.dataset.key === key));
+  if (key === "graph") { if (graphCache) renderGraph(graphCache); }
+  else hideGraphPopup();
 }
 
 function addDynamicTab(key, title, pane) {
@@ -689,6 +691,7 @@ let graphCache = null;
 let graphPos = {};        // name -> {x,y}，跨刷新保持布局稳定
 let graphLayoutKey = "";  // 节点集合变化时重算布局
 let graphSelected = null;
+let graphAnchor = null;   // {x,y} 客户端坐标：节点弹窗定位锚点
 
 async function refreshGraph() {
   try {
@@ -759,13 +762,12 @@ function renderGraph(data) {
   box.innerHTML = "";
   if (!nodes.length) {
     box.innerHTML = '<p class="muted">（还没有概念）</p>';
-    const info = $("graph-info");
-    if (info) info.textContent = "";
+    hideGraphPopup();
     return;
   }
-  const W = Math.max(240, box.clientWidth || 280);
-  const H = 420;
-  const key = nodes.map((n) => n.name).join("|");
+  const W = Math.max(320, box.clientWidth || 480);
+  const H = Math.max(360, Math.min(640, (window.innerHeight || 900) - 240));
+  const key = `${W}x${H}|` + nodes.map((n) => n.name).join("|");
   if (key !== graphLayoutKey) {
     graphLayoutKey = key;
     graphPos = graphLayout(nodes, edges, W, H, graphPos);
@@ -776,9 +778,6 @@ function renderGraph(data) {
   svg.setAttribute("width", "100%");
   svg.setAttribute("height", H);
   svg.setAttribute("class", "graph-svg");
-  const defs = document.createElementNS(NS, "defs");
-  defs.innerHTML = '<marker id="g-arrow" viewBox="0 0 10 10" refX="18" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>';
-  svg.appendChild(defs);
 
   const neighbors = new Set();
   if (graphSelected) {
@@ -787,7 +786,6 @@ function renderGraph(data) {
       if (e.to === graphSelected) neighbors.add(e.from);
     });
   }
-  const directed = (k) => ["前置", "包含", "应用"].includes(k);
   edges.forEach((e) => {
     const a = graphPos[e.from], b = graphPos[e.to];
     if (!a || !b) return;
@@ -796,7 +794,6 @@ function renderGraph(data) {
     line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
     line.setAttribute("stroke", e.kind === "对比" ? "#f59e0b" : e.kind === "相关" ? "#94a3b8" : "#3b82f6");
     line.setAttribute("stroke-width", graphSelected && (e.from === graphSelected || e.to === graphSelected) ? "2" : "1.2");
-    if (directed(e.kind)) line.setAttribute("marker-end", "url(#g-arrow)");
     const t = document.createElementNS(NS, "title");
     t.textContent = `${e.from} ${e.kind} ${e.to}${e.note ? "：" + e.note : ""}`;
     line.appendChild(t);
@@ -819,33 +816,66 @@ function renderGraph(data) {
     g.appendChild(c); g.appendChild(label);
     g.onclick = (ev) => {
       ev.stopPropagation();
-      graphSelected = graphSelected === nd.name ? null : nd.name;
+      if (graphSelected === nd.name) {
+        graphSelected = null;
+        graphAnchor = null;
+      } else {
+        graphSelected = nd.name;
+        graphAnchor = { x: ev.clientX, y: ev.clientY };
+      }
       renderGraph(graphCache);
     };
     svg.appendChild(g);
   });
   box.appendChild(svg);
-  showGraphInfo(data, graphSelected);
+  showGraphInfo(data, graphSelected, graphAnchor);
 }
 
-function showGraphInfo(data, name) {
-  const info = $("graph-info");
-  if (!info) return;
-  if (!name) {
-    info.innerHTML = '<span class="muted">点击节点查看定义与关联。</span>';
-    return;
-  }
+/// 隐藏节点详情弹窗。
+function hideGraphPopup() {
+  const pop = $("graph-popup");
+  if (pop) { pop.classList.add("hidden"); pop.innerHTML = ""; }
+}
+
+/// 节点详情弹窗：定义 + 关联 + 「回看来源」（打开概念详情页）。
+function showGraphInfo(data, name, anchor) {
+  const pop = $("graph-popup");
+  if (!pop) return;
+  const pane = $("pane-graph");
+  if (!name || !pane || !pane.classList.contains("active")) { hideGraphPopup(); return; }
   const nd = (data.nodes || []).find((n) => n.name === name) || { name };
   const rels = (data.edges || []).filter((e) => e.from === name || e.to === name);
-  let html = `<b>${esc(nd.name)}</b>`;
+  let html = '<div class="gp-head"><b class="gp-name">' + esc(nd.name) + "</b>";
   if (nd.paper) html += ` <span class="muted">（${esc(nd.paper)}）</span>`;
-  if (nd.definition) html += `<div class="graph-def">${esc(nd.definition)}</div>`;
+  html += '<span class="gp-spacer"></span>';
+  html += '<button class="mini ghost gp-open" title="打开概念详情页（出处与当时的问答）">回看来源</button>';
+  html += '<button class="mini ghost gp-close" title="关闭">×</button></div>';
+  if (nd.definition) html += `<div class="gp-def">${esc(nd.definition)}</div>`;
   if (rels.length) {
     html += "<ul>" + rels.map((e) =>
       `<li>${esc(e.from)} <em>${esc(e.kind)}</em> ${esc(e.to)}${e.note ? "：" + esc(e.note) : ""}</li>`
     ).join("") + "</ul>";
   }
-  info.innerHTML = html;
+  pop.innerHTML = html;
+  pop.querySelector(".gp-open").onclick = () => openConceptTab(nd.name);
+  pop.querySelector(".gp-close").onclick = () => {
+    graphSelected = null;
+    graphAnchor = null;
+    renderGraph(graphCache);
+  };
+  pop.classList.remove("hidden");
+  const rect = pop.getBoundingClientRect();
+  const a = anchor || graphAnchor;
+  let x, y;
+  if (a) { x = a.x + 12; y = a.y + 12; }
+  else {
+    const b = $("graph-view").getBoundingClientRect();
+    x = b.left + 16; y = b.top + 16;
+  }
+  x = Math.max(8, Math.min(x, window.innerWidth - rect.width - 12));
+  y = Math.max(8, Math.min(y, window.innerHeight - rect.height - 12));
+  pop.style.left = x + "px";
+  pop.style.top = y + "px";
 }
 
 /// 无笔记时隐藏 iframe，显示居中的导入入口（导入只在新笔记时需要）。

@@ -35,7 +35,6 @@
     <button class="act" data-panel="sessions" title="会话历史" aria-label="会话历史">⟳</button>
     <button class="act" data-panel="papers" title="已读论文" aria-label="已读论文">▤</button>
     <button class="act" data-panel="concepts" title="已学概念" aria-label="已学概念">◈</button>
-    <button class="act" data-panel="graph" title="知识图谱" aria-label="知识图谱">⬡</button>
   </nav>
   <aside id="sidebar">
     <div id="sidebar-panels">
@@ -62,18 +61,6 @@
         <h3>已学概念 <span class="sel-count" id="sel-count-concepts"></span></h3>
         <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
       </section>
-      <section data-panel="graph">
-        <h3>
-          <span>知识图谱 <span class="sel-count" id="sel-count-graph"></span></span>
-          <span class="tree-actions">
-            <button id="btn-graph-update" class="mini ghost" title="用 LLM 判断新概念与已有概念的关系（只处理新概念）" disabled>更新关系</button>
-            <button id="btn-graph-rebuild" class="mini ghost" title="清空并重建全部概念关系" disabled>重建</button>
-          </span>
-        </h3>
-        <p class="conv-hint muted">由 LLM 判断概念间关系；点节点看定义与关联，新增概念后点「更新关系」。</p>
-        <div id="graph-view" class="graph-view"><p class="muted">（还没有概念）</p></div>
-        <div id="graph-info" class="graph-info muted"><span class="muted">点击节点查看定义与关联。</span></div>
-      </section>
     </div>
     <section id="sidebar-usage">
       <h3>用量</h3>
@@ -85,6 +72,7 @@
   <main id="main">
     <div class="tabs" id="tabs">
       <button class="tab active" data-key="note">笔记</button>
+      <button class="tab" data-key="graph">知识图谱</button>
       <button class="tab" data-key="console">控制台</button>
       <span class="spacer" id="tab-spacer"></span>
       <span id="progress" class="progress hidden"></span>
@@ -146,6 +134,18 @@
       </div>
       <div id="pane-console" class="pane" data-key="console">
         <pre id="console"></pre>
+      </div>
+      <div id="pane-graph" class="pane" data-key="graph">
+        <div class="graph-head">
+          <span class="graph-title">知识图谱 <span class="sel-count" id="sel-count-graph"></span></span>
+          <span class="graph-actions">
+            <button id="btn-graph-update" class="mini ghost" title="用 LLM 判断新概念与已有概念的关系（只处理新概念）" disabled>更新关系</button>
+            <button id="btn-graph-rebuild" class="mini ghost" title="清空并重建全部概念关系" disabled>重建</button>
+          </span>
+        </div>
+        <p class="conv-hint muted">由 LLM 判断概念间关系；点节点看定义与关联，新增概念后点「更新关系」。</p>
+        <div id="graph-view" class="graph-view"><p class="muted">（还没有概念）</p></div>
+        <div id="graph-popup" class="graph-popup hidden"></div>
       </div>
     </div>
   </main>
