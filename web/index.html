@@ -35,6 +35,7 @@
     <button class="act" data-panel="sessions" title="会话历史" aria-label="会话历史">⟳</button>
     <button class="act" data-panel="papers" title="已读论文" aria-label="已读论文">▤</button>
     <button class="act" data-panel="concepts" title="已学概念" aria-label="已学概念">◈</button>
+    <button class="act" data-panel="conversation" title="对话树" aria-label="对话树">⎇</button>
   </nav>
   <aside id="sidebar">
     <div id="sidebar-panels">
@@ -60,6 +61,11 @@
       <section data-panel="concepts">
         <h3>已学概念 <span class="sel-count" id="sel-count-concepts"></span></h3>
         <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
+      </section>
+      <section data-panel="conversation">
+        <h3>对话树 <span class="sel-count" id="sel-count-conv"></span></h3>
+        <p class="conv-hint muted">点击节点切换上下文：之后的提问会基于该分支。</p>
+        <div id="conv-tree" class="conv-tree"><p class="muted">（还没有对话）</p></div>
       </section>
     </div>
     <section id="sidebar-usage">
@@ -160,6 +166,7 @@
     <span class="ann-quote" id="ann-quote"></span>
     <span class="ann-spacer"></span>
     <span class="ann-progress" id="ann-progress"></span>
+    <button id="ann-tree" class="mini ghost" title="查看整会话对话树，点击节点切换上下文">对话树</button>
     <button id="ann-stop" class="mini ghost hidden" title="中止当前提问">停止</button>
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>

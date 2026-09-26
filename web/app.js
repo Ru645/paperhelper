@@ -609,8 +609,72 @@ async function refreshState() {
   }
   await refreshSessions();
   await refreshAnnotations();
+  await refreshConversation();
   renderOutline(lastState);
   applyHighlights();
+}
+
+// ===== 对话树面板（整会话，点击节点 goto 切上下文） =====
+async function refreshConversation() {
+  try {
+    const res = await fetch("/api/conversation");
+    if (!res.ok) return;
+    renderConversation(await res.json());
+  } catch (e) {
+    /* 面板刷新失败不影响主流程 */
+  }
+}
+
+function renderConversation(data) {
+  const box = $("conv-tree");
+  if (!box) return;
+  const roots = (data && data.roots) || [];
+  const count = $("sel-count-conv");
+  if (count) count.textContent = data && data.count ? data.count : "";
+  box.innerHTML = "";
+  if (!roots.length) {
+    box.innerHTML = '<p class="muted">（还没有对话）</p>';
+    return;
+  }
+  const current = data.current;
+  const add = (node, depth, container) => {
+    if (!node) return;
+    const row = document.createElement("div");
+    row.className = "conv-row"
+      + (node.is_check ? " check" : "")
+      + (node.collapsed ? " collapsed" : "")
+      + (node.node_id === current ? " current" : "");
+    row.style.paddingLeft = 6 + depth * 12 + "px";
+    row.title = node.question || "";
+    const num = document.createElement("span");
+    num.className = "conv-num";
+    num.textContent = node.n;
+    const text = document.createElement("span");
+    text.className = "conv-q";
+    text.textContent = (node.is_check ? "[核对] " : "") + (node.summary || node.question || "");
+    row.appendChild(num);
+    row.appendChild(text);
+    row.onclick = async () => {
+      await runCommand("goto " + node.n, { skipReload: true });
+      refreshConversation();
+    };
+    container.appendChild(row);
+    (node.children || []).forEach((c) => add(c, depth + 1, container));
+  };
+  roots.forEach((r) => add(r, 0, box));
+}
+
+/// 程序化打开侧栏面板（供弹窗「对话树」按钮调用）。
+function activatePanel(name) {
+  const sidebar = $("sidebar");
+  if (sidebar) sidebar.classList.remove("collapsed");
+  document.querySelectorAll("#activitybar .act").forEach((b) => {
+    b.classList.toggle("active", b.dataset.panel === name);
+  });
+  document.querySelectorAll("#sidebar-panels section[data-panel]").forEach((p) => {
+    p.classList.toggle("active", p.dataset.panel === name);
+  });
+  try { localStorage.setItem(PANEL_KEY, name); } catch (e) { /* 忽略 */ }
 }
 
 /// 无笔记时隐藏 iframe，显示居中的导入入口（导入只在新笔记时需要）。
@@ -4326,6 +4390,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   }
   $("ann-subquote-clear").onclick = () => clearAnnSubquote();
+  $("ann-tree").onclick = () => { activatePanel("conversation"); refreshConversation(); };
   $("ann-send").onclick = sendAnnotation;
   $("ann-attach").onclick = () => $("ann-file").click();
   $("ann-file").onchange = () => onAnnFiles($("ann-file").files);

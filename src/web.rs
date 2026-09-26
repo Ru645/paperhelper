@@ -101,6 +101,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/annotate/reply", post(api_annotate_reply))
         .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
+        .route("/api/conversation", get(api_conversation))
         .route(
             "/api/upload",
             post(api_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
@@ -2540,12 +2541,46 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
     Json(json!({ "annotations": list }))
 }
 
+/// 整会话对话树：所有根节点的嵌套子树 + 当前节点，供「对话树」面板点击 `goto` 切上下文。
+async fn api_conversation(State(app): State<SharedApp>) -> Json<serde_json::Value> {
+    let a = app.lock().await;
+    let conv = &a.session.conversation;
+    let summary_map = a
+        .session
+        .notes
+        .as_ref()
+        .map(|n| n.summary_map())
+        .unwrap_or_default();
+    let roots: Vec<serde_json::Value> = conv
+        .nodes
+        .iter()
+        .filter(|n| n.parent.is_none())
+        .map(|n| build_thread_opts(conv, &n.id, &summary_map, false))
+        .collect();
+    Json(json!({
+        "roots": roots,
+        "current": conv.current,
+        "current_label": conv.current_label(),
+        "count": conv.nodes.len(),
+    }))
+}
+
 /// 把以 `root` 为根的会话子树渲染成嵌套 JSON（`n` 为全局 DFS 编号，供 goto）。
 /// `summary_map` 提供解释 id → (summary, collapsed)，用于把被 sum 的节点标成总结节点。
 fn build_thread(
     conv: &crate::conversation::Conversation,
     root: &str,
     summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+) -> serde_json::Value {
+    build_thread_opts(conv, root, summary_map, true)
+}
+
+/// 同 `build_thread`，但可控制是否带完整回答（「对话树」面板只需问题/总结，省流量）。
+fn build_thread_opts(
+    conv: &crate::conversation::Conversation,
+    root: &str,
+    summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+    include_answer: bool,
 ) -> serde_json::Value {
     use std::collections::HashMap;
     let order = conv.dfs_order();
@@ -2559,6 +2594,7 @@ fn build_thread(
         id: &str,
         num_of: &std::collections::HashMap<&str, usize>,
         summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+        include_answer: bool,
     ) -> serde_json::Value {
         let Some(n) = conv.nodes.iter().find(|x| x.id == id) else {
             return serde_json::Value::Null;
@@ -2567,7 +2603,7 @@ fn build_thread(
             .nodes
             .iter()
             .filter(|x| x.parent.as_deref() == Some(id))
-            .map(|c| build(conv, &c.id, num_of, summary_map))
+            .map(|c| build(conv, &c.id, num_of, summary_map, include_answer))
             .collect();
         let (summary, collapsed) = n
             .explanation_id
@@ -2580,14 +2616,14 @@ fn build_thread(
             "node_id": n.id,
             "question": n.question,
             "quote": n.quote,
-            "answer": n.answer,
+            "answer": if include_answer { n.answer.clone() } else { String::new() },
             "is_check": n.explanation_id.is_none(),
             "summary": summary,
             "collapsed": collapsed,
             "children": children,
         })
     }
-    build(conv, root, &num_of, summary_map)
+    build(conv, root, &num_of, summary_map, include_answer)
 }
 
 // ===== 文件上传（Web 端导入论文文件） =====
@@ -2798,6 +2834,43 @@ mod tests {
         // 文本总量超限
         let big = vec![att("b", "text", &"x".repeat(MAX_ATTACH_TEXT_CHARS + 1))];
         assert!(parse_attachments(big).is_err());
+    }
+
+    /// 对话树渲染：层级正确、`n` 为全局 DFS 编号；面板模式不带完整回答。
+    #[test]
+    fn build_thread_hierarchy_and_answer_omission() {
+        let node = |id: &str, parent: Option<&str>, q: &str| crate::conversation::ConvNode {
+            id: id.to_string(),
+            parent: parent.map(|p| p.to_string()),
+            question: q.to_string(),
+            quote: None,
+            answer: format!("答{q}"),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            label: format!("[{q}]"),
+        };
+        let mut conv = crate::conversation::Conversation::default();
+        conv.nodes.push(node("r1", None, "一"));
+        conv.nodes.push(node("c1", Some("r1"), "二"));
+        conv.nodes.push(node("g1", Some("c1"), "三"));
+        conv.nodes.push(node("r2", None, "四"));
+        conv.current = Some("c1".to_string());
+
+        let map = std::collections::HashMap::new();
+        let full = build_thread(&conv, "r1", &map);
+        assert_eq!(full["children"][0]["children"][0]["n"], 3);
+        assert_eq!(full["children"][0]["children"][0]["answer"], "答三");
+
+        let lean = build_thread_opts(&conv, "r1", &map, false);
+        assert_eq!(lean["children"][0]["children"][0]["answer"], "");
+        assert_eq!(lean["question"], "一");
+        // 编号全局唯一：r2 应是第 4 个
+        let full2 = build_thread(&conv, "r2", &map);
+        assert_eq!(full2["n"], 4);
     }
 
     /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。
