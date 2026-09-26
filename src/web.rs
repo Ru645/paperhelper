@@ -678,7 +678,7 @@ async fn api_run(
         }
         let mutating = matches!(
             first.as_str(),
-            "ingest" | "pdf" | "del" | "rm" | "undo" | "new" | "load"
+            "ingest" | "pdf" | "del" | "rm" | "undo"
         );
         let result = guard.run_command(&command).await;
         if result.is_ok() && mutating {
@@ -1343,6 +1343,7 @@ async fn api_note_edit(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut a = app.lock().await;
     a.edit_block(&req.block_id, &req.text).map_err(note_err)?;
+    let _ = a.auto_persist();
     logging::info(format!("编辑笔记块 {}", req.block_id));
     Ok(Json(json!({ "ok": true })))
 }
@@ -1354,6 +1355,7 @@ async fn api_note_rewrite(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut a = app.lock().await;
     a.rewrite_block(&req.block_id, &req.text).map_err(note_err)?;
+    let _ = a.auto_persist();
     logging::info(format!("重写笔记块 {}", req.block_id));
     Ok(Json(json!({ "ok": true })))
 }
@@ -1371,6 +1373,7 @@ async fn api_note_add(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut a = app.lock().await;
     a.insert_after(&req.after_block_id, &req.text).map_err(note_err)?;
+    let _ = a.auto_persist();
     logging::info(format!("在 {} 后插入笔记内容", req.after_block_id));
     Ok(Json(json!({ "ok": true })))
 }
@@ -1387,6 +1390,7 @@ async fn api_note_delete(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut a = app.lock().await;
     let n = a.remove_note_block(&req.block_id).map_err(note_err)?;
+    let _ = a.auto_persist();
     logging::info(format!("删除笔记块 {}（含子树共 {n} 块）", req.block_id));
     Ok(Json(json!({ "ok": true, "removed_blocks": n })))
 }
@@ -1756,8 +1760,9 @@ async fn api_session_load(
     let loaded = session::Session::load(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let mut a = app.lock().await;
-    // 切换前先落盘当前会话：在途 LLM 任务稍后会把结果写回它（见 App::with_session）
-    if let Err(e) = a.auto_persist() {
+    // 切换前先落盘当前会话：在途 LLM 任务稍后会把结果写回它（见 App::with_session）。
+    // 纯浏览不改写 updated_at，避免会话仅因被点开就跳到列表最前。
+    if let Err(e) = a.auto_persist_keep_time() {
         crate::logging::warn(format!("切换会话前保存失败: {e:#}"));
     }
     a.session = loaded;
@@ -1820,7 +1825,8 @@ async fn api_session_rename(
     let mut sess = session::Session::load(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     sess.session_name = req.name.trim().to_string();
-    sess.save(&path)
+    // 改名属元数据修改，不改写 updated_at，避免影响会话列表排序
+    sess.save_preserving_time(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // 若改的是当前会话，同步内存中的名字
     let mut a = app.lock().await;

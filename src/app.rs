@@ -758,8 +758,17 @@ impl App {
                     if matches!(line, "exit" | "quit") {
                         break;
                     }
+                    let (cmd, _) = split_cmd(line);
                     if let Err(e) = self.run_command(line).await {
                         outerr!(self, "{} {e:#}", "❌".red());
+                    } else if matches!(
+                        cmd,
+                        "ingest" | "pdf" | "ask" | "q" | "sum" | "del" | "rm" | "undo"
+                    ) {
+                        // 内容变更命令：立即落盘并刷新 updated_at（退出时不再代刷）
+                        if let Err(e) = self.auto_persist() {
+                            crate::logging::warn(format!("命令后保存会话失败: {e:#}"));
+                        }
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -804,7 +813,8 @@ impl App {
         }
         self.session.export_path = self.export_path.clone();
         let path = crate::paths::session_path(&self.session.session_id);
-        self.session.save(&path)?;
+        // 退出/手动保存不改变「最后一次内容修改」时间（内容变更已即时落盘）
+        self.session.save_preserving_time(&path)?;
         outln!(self, "{} 会话已保存：{}", "✓".green().bold(), self.session.session_name);
         outln!(self, "  恢复会话，请执行：paperhelper -s {}", self.session.session_id);
         Ok(())
@@ -813,6 +823,16 @@ impl App {
     /// Web 端自动保存会话（**不调用 LLM 取名**，用笔记标题兜底），
     /// 让新导入的会话立即出现在会话列表里，切换/新建都不会丢。
     pub fn auto_persist(&mut self) -> Result<()> {
+        self.auto_persist_impl(true)
+    }
+
+    /// 非内容变更的自动保存（切换会话 / 退出 / 改名等）：落盘但不改写
+    /// `updated_at`，会话列表仍按「最后一次内容修改」排序。
+    pub fn auto_persist_keep_time(&mut self) -> Result<()> {
+        self.auto_persist_impl(false)
+    }
+
+    fn auto_persist_impl(&mut self, touch: bool) -> Result<()> {
         if self.session.notes.is_none() && self.session.conversation.nodes.is_empty() {
             return Ok(());
         }
@@ -835,7 +855,11 @@ impl App {
         self.session.export_path = self.export_path.clone();
         crate::paths::ensure_sessions_dir()?;
         let path = crate::paths::session_path(&self.session.session_id);
-        self.session.save(&path)?;
+        if touch {
+            self.session.save(&path)?;
+        } else {
+            self.session.save_preserving_time(&path)?;
+        }
         Ok(())
     }
 
@@ -905,8 +929,9 @@ impl App {
             "graph" => self.cmd_graph(rest).await,
             "styles" => self.cmd_styles(rest).await,
             "new" => {
-                // 先保存当前会话：在途 LLM 任务稍后仍能写回它（写回不需要它是当前会话）
-                if let Err(e) = self.auto_persist() {
+                // 先保存当前会话：在途 LLM 任务稍后仍能写回它（写回不需要它是当前会话）。
+                // 新建会话属切换操作，不改写 updated_at，避免影响会话列表排序。
+                if let Err(e) = self.auto_persist_keep_time() {
                     crate::logging::warn(format!("新建会话前保存失败: {e:#}"));
                 }
                 if self.session.session_id.is_empty() {
@@ -1865,7 +1890,7 @@ PaperHelper 命令：
             let path = crate::paths::session_path(&job.session);
             if let Ok(mut sess) = Session::load(&path) {
                 sess.conversation.current = job.restore_current.clone();
-                let _ = sess.save(&path);
+                let _ = sess.save_preserving_time(&path);
             }
             return;
         }

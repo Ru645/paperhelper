@@ -165,6 +165,23 @@ impl Session {
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.touch();
+        self.write(path)
+    }
+
+    /// 非内容变更的落盘（切走 / 退出 / 改名等）：不改写已有的 `updated_at`，
+    /// 让会话列表仍按「最后一次内容修改」排序；仅当字段为空（新会话）时补时间。
+    pub fn save_preserving_time(&mut self, path: &Path) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        if self.created_at.is_empty() {
+            self.created_at = now.clone();
+        }
+        if self.updated_at.is_empty() {
+            self.updated_at = now;
+        }
+        self.write(path)
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
         let s = serde_json::to_string_pretty(self)?;
         fs::write(path, s)?;
         Ok(())
@@ -489,6 +506,40 @@ mod tests {
         assert_eq!(loaded.conversation.nodes.len(), 1);
         assert_eq!(loaded.stats.calls, 1);
         assert_eq!(loaded.conversation.current.as_deref(), Some("n1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 非内容落盘（切换 / 退出 / 改名）不改写 `updated_at`；内容落盘 `save()`
+    /// 与首次落盘仍会写入时间，保证会话列表按内容修改时间排序。
+    #[test]
+    fn save_preserving_time_keeps_updated_at() {
+        let dir = std::env::temp_dir().join("paperhelper_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("preserve_time.json");
+
+        let mut sess = Session {
+            created_at: "2019-01-01T00:00:00Z".into(),
+            updated_at: "2020-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        sess.save_preserving_time(&path).unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(
+            loaded.updated_at, "2020-01-01T00:00:00Z",
+            "非内容落盘不应改写 updated_at"
+        );
+        assert_eq!(loaded.created_at, "2019-01-01T00:00:00Z");
+
+        let mut fresh = Session::default();
+        fresh.save_preserving_time(&path).unwrap();
+        assert!(!fresh.updated_at.is_empty(), "新会话首次落盘应补上时间");
+
+        let mut bump = Session {
+            updated_at: "2020-01-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        bump.save(&path).unwrap();
+        assert_ne!(bump.updated_at, "2020-01-01T00:00:00Z", "save() 应刷新 updated_at");
         let _ = std::fs::remove_file(&path);
     }
 
