@@ -225,6 +225,14 @@ const reasoningBuf = { ann: "", edit: "" };
 // 用户手动折叠后不再被后续流式分片弹开（resetReasoning 时复位）。
 const reasoningAutoOpened = { ann: false, edit: false, "note-gen": false };
 
+/// 用户对每个思考区的折叠偏好（记住上次选择，下次沿用）：默认展开。
+function reasoningPrefOpen(which) {
+  try { return localStorage.getItem("ph.reasoning.open." + which) !== "0"; } catch (e) { return true; }
+}
+function setReasoningPrefOpen(which, open) {
+  try { localStorage.setItem("ph.reasoning.open." + which, open ? "1" : "0"); } catch (e) { /* 忽略 */ }
+}
+
 /// 追加一段思考流（截断保留末尾，避免无限增长），并展开折叠区。
 function appendReasoning(which, text) {
   const box = $(which + "-reasoning");
@@ -234,7 +242,7 @@ function appendReasoning(which, text) {
   el.textContent = reasoningBuf[which];
   box.classList.remove("hidden");
   if (!reasoningAutoOpened[which]) {
-    box.open = true;
+    box.open = reasoningPrefOpen(which);
     reasoningAutoOpened[which] = true;
   }
   if (box.open) el.scrollTop = el.scrollHeight;
@@ -298,7 +306,7 @@ function resetReasoning(which) {
   reasoningBuf[which] = "";
   reasoningAutoOpened[which] = false;
   if (el) el.textContent = "";
-  if (box) { box.classList.add("hidden"); box.open = true; }
+  if (box) { box.classList.add("hidden"); box.open = reasoningPrefOpen(which); }
 }
 
 /// 弹窗右上角的进度文案 + 计时（后端 progress 事件会更新 base，计时器每秒刷新）。
@@ -2208,6 +2216,15 @@ function setupReasoningResize() {
         },
       });
     });
+  });
+}
+
+/// 记住每个思考区的折叠 / 展开选择，下次提问沿用（见 reasoningPrefOpen）。
+function setupReasoningPref() {
+  document.querySelectorAll("details.reasoning").forEach((box) => {
+    const which = box.id.replace(/-reasoning$/, "");
+    if (!which || which === box.id) return;
+    box.addEventListener("toggle", () => setReasoningPrefOpen(which, box.open));
   });
 }
 
@@ -4656,6 +4673,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupAnnInputResize();
   setupAnnResize();
   setupReasoningResize();
+  setupReasoningPref();
   applyAnnSide();
   $("btn-config").onclick = () => openConfig("model");
   $("btn-settings-close").onclick = () => $("config-modal").classList.add("hidden");
