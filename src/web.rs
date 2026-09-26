@@ -102,6 +102,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
         .route("/api/conversation", get(api_conversation))
+        .route("/api/thread", get(api_thread))
         .route("/api/graph", get(api_graph))
         .route(
             "/api/upload",
@@ -2627,6 +2628,38 @@ async fn api_conversation(State(app): State<SharedApp>) -> Json<serde_json::Valu
     }))
 }
 
+#[derive(Deserialize)]
+struct ThreadQuery {
+    root: String,
+}
+
+/// 以某对话节点为根的完整子树（带回答），供批注弹窗内的对话树点击后载入。
+async fn api_thread(
+    State(app): State<SharedApp>,
+    Query(q): Query<ThreadQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let a = app.lock().await;
+    let payload = thread_payload(&a.session.conversation, a.session.notes.as_ref(), &q.root)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "对话节点不存在".to_string()))?;
+    Ok(Json(payload))
+}
+
+/// 组装 `api_thread` 的返回体；根节点不存在时返回 `None`。
+fn thread_payload(
+    conv: &crate::conversation::Conversation,
+    notes: Option<&crate::notes::Note>,
+    root: &str,
+) -> Option<serde_json::Value> {
+    if !conv.nodes.iter().any(|n| n.id == root) {
+        return None;
+    }
+    let summary_map = notes.map(|n| n.summary_map()).unwrap_or_default();
+    Some(json!({
+        "root_node_id": root,
+        "thread": build_thread(conv, root, &summary_map),
+    }))
+}
+
 /// 把以 `root` 为根的会话子树渲染成嵌套 JSON（`n` 为全局 DFS 编号，供 goto）。
 /// `summary_map` 提供解释 id → (summary, collapsed)，用于把被 sum 的节点标成总结节点。
 fn build_thread(
@@ -2932,6 +2965,33 @@ mod tests {
         // 编号全局唯一：r2 应是第 4 个
         let full2 = build_thread(&conv, "r2", &map);
         assert_eq!(full2["n"], 4);
+    }
+
+    /// api_thread 返回体：根存在则给完整回答的子树，根不存在则 None。
+    #[test]
+    fn thread_payload_resolves_root_and_missing() {
+        let node = |id: &str, parent: Option<&str>, q: &str| crate::conversation::ConvNode {
+            id: id.to_string(),
+            parent: parent.map(|p| p.to_string()),
+            question: q.to_string(),
+            quote: None,
+            answer: format!("答{q}"),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            label: q.to_string(),
+        };
+        let mut conv = crate::conversation::Conversation::default();
+        conv.nodes.push(node("r1", None, "一"));
+        conv.nodes.push(node("c1", Some("r1"), "二"));
+        let payload = thread_payload(&conv, None, "r1").unwrap();
+        assert_eq!(payload["root_node_id"], "r1");
+        assert_eq!(payload["thread"]["answer"], "答一");
+        assert_eq!(payload["thread"]["children"][0]["node_id"], "c1");
+        assert!(thread_payload(&conv, None, "不存在").is_none());
     }
 
     /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。

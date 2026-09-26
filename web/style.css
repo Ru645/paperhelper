@@ -485,11 +485,20 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .edit-tools button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 
 .ann-popup {
-  position: fixed; z-index: 65; width: 380px;
+  position: fixed; z-index: 65; width: 560px;
   background: #fff; border: 1px solid var(--line); border-radius: 10px;
   box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column;
 }
 .ann-popup.hidden { display: none; }
+/* 弹窗主体：左侧对话树 + 右侧线程/输入 */
+.ann-body { display: flex; flex: 1; min-height: 0; }
+.ann-side {
+  flex: 0 0 200px; width: 200px; box-sizing: border-box;
+  border-right: 1px solid var(--line); overflow-y: auto; padding: 8px;
+}
+.ann-side.hidden { display: none; }
+.ann-side-head { font-size: 12px; font-weight: 600; color: #444; margin-bottom: 6px; }
+.ann-main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .ann-head {
   display: flex; align-items: center; gap: 8px; padding: 8px 10px;
   border-bottom: 1px solid var(--line);

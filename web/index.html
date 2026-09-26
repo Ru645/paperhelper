@@ -35,7 +35,6 @@
     <button class="act" data-panel="sessions" title="会话历史" aria-label="会话历史">⟳</button>
     <button class="act" data-panel="papers" title="已读论文" aria-label="已读论文">▤</button>
     <button class="act" data-panel="concepts" title="已学概念" aria-label="已学概念">◈</button>
-    <button class="act" data-panel="conversation" title="对话树" aria-label="对话树">⎇</button>
     <button class="act" data-panel="graph" title="知识图谱" aria-label="知识图谱">⬡</button>
   </nav>
   <aside id="sidebar">
@@ -62,11 +61,6 @@
       <section data-panel="concepts">
         <h3>已学概念 <span class="sel-count" id="sel-count-concepts"></span></h3>
         <ul id="concepts" class="plain"><li class="muted">（无）</li></ul>
-      </section>
-      <section data-panel="conversation">
-        <h3>对话树 <span class="sel-count" id="sel-count-conv"></span></h3>
-        <p class="conv-hint muted">点击节点切换上下文：之后的提问会基于该分支。</p>
-        <div id="conv-tree" class="conv-tree"><p class="muted">（还没有对话）</p></div>
       </section>
       <section data-panel="graph">
         <h3>
@@ -179,30 +173,39 @@
     <span class="ann-quote" id="ann-quote"></span>
     <span class="ann-spacer"></span>
     <span class="ann-progress" id="ann-progress"></span>
-    <button id="ann-tree" class="mini ghost" title="查看整会话对话树，点击节点切换上下文">对话树</button>
+    <button id="ann-tree" class="mini ghost" title="显示 / 隐藏整会话对话树，点击节点切换上下文">对话树</button>
     <button id="ann-stop" class="mini ghost hidden" title="中止当前提问">停止</button>
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
   </div>
   <div id="ann-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
-  <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div><div class="reasoning-resize" data-target="ann-reasoning-text" title="拖动调整思考区高度"></div></details>
-  <div class="ann-thread" id="ann-thread"></div>
-  <div id="ann-input-resize" class="ann-input-resize" title="拖动调整输入栏高度"></div>
-  <div class="ann-input">
-    <div id="ann-subquote" class="ann-subquote hidden">
-      <span class="ann-subquote-label">引用</span>
-      <span id="ann-subquote-text" class="ann-subquote-text"></span>
-      <button id="ann-subquote-clear" class="mini ghost" title="不引用这段">×</button>
-    </div>
-    <div id="ann-chips" class="ann-chips hidden"></div>
-    <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
-    <div class="ann-input-row">
-      <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
-        <input type="checkbox" id="ann-record" checked> 记概念
-      </label>
-      <button id="ann-attach" class="mini ghost" title="添加附件（图片 / txt / md / PDF），随本次提问发送，不写入历史">📎 附件</button>
-      <input type="file" id="ann-file" class="hidden" multiple accept="image/*,.txt,.md,.markdown,.pdf" />
-      <span class="ann-input-spacer"></span>
-      <button id="ann-send" class="mini primary">发送</button>
+  <div class="ann-body">
+    <aside id="ann-side" class="ann-side">
+      <div class="ann-side-head">对话树 <span class="sel-count" id="sel-count-conv"></span></div>
+      <p class="conv-hint muted">点击节点切换上下文：之后的提问会基于该分支。</p>
+      <div id="ann-conv-tree" class="conv-tree"><p class="muted">（还没有对话）</p></div>
+    </aside>
+    <div class="ann-main">
+      <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div><div class="reasoning-resize" data-target="ann-reasoning-text" title="拖动调整思考区高度"></div></details>
+      <div class="ann-thread" id="ann-thread"></div>
+      <div id="ann-input-resize" class="ann-input-resize" title="拖动调整输入栏高度"></div>
+      <div class="ann-input">
+        <div id="ann-subquote" class="ann-subquote hidden">
+          <span class="ann-subquote-label">引用</span>
+          <span id="ann-subquote-text" class="ann-subquote-text"></span>
+          <button id="ann-subquote-clear" class="mini ghost" title="不引用这段">×</button>
+        </div>
+        <div id="ann-chips" class="ann-chips hidden"></div>
+        <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
+        <div class="ann-input-row">
+          <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
+            <input type="checkbox" id="ann-record" checked> 记概念
+          </label>
+          <button id="ann-attach" class="mini ghost" title="添加附件（图片 / txt / md / PDF），随本次提问发送，不写入历史">📎 附件</button>
+          <input type="file" id="ann-file" class="hidden" multiple accept="image/*,.txt,.md,.markdown,.pdf" />
+          <span class="ann-input-spacer"></span>
+          <button id="ann-send" class="mini primary">发送</button>
+        </div>
+      </div>
     </div>
   </div>
   <div class="ann-rz n" data-dir="n"></div>

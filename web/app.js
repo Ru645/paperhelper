@@ -28,6 +28,7 @@ const dynamicTabs = new Map(); // key -> { btn, pane }
 let annotationsCache = [];
 let currentAnnotation = null; // { id, block_id, quote }
 let annSelectedNode = null;   // 弹窗内当前选中的节点（追问挂到它下面）
+let annNavigated = false;     // 用户是否在弹窗对话树里点过节点（之后提问挂到选中节点）
 
 // ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
 const SEL_SEP = "\u0001";
@@ -615,7 +616,7 @@ async function refreshState() {
   applyHighlights();
 }
 
-// ===== 对话树面板（整会话，点击节点 goto 切上下文） =====
+// ===== 弹窗内对话树（整会话，点击节点 goto 切上下文并载入该子树） =====
 async function refreshConversation() {
   try {
     const res = await fetch("/api/conversation");
@@ -626,8 +627,21 @@ async function refreshConversation() {
   }
 }
 
+/// 拉取以某节点为根的对话子树并渲染到弹窗线程区。
+async function loadThreadInto(rootId) {
+  if (!rootId) return;
+  try {
+    const res = await fetch("/api/thread?root=" + encodeURIComponent(rootId));
+    if (!res.ok) return;
+    const data = await res.json();
+    renderAnnThread(data.thread);
+  } catch (e) {
+    /* 载入失败保留原线程 */
+  }
+}
+
 function renderConversation(data) {
-  const box = $("conv-tree");
+  const box = $("ann-conv-tree");
   if (!box) return;
   const roots = (data && data.roots) || [];
   const count = $("sel-count-conv");
@@ -654,27 +668,20 @@ function renderConversation(data) {
     text.textContent = node.summary || node.question || "";
     row.appendChild(num);
     row.appendChild(text);
-    row.onclick = async () => {
-      await runCommand("goto " + node.n, { skipReload: true });
-      refreshConversation();
-    };
+    row.onclick = () => annGotoNode(node);
     container.appendChild(row);
     (node.children || []).forEach((c) => add(c, depth + 1, container));
   };
   roots.forEach((r) => add(r, 0, box));
 }
 
-/// 程序化打开侧栏面板（供弹窗「对话树」按钮调用）。
-function activatePanel(name) {
-  const sidebar = $("sidebar");
-  if (sidebar) sidebar.classList.remove("collapsed");
-  document.querySelectorAll("#activitybar .act").forEach((b) => {
-    b.classList.toggle("active", b.dataset.panel === name);
-  });
-  document.querySelectorAll("#sidebar-panels section[data-panel]").forEach((p) => {
-    p.classList.toggle("active", p.dataset.panel === name);
-  });
-  try { localStorage.setItem(PANEL_KEY, name); } catch (e) { /* 忽略 */ }
+/// 弹窗对话树点节点：切换上下文并把该节点子树载入线程区，之后的提问挂到它下面。
+async function annGotoNode(node) {
+  if (!node || !node.node_id) return;
+  annSelectedNode = node.node_id;
+  annNavigated = true;
+  await runCommand("goto " + node.n, { skipReload: true });
+  await loadThreadInto(node.node_id);
 }
 
 // ===== 知识图谱面板（LLM 判断的概念关系，实时渲染） =====
@@ -2089,7 +2096,7 @@ function setupAnnResize() {
   const popup = $("ann-popup");
   const handles = [...popup.querySelectorAll(".ann-rz")];
   if (!handles.length) return;
-  const MIN_W = 300, MIN_H = 240;
+  const MIN_W = 420, MIN_H = 240;
   try {
     const s = JSON.parse(localStorage.getItem(ANN_SIZE_KEY) || "null");
     if (s && s.w >= MIN_W && s.h >= MIN_H) {
@@ -2233,6 +2240,7 @@ async function openAnnotationCreate(anchor) {
     image: anchor.image || null,
   };
   if (!isAnswer) annSelectedNode = null;
+  annNavigated = false;
   await loadMathLibs();
   $("ann-quote").textContent = anchor.quote;
   showAnnSubquote(anchor.quote);
@@ -2252,6 +2260,8 @@ async function openAnnotationCreate(anchor) {
   $("ann-q").value = "";
   annInputGrow();
   clearAnnAttachments();
+  applyAnnSide();
+  await refreshConversation();
   $("ann-q").focus();
 }
 
@@ -2269,16 +2279,19 @@ async function openAnnotationView(annId, opts = {}) {
     image: null,
   };
   annSelectedNode = ann.thread ? ann.thread.node_id : null;
+  annNavigated = false;
   await loadMathLibs();
   clearAnnSubquote();
   clearAnnAttachments();
   $("ann-quote").textContent = cleanQuote(ann.quote);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
+  applyAnnSide();
+  await refreshConversation();
   if (ann.page != null) {
     // PDF 批注：高亮在阅读器里（不在笔记 iframe），用点击位置或居中定位
     if (opts.rect) positionPopup(opts.rect.left, opts.rect.bottom + 10);
-    else positionPopup(window.innerWidth / 2 - 190, 120);
+    else positionPopup(window.innerWidth / 2 - 280, 120);
     $("ann-q").focus();
     return;
   }
@@ -2299,7 +2312,7 @@ async function openAnnotationView(annId, opts = {}) {
     } else {
       // 至少滚动到批注所在块（回答批注没有块则居中显示）
       if (opts.scroll && ann.block_id) scrollNoteToBlock(ann.block_id);
-      positionPopup(window.innerWidth / 2 - 190, 120);
+      positionPopup(window.innerWidth / 2 - 280, 120);
     }
   }
   $("ann-q").focus();
@@ -2447,6 +2460,28 @@ function closeAnnPopup() {
   clearAnnAttachments();
   currentAnnotation = null;
   annSelectedNode = null;
+  annNavigated = false;
+}
+
+/// 弹窗左侧对话树显隐（默认显示，选择存 localStorage）。
+const ANN_SIDE_KEY = "ph.ann.side";
+function annSideShown() {
+  return localStorage.getItem(ANN_SIDE_KEY) !== "0";
+}
+function applyAnnSide() {
+  const side = $("ann-side");
+  const btn = $("ann-tree");
+  if (!side) return;
+  const shown = annSideShown();
+  side.classList.toggle("hidden", !shown);
+  if (btn) btn.classList.toggle("active", shown);
+}
+function toggleAnnSide() {
+  try {
+    localStorage.setItem(ANN_SIDE_KEY, annSideShown() ? "0" : "1");
+  } catch (e) { /* 忽略 */ }
+  applyAnnSide();
+  if (annSideShown()) refreshConversation();
 }
 
 /// 乐观追加一个待回答节点（问题 + 思考中…），返回回答元素供流式填充。
@@ -2635,38 +2670,36 @@ async function sendAnnotation() {
   const ansEl = appendPendingNode(q, currentAnnotation.quote);
   let url, body;
   const answerAnchorNode = currentAnnotation.node_id && !currentAnnotation.id ? currentAnnotation.node_id : null;
-  if (!currentAnnotation.id) {
-    if (answerAnchorNode) {
-      // 回答批注：锚定该回答所在节点，新问答成为它的子节点
-      url = "/api/annotate/answer";
-      body = {
-        node_id: answerAnchorNode,
-        quote: currentAnnotation.quote,
-        quote_tex: currentAnnotation.quote_tex || null,
-        question: q,
-        record_concept: recordConceptOn(),
-        attachments: currentAnnAttachments(),
-      };
-    } else {
-      url = "/api/annotate";
-      body = {
-        block_id: currentAnnotation.block_id,
-        quote: currentAnnotation.quote,
-        quote_tex: currentAnnotation.quote_tex || null,
-        question: q,
-        record_concept: recordConceptOn(),
-        attachments: currentAnnAttachments(),
-      };
-      if (currentAnnotation.pdf) {
-        body.pdf = currentAnnotation.pdf;
-        if (currentAnnotation.image) body.image = currentAnnotation.image;
-      }
-    }
-  } else {
-    const nodeId = annSelectedNode;
-    if (!nodeId) { $("ann-send").disabled = false; setAnnProgress(""); return; }
+  if (currentAnnotation.id || annNavigated) {
+    // 已有批注继续追问 / 在弹窗对话树里点节点后提问：新问答挂到选中节点下
+    if (!annSelectedNode) { $("ann-send").disabled = false; setAnnProgress(""); return; }
     url = "/api/annotate/reply";
-    body = { node_id: nodeId, question: q, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
+    body = { node_id: annSelectedNode, question: q, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
+  } else if (answerAnchorNode) {
+    // 回答批注：锚定该回答所在节点，新问答成为它的子节点
+    url = "/api/annotate/answer";
+    body = {
+      node_id: answerAnchorNode,
+      quote: currentAnnotation.quote,
+      quote_tex: currentAnnotation.quote_tex || null,
+      question: q,
+      record_concept: recordConceptOn(),
+      attachments: currentAnnAttachments(),
+    };
+  } else {
+    url = "/api/annotate";
+    body = {
+      block_id: currentAnnotation.block_id,
+      quote: currentAnnotation.quote,
+      quote_tex: currentAnnotation.quote_tex || null,
+      question: q,
+      record_concept: recordConceptOn(),
+      attachments: currentAnnAttachments(),
+    };
+    if (currentAnnotation.pdf) {
+      body.pdf = currentAnnotation.pdf;
+      if (currentAnnotation.image) body.image = currentAnnotation.image;
+    }
   }
   clearAnnAttachments();
   let streamed = "";
@@ -2738,6 +2771,9 @@ async function sendAnnotation() {
       };
       renderAnnThread(ann.thread);
     }
+  } else if (annNavigated && annSelectedNode) {
+    // 对话树导航下追问：重新载入该节点子树，显示新子节点
+    await loadThreadInto(annSelectedNode);
   } else {
     // 新建：匹配最新一条（同块/同节点/同页 + 同引用）
     const latest = annotationsCache[annotationsCache.length - 1];
@@ -4557,7 +4593,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   }
   $("ann-subquote-clear").onclick = () => clearAnnSubquote();
-  $("ann-tree").onclick = () => { activatePanel("conversation"); refreshConversation(); };
+  $("ann-tree").onclick = toggleAnnSide;
   $("ann-send").onclick = sendAnnotation;
   $("ann-attach").onclick = () => $("ann-file").click();
   $("ann-file").onchange = () => onAnnFiles($("ann-file").files);
@@ -4590,6 +4626,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupAnnInputResize();
   setupAnnResize();
   setupReasoningResize();
+  applyAnnSide();
   $("btn-config").onclick = () => openConfig("model");
   $("btn-settings-close").onclick = () => $("config-modal").classList.add("hidden");
   document.querySelectorAll("#settings-tabs .settings-tab").forEach(
