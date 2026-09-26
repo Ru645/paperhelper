@@ -4858,10 +4858,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${annSelectedNode}"]`);
     if (el) el.scrollIntoView({ block: "center" });
   });
-  // 对话树空白处点击：下一次提问作为新的对话根（森林），不再显示编号/提示
-  const convTree = $("ann-conv-tree");
-  if (convTree) {
-    convTree.addEventListener("click", (e) => {
+  // 对话树侧栏空白处点击：下一次提问作为新的对话根（森林），不再显示编号/提示。
+  const annSide = $("ann-side");
+  if (annSide) {
+    annSide.addEventListener("click", (e) => {
       if (e.target.closest && e.target.closest(".conv-row")) return;
       annNewRoot = true;
       annSelectedNode = null;
