@@ -626,48 +626,45 @@ async function refreshState() {
   applyHighlights();
 }
 
-// ===== 弹窗内对话树（整会话，点击节点 goto 切上下文并载入该子树） =====
-async function refreshConversation() {
-  try {
-    const res = await fetch("/api/conversation");
-    if (!res.ok) return;
-    renderConversation(await res.json());
-  } catch (e) {
-    /* 面板刷新失败不影响主流程 */
+// ===== 弹窗内对话树（只显示当前弹窗这条批注的线程；点节点切上下文但不收窄右侧） =====
+
+/// 当前弹窗这条批注的线程：已有批注取缓存里最新的一份，新建尚未落库时用暂存。
+let currentAnnThread = null;
+function popupThread() {
+  if (currentAnnotation && currentAnnotation.id) {
+    const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
+    if (ann) return ann.thread;
   }
+  return currentAnnThread;
 }
 
-/// 拉取以某节点为根的对话子树并渲染到弹窗线程区。
-async function loadThreadInto(rootId) {
-  if (!rootId) return;
-  try {
-    const res = await fetch("/api/thread?root=" + encodeURIComponent(rootId));
-    if (!res.ok) return;
-    const data = await res.json();
-    renderAnnThread(data.thread);
-  } catch (e) {
-    /* 载入失败保留原线程 */
-  }
+/// 设置弹窗线程并同步渲染左侧导航树（右侧内容由调用方另外渲染）。
+function setPopupThread(thread) {
+  currentAnnThread = thread || null;
+  renderPopupTree(currentAnnThread);
 }
 
-function renderConversation(data) {
+/// 刷新弹窗左侧对话树（跟随当前弹窗，不再拉整会话）。
+function refreshConversation() {
+  renderPopupTree(popupThread());
+}
+
+function renderPopupTree(thread) {
   const box = $("ann-conv-tree");
   if (!box) return;
-  const roots = (data && data.roots) || [];
   const count = $("sel-count-conv");
-  if (count) count.textContent = data && data.count ? data.count : "";
+  if (count) count.textContent = thread ? countThreadNodes(thread) : "";
   box.innerHTML = "";
-  if (!roots.length) {
+  if (!thread) {
     box.innerHTML = '<p class="muted">（还没有对话）</p>';
     return;
   }
-  const current = data.current;
   const add = (node, depth, container) => {
     if (!node) return;
     const row = document.createElement("div");
     row.className = "conv-row"
       + (node.collapsed ? " collapsed" : "")
-      + (node.node_id === current ? " current" : "");
+      + (node.node_id === annSelectedNode ? " current" : "");
     row.style.paddingLeft = 6 + depth * 12 + "px";
     row.title = node.question || "";
     const num = document.createElement("span");
@@ -682,16 +679,27 @@ function renderConversation(data) {
     container.appendChild(row);
     (node.children || []).forEach((c) => add(c, depth + 1, container));
   };
-  roots.forEach((r) => add(r, 0, box));
+  add(thread, 0, box);
 }
 
-/// 弹窗对话树点节点：切换上下文并把该节点子树载入线程区，之后的提问挂到它下面。
+function countThreadNodes(node) {
+  return 1 + (node.children || []).reduce((s, c) => s + countThreadNodes(c), 0);
+}
+
+/// 弹窗左侧树点节点：选中它作为下一次提问的挂载点并切换全局上下文；
+/// 右侧仍显示整条线程（不再收窄成该节点子树），只把选中节点滚动到视野内。
 async function annGotoNode(node) {
   if (!node || !node.node_id) return;
   annSelectedNode = node.node_id;
   annNavigated = true;
   await runCommand("goto " + node.n, { skipReload: true });
-  await loadThreadInto(node.node_id);
+  const thread = popupThread();
+  if (thread) {
+    renderAnnThread(thread);
+    renderPopupTree(thread);
+  }
+  const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${node.node_id}"]`);
+  if (el) el.scrollIntoView({ block: "center" });
 }
 
 // ===== 知识图谱面板（LLM 判断的概念关系，实时渲染） =====
@@ -2307,8 +2315,9 @@ async function openAnnotationCreate(anchor) {
   $("ann-q").value = "";
   annInputGrow();
   clearAnnAttachments();
+  currentAnnThread = null;
   applyAnnSide();
-  await refreshConversation();
+  renderPopupTree(null);
   $("ann-q").focus();
 }
 
@@ -2331,10 +2340,10 @@ async function openAnnotationView(annId, opts = {}) {
   clearAnnSubquote();
   clearAnnAttachments();
   $("ann-quote").textContent = cleanQuote(ann.quote);
+  setPopupThread(ann.thread);
   renderAnnThread(ann.thread);
   $("ann-popup").classList.remove("hidden");
   applyAnnSide();
-  await refreshConversation();
   if (ann.page != null) {
     // PDF 批注：高亮在阅读器里（不在笔记 iframe），用点击位置或居中定位
     if (opts.rect) positionPopup(opts.rect.left, opts.rect.bottom + 10);
@@ -2458,6 +2467,7 @@ function renderAnnThread(root) {
     onAnnNodeClick(div, () => {
       annSelectedNode = node.node_id;
       renderAnnThread(root);
+      renderPopupTree(popupThread());
       runCommand("goto " + node.n, { skipReload: true });
     });
     div.oncontextmenu = (e) => {
@@ -2508,6 +2518,8 @@ function closeAnnPopup() {
   currentAnnotation = null;
   annSelectedNode = null;
   annNavigated = false;
+  currentAnnThread = null;
+  renderPopupTree(null);
 }
 
 /// 弹窗左侧对话树显隐（默认显示，选择存 localStorage）。
@@ -2816,11 +2828,13 @@ async function sendAnnotation() {
         pdf: currentAnnotation.pdf,
         image: null,
       };
+      setPopupThread(ann.thread);
       renderAnnThread(ann.thread);
     }
   } else if (annNavigated && annSelectedNode) {
-    // 对话树导航下追问：重新载入该节点子树，显示新子节点
-    await loadThreadInto(annSelectedNode);
+    // 对话树导航下追问：仍显示整条线程（新子节点已在其中）
+    const thread = popupThread();
+    if (thread) { renderAnnThread(thread); renderPopupTree(thread); }
   } else {
     // 新建：匹配最新一条（同块/同节点/同页 + 同引用）
     const latest = annotationsCache[annotationsCache.length - 1];
@@ -2840,6 +2854,7 @@ async function sendAnnotation() {
         image: null,
       };
       annSelectedNode = latest.thread ? latest.thread.node_id : null;
+      setPopupThread(latest.thread);
       renderAnnThread(latest.thread);
     }
   }
@@ -2851,7 +2866,7 @@ async function sendAnnotation() {
       const parent = currentAnnotation.id
         ? annotationsCache.find((a) => a.id === currentAnnotation.id)
         : null;
-      if (parent) renderAnnThread(parent.thread);
+      if (parent) { setPopupThread(parent.thread); renderAnnThread(parent.thread); }
       const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${latest.root_node_id}"]`);
       if (el) el.scrollIntoView({ block: "center" });
     }
