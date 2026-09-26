@@ -32,3 +32,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.dev.build-override]
+debug = false
