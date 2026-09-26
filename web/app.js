@@ -221,6 +221,9 @@ function showBar(id, on) {
 
 // ===== 思考过程（reasoning 流）与「等待响应」计时 =====
 const reasoningBuf = { ann: "", edit: "" };
+// 每个任务是否已自动展开过思考区：仅首个分片自动展开一次，
+// 用户手动折叠后不再被后续流式分片弹开（resetReasoning 时复位）。
+const reasoningAutoOpened = { ann: false, edit: false, "note-gen": false };
 
 /// 追加一段思考流（截断保留末尾，避免无限增长），并展开折叠区。
 function appendReasoning(which, text) {
@@ -230,8 +233,11 @@ function appendReasoning(which, text) {
   reasoningBuf[which] = (reasoningBuf[which] + text).slice(-4000);
   el.textContent = reasoningBuf[which];
   box.classList.remove("hidden");
-  box.open = true;
-  el.scrollTop = el.scrollHeight;
+  if (!reasoningAutoOpened[which]) {
+    box.open = true;
+    reasoningAutoOpened[which] = true;
+  }
+  if (box.open) el.scrollTop = el.scrollHeight;
 }
 
 // ===== 笔记区「生成中」覆盖层（导入/生成笔记的实时反馈） =====
@@ -290,6 +296,7 @@ function resetReasoning(which) {
   const box = $(which + "-reasoning");
   const el = $(which + "-reasoning-text");
   reasoningBuf[which] = "";
+  reasoningAutoOpened[which] = false;
   if (el) el.textContent = "";
   if (box) { box.classList.add("hidden"); box.open = true; }
 }
@@ -340,6 +347,15 @@ function setRunning(v) {
   running = v;
   if (!v) setProgress("");
   $("btn-stop").classList.toggle("hidden", !v);
+}
+
+/// 统一同步各中止按钮：仅当确有可中止的任务时才出现（无任务立即隐藏）。
+/// 避免出现「停止」按钮可点却无事发生，也避免任务在途却没有入口中止。
+function syncStopButtons() {
+  const set = (id, on) => { const el = $(id); if (el) el.classList.toggle("hidden", !on); };
+  set("ann-stop", !!annAbort);
+  set("btn-edit-stop", !!editRun);
+  set("btn-config-test-stop", !!cfgTestAbort);
 }
 
 /// 当前正在进行的任务名（顶部进度优先，其次 LLM 任务名）。
@@ -1600,6 +1616,7 @@ async function generateEdit() {
   const ctrl = new AbortController();
   const run = { blockId: bid, ctrl };
   editRun = run;
+  syncStopButtons();
   let acc = "";
   const setStatus = (s, cls) => {
     const d = editDrafts.get(bid) || { text: "" };
@@ -1616,7 +1633,6 @@ async function generateEdit() {
   if (editModalOpen(bid)) {
     $("edit-text").value = "";
     $("btn-edit-gen").disabled = true;
-    $("btn-edit-stop").classList.remove("hidden");
   }
   showBar("edit-ai-bar", true);
   try {
@@ -1674,11 +1690,11 @@ async function generateEdit() {
   if (editRun === run) editRun = null;
   llmBusyTask = "";
   setRunning(false);
+  syncStopButtons();
   setEditProgress("");
   showBar("edit-ai-bar", false);
   if (editModalOpen(bid)) {
     $("btn-edit-gen").disabled = false;
-    $("btn-edit-stop").classList.add("hidden");
   }
   const rbox = $("edit-reasoning");
   if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
@@ -2236,6 +2252,7 @@ async function sendAnnotation() {
   if (!q || !currentAnnotation) return;
   if (running || llmBusyTask) { showBusyHint(); return; }
   llmBusyTask = "回答提问";
+  setRunning(true); // 顶部也显示停止：关闭弹窗后仍可中止
   $("ann-q").value = "";
   annInputGrow();
   clearAnnSubquote();
@@ -2281,7 +2298,7 @@ async function sendAnnotation() {
   let streamed = "";
   const controller = new AbortController();
   annAbort = controller;
-  $("ann-stop").classList.remove("hidden");
+  syncStopButtons();
   showBar("ann-bar", true);
   try {
     await postSse(url, body, ({ name, text }) => {
@@ -2324,8 +2341,9 @@ async function sendAnnotation() {
   }
   if (annAbort === controller) annAbort = null;
   llmBusyTask = "";
+  setRunning(false);
   showBar("ann-bar", false);
-  $("ann-stop").classList.add("hidden");
+  syncStopButtons();
   $("ann-send").disabled = false;
   setAnnProgress("");
   const rbox = $("ann-reasoning");
@@ -3329,7 +3347,7 @@ async function openConfig(tab = "model") {
     $("cfg-status").className = "status";
     $("cfg-test-result").classList.add("hidden");
     showBar("cfg-test-bar", false);
-    $("btn-config-test-stop").classList.add("hidden");
+    syncStopButtons();
     $("btn-config-test").disabled = false;
     $("cfg-version").textContent = lastState && lastState.version
       ? `当前版本 v${lastState.version}`
@@ -3385,9 +3403,9 @@ async function testConfig() {
   result.textContent = "测试中…";
   showBar("cfg-test-bar", true);
   $("btn-config-test").disabled = true;
-  $("btn-config-test-stop").classList.remove("hidden");
   const ctrl = new AbortController();
   cfgTestAbort = ctrl;
+  syncStopButtons();
   try {
     const res = await fetch("/api/config/test", {
       method: "POST",
@@ -3437,8 +3455,8 @@ async function testConfig() {
   }
   cfgTestAbort = null;
   showBar("cfg-test-bar", false);
+  syncStopButtons();
   $("btn-config-test").disabled = false;
-  $("btn-config-test-stop").classList.add("hidden");
 }
 
 function stopConfigTest() {
