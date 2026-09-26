@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::conversation::{Conversation, ConvNode};
 use crate::export;
 use crate::interrupt;
-use crate::knowledge::{Concept, KnowledgeBase, Paper};
+use crate::knowledge::{Concept, ConceptRelation, KnowledgeBase, Paper};
 use crate::llm::{self, Message};
 use crate::notes::{self, Explanation};
 use crate::output::Emitter;
@@ -60,8 +60,8 @@ fn sys_ask() -> String {
 
 const COMMANDS: &[&str] = &[
     "ingest", "ask", "check", "sum", "del", "undo", "blocks", "note", "tree", "goto", "stats",
-    "budget", "save", "load", "export", "papers", "concepts", "styles", "config", "new", "help",
-    "exit",
+    "budget", "save", "load", "export", "papers", "concepts", "graph", "styles", "config", "new",
+    "help", "exit",
 ];
 
 /// `del`/批注删除的撤销快照：保存可恢复的笔记、对话树与批注，不含 stats
@@ -510,6 +510,29 @@ impl SumJob {
     }
 }
 
+/// 知识图谱关系整理（`graph build`）：只让 LLM 判断「新概念」与已有概念的关系。
+/// 与论文/会话无关，锁外执行，`commit_graph` 再持锁合并进知识库。
+pub struct GraphJob {
+    msgs: Vec<Message>,
+    cfg: crate::config::LlmConfig,
+    client: reqwest::Client,
+    /// 本次参与整理的新概念名（commit 时标记为已整理）。
+    new_names: Vec<String>,
+    /// 是否重建：commit 时先清空旧关系再合并。
+    rebuild: bool,
+}
+
+impl GraphJob {
+    /// 锁外执行 LLM 非流式调用（关系输出是一小段结构化文本）。
+    pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        interrupt::reset();
+        emitter.progress("整理概念关系…");
+        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |_| {}, None).await;
+        emitter.progress_done();
+        res
+    }
+}
+
 impl IngestJob {
     /// 锁外执行 LLM 流式调用（正文 + 思考 + 字数进度）。
     pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
@@ -881,6 +904,7 @@ impl App {
             "stats" => self.cmd_stats().await,
             "papers" => self.cmd_papers().await,
             "concepts" => self.cmd_concepts().await,
+            "graph" => self.cmd_graph(rest).await,
             "styles" => self.cmd_styles(rest).await,
             "new" => {
                 // 先保存当前会话：在途 LLM 任务稍后仍能写回它（写回不需要它是当前会话）
@@ -955,6 +979,9 @@ PaperHelper 命令：
                           也是实验特性，仅供测试体验，正式笔记建议用 md
   papers                   列出已读论文
   concepts                 列出已学概念(跨论文)
+  graph [build|rebuild|clear|show]  知识图谱：LLM 判断概念间关系
+                           build 只整理新概念(懒惰更新)；rebuild 重建全部；
+                           clear 清空关系；show 查看状态(默认)
   config show              查看配置
   config set <k> <v>       设置(如 llm.api_key / llm.model / llm.context_length)
   config presets [id]      列出内置服务商预设 / 一键填入(deepseek/paratera/ollama/custom)
@@ -1982,6 +2009,7 @@ PaperHelper 命令：
                     block_id: if is_nested { None } else { job.block_id.clone() },
                     created_at: now.clone(),
                     pinned: false,
+                    graph_seen: false,
                 });
                 self.kb.save()?;
             }
@@ -2778,6 +2806,101 @@ PaperHelper 命令：
         Ok(())
     }
 
+    /// graph 的 prepare 段：确定要整理的新概念并构造 LLM 消息。
+    /// `rebuild` 为真时整理全部概念（配合 `graph rebuild`，commit 时先清空旧关系）。
+    pub fn prepare_graph(&mut self, rebuild: bool) -> Result<GraphJob> {
+        let all = self.kb.unique_concept_names();
+        if all.is_empty() {
+            bail!("知识库还没有概念：先在回答里「记概念」（或提问时保持默认），再来整理关系。");
+        }
+        let new_names = if rebuild {
+            all
+        } else {
+            self.kb.pending_graph_names()
+        };
+        if new_names.is_empty() {
+            bail!("没有新概念需要整理（用 `graph rebuild` 重建全部关系）。");
+        }
+        let msgs = build_graph_messages(&self.kb, &new_names);
+        Ok(GraphJob {
+            msgs,
+            cfg: self.config.llm.clone(),
+            client: self.client.clone(),
+            new_names,
+            rebuild,
+        })
+    }
+
+    /// CLI 用：锁内 prepare → run → commit（Web 端走 api_run 的三段式，锁外执行 LLM）。
+    pub async fn run_graph(&mut self, job: GraphJob) -> Result<()> {
+        let emitter = self.emitter.clone();
+        let res = job.run(&emitter).await?;
+        self.commit_graph(job, res)
+    }
+
+    /// graph 的 commit 段：解析 LLM 输出的关系、合并入库、标记已整理并落盘。
+    pub fn commit_graph(&mut self, job: GraphJob, res: crate::llm::LlmResult) -> Result<()> {
+        self.record_usage(res.input_tokens, res.output_tokens);
+        if res.estimated {
+            outln!(self, "[注: 本次 token 数为估算]");
+        }
+        let rels = parse_graph_relations(&res.content);
+        if job.rebuild {
+            self.kb.reset_graph();
+        }
+        let added = self.kb.merge_relations(rels);
+        self.kb.mark_graph_seen(&job.new_names);
+        self.kb.save()?;
+        outln!(
+            self,
+            "{} 知识图谱已更新：新增 {} 条关系，当前共 {} 个概念、{} 条关系。",
+            "✓".green().bold(),
+            added,
+            self.kb.unique_concept_names().len(),
+            self.kb.relations.len()
+        );
+        Ok(())
+    }
+
+    /// graph [build|rebuild|clear|show]：查看 / 懒惰更新 / 重建 / 清空概念关系。
+    async fn cmd_graph(&mut self, rest: &str) -> Result<()> {
+        match rest.trim() {
+            "" | "show" | "status" => {
+                self.print_graph_status();
+                Ok(())
+            }
+            "clear" => {
+                let n = self.kb.relations.len();
+                self.kb.relations.clear();
+                self.kb.save()?;
+                outln!(self, "已清空 {n} 条概念关系（概念本身保留）。");
+                Ok(())
+            }
+            "build" | "update" => {
+                let job = self.prepare_graph(false)?;
+                self.run_graph(job).await
+            }
+            "--all" | "rebuild" => {
+                let job = self.prepare_graph(true)?;
+                self.run_graph(job).await
+            }
+            other => {
+                outln!(self, "用法: graph [build|rebuild|clear|show]（未知参数: {other}）");
+                Ok(())
+            }
+        }
+    }
+
+    fn print_graph_status(&self) {
+        outln!(
+            self,
+            "知识图谱: {} 个概念，{} 条关系，{} 个概念待整理。",
+            self.kb.unique_concept_names().len(),
+            self.kb.relations.len(),
+            self.kb.pending_graph_names().len()
+        );
+    }
+
     /// del [n] [--yes]：删除指定（默认当前）对话节点及其子树（根节点不可删）。
     /// 不带 `--yes` 只打印警告与将删除的内容；执行前把笔记+对话树入撤销栈。
     async fn cmd_del(&mut self, rest: &str) -> Result<()> {
@@ -3282,6 +3405,72 @@ fn extract_concept(content: &str) -> (String, Option<String>) {
     (clean_answer, concept)
 }
 
+/// 构造「整理概念关系」的 LLM 消息：列出所有概念（名称+定义摘要），
+/// 要求只针对 `new_names` 输出固定格式的关系行。
+fn build_graph_messages(kb: &KnowledgeBase, new_names: &[String]) -> Vec<Message> {
+    let list: Vec<String> = kb
+        .unique_concept_names()
+        .iter()
+        .map(|n| {
+            let def = kb
+                .concepts
+                .iter()
+                .find(|c| &c.name == n)
+                .map(|c| c.definition.chars().take(80).collect::<String>())
+                .unwrap_or_default();
+            format!("- {n}：{def}")
+        })
+        .collect();
+    let sys = "你在为学习笔记构建跨论文概念图谱。只依据给定的概念定义判断关系，不要杜撰概念或关系。";
+    let user = format!(
+        "概念列表（名称：定义）：\n{}\n\n请判断这些「新概念」与列表中其它概念之间的关系。新概念：{}\n\n\
+输出要求：\n\
+- 每行一条关系，格式严格为：概念A => 概念B || 关系类型 || 一句话说明\n\
+- 关系类型只能取：前置、相关、对比、包含、应用；前置/包含/应用有方向（A 是 B 的前提/组成/应用）\n\
+- 只输出新概念参与、且确实存在的关系，宁少勿错，最多 5 条\n\
+- 没有任何明显关系就只输出：无\n\
+- 不要输出标题、解释、序号或代码块标记",
+        list.join("\n"),
+        new_names.join("、")
+    );
+    vec![Message::text("system", sys), Message::text("user", user)]
+}
+
+/// 解析 LLM 输出的关系行（`A => B || 类型 || 说明`），跳过格式不符的行。
+pub fn parse_graph_relations(reply: &str) -> Vec<ConceptRelation> {
+    let mut out: Vec<ConceptRelation> = Vec::new();
+    for raw in reply.lines() {
+        let line = raw
+            .trim()
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ')
+            .trim();
+        if line.is_empty() || line.contains('`') {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once("=>") else {
+            continue;
+        };
+        let from = lhs.trim().to_string();
+        let parts: Vec<&str> = rhs.split("||").map(|s| s.trim()).collect();
+        if parts.len() < 2 || from.is_empty() || parts[0].is_empty() || parts[1].is_empty() {
+            continue;
+        }
+        let rel = ConceptRelation {
+            from,
+            to: parts[0].to_string(),
+            kind: parts[1].to_string(),
+            note: parts.get(2).map(|s| s.to_string()).unwrap_or_default(),
+        };
+        if !out
+            .iter()
+            .any(|x| x.from == rel.from && x.to == rel.to && x.kind == rel.kind)
+        {
+            out.push(rel);
+        }
+    }
+    out
+}
+
 pub fn mask_key(k: &str) -> String {
     if k.is_empty() {
         "（未设置）".into()
@@ -3295,8 +3484,8 @@ pub fn mask_key(k: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_concept, normalize_path_arg, strip_flag, take_bool_arg, take_style_arg, take_value_arg,
-        CommandCompleter, ExtraInput,
+        extract_concept, normalize_path_arg, parse_graph_relations, strip_flag, take_bool_arg,
+        take_style_arg, take_value_arg, CommandCompleter, ExtraInput,
     };
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
@@ -3313,6 +3502,26 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(r, "x.pdf");
         assert!(take_style_arg("--style").is_err(), "缺取值应报错");
+    }
+
+    /// 关系行解析：合法行解析、去重、跳过「无」与格式不符/代码块标记的行。
+    #[test]
+    fn graph_relation_parsing_is_lenient() {
+        let out = parse_graph_relations(
+            "无\n\
+             - 贝叶斯定理 => 先验概率 || 前置 || 先验是贝叶斯的基础\n\
+             * 熵 => 交叉熵 || 相关 || 都由信息量定义\n\
+             熵 => 交叉熵 || 相关 || 重复不应再加一条\n\
+             `代码块跳过`\n\
+             缺字段 => 只有名字\n\
+             => 缺左边 || 相关 || x",
+        );
+        assert_eq!(out.len(), 2, "重复与非法行应被丢弃: {out:?}");
+        assert_eq!(out[0].from, "贝叶斯定理");
+        assert_eq!(out[0].to, "先验概率");
+        assert_eq!(out[0].kind, "前置");
+        assert!(out[0].note.contains("基础"));
+        assert_eq!(out[1].note, "都由信息量定义");
     }
 
     /// 附件并入消息列表：追加到末条 user 消息；末条非 user 时新增一条；空附件无副作用。

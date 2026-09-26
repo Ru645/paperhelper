@@ -517,7 +517,8 @@ async function runCommand(command, opts = {}) {
   const cmdTrim = command.trim();
   // `ingest --read`：不调模型（可离线阅读），但仍占任务锁，避免与在途任务并发改同一会话
   const isReadIngest = /^(ingest|pdf)\b/.test(cmdTrim) && /(^|\s)--read(\s|$)/.test(cmdTrim);
-  const isLlm = LLM_CMD_RE.test(cmdTrim) && !isReadIngest;
+  const isGraphBuild = /^graph\s+(build|update|rebuild|--all)\b/.test(cmdTrim);
+  const isLlm = (LLM_CMD_RE.test(cmdTrim) || isGraphBuild) && !isReadIngest;
   const needsLock = isLlm || isReadIngest;
   // 未配置模型：弹向导（原样导入 `ingest --note` 不调模型，直接放行）
   if (isLlm && lastState && !lastState.llm_ready && !/--note\b/.test(cmdTrim)) {
@@ -610,6 +611,7 @@ async function refreshState() {
   await refreshSessions();
   await refreshAnnotations();
   await refreshConversation();
+  await refreshGraph();
   renderOutline(lastState);
   applyHighlights();
 }
@@ -675,6 +677,170 @@ function activatePanel(name) {
     p.classList.toggle("active", p.dataset.panel === name);
   });
   try { localStorage.setItem(PANEL_KEY, name); } catch (e) { /* 忽略 */ }
+}
+
+// ===== 知识图谱面板（LLM 判断的概念关系，实时渲染） =====
+let graphCache = null;
+let graphPos = {};        // name -> {x,y}，跨刷新保持布局稳定
+let graphLayoutKey = "";  // 节点集合变化时重算布局
+let graphSelected = null;
+
+async function refreshGraph() {
+  try {
+    const res = await fetch("/api/graph");
+    if (!res.ok) return;
+    graphCache = await res.json();
+    renderGraph(graphCache);
+  } catch (e) {
+    /* 图谱刷新失败不影响主流程 */
+  }
+}
+
+/// 轻量力导向布局：斥力 + 边弹簧 + 向心引力；已算过的节点沿用旧坐标。
+function graphLayout(nodes, edges, W, H, prev) {
+  const pos = {};
+  const nc = nodes.length;
+  nodes.forEach((nd, i) => {
+    if (prev[nd.name]) {
+      pos[nd.name] = { x: prev[nd.name].x, y: prev[nd.name].y };
+    } else {
+      const a = (i / Math.max(1, nc)) * Math.PI * 2;
+      pos[nd.name] = { x: W / 2 + Math.cos(a) * Math.min(W, H) * 0.34, y: H / 2 + Math.sin(a) * Math.min(W, H) * 0.34 };
+    }
+  });
+  const adj = edges.filter((e) => pos[e.from] && pos[e.to]);
+  const iters = nc > 80 ? 120 : 240;
+  for (let it = 0; it < iters; it++) {
+    const fx = {};
+    nodes.forEach((nd) => (fx[nd.name] = { x: 0, y: 0 }));
+    for (let i = 0; i < nc; i++) {
+      for (let j = i + 1; j < nc; j++) {
+        const a = nodes[i].name, b = nodes[j].name;
+        let dx = pos[a].x - pos[b].x, dy = pos[a].y - pos[b].y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 1; }
+        const d = Math.sqrt(d2), f = 18000 / d2;
+        fx[a].x += (dx / d) * f; fx[a].y += (dy / d) * f;
+        fx[b].x -= (dx / d) * f; fx[b].y -= (dy / d) * f;
+      }
+    }
+    adj.forEach((e) => {
+      const dx = pos[e.to].x - pos[e.from].x, dy = pos[e.to].y - pos[e.from].y;
+      const d = Math.max(1, Math.hypot(dx, dy)), f = (d - 110) * 0.02;
+      fx[e.from].x += (dx / d) * f; fx[e.from].y += (dy / d) * f;
+      fx[e.to].x -= (dx / d) * f; fx[e.to].y -= (dy / d) * f;
+    });
+    nodes.forEach((nd) => {
+      const p = pos[nd.name];
+      fx[nd.name].x += (W / 2 - p.x) * 0.01;
+      fx[nd.name].y += (H / 2 - p.y) * 0.01;
+      p.x = Math.max(30, Math.min(W - 30, p.x + Math.max(-30, Math.min(30, fx[nd.name].x))));
+      p.y = Math.max(30, Math.min(H - 30, p.y + Math.max(-30, Math.min(30, fx[nd.name].y))));
+    });
+  }
+  return pos;
+}
+
+function renderGraph(data) {
+  const box = $("graph-view");
+  if (!box) return;
+  const nodes = (data && data.nodes) || [];
+  const edges = (data && data.edges) || [];
+  const count = $("sel-count-graph");
+  if (count) count.textContent = nodes.length ? `${nodes.length} 概念 / ${edges.length} 关系` : "";
+  const upd = $("btn-graph-update"), reb = $("btn-graph-rebuild");
+  if (upd) upd.disabled = !(data && data.pending > 0);
+  if (reb) reb.disabled = nodes.length === 0;
+  box.innerHTML = "";
+  if (!nodes.length) {
+    box.innerHTML = '<p class="muted">（还没有概念）</p>';
+    const info = $("graph-info");
+    if (info) info.textContent = "";
+    return;
+  }
+  const W = Math.max(240, box.clientWidth || 280);
+  const H = 420;
+  const key = nodes.map((n) => n.name).join("|");
+  if (key !== graphLayoutKey) {
+    graphLayoutKey = key;
+    graphPos = graphLayout(nodes, edges, W, H, graphPos);
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", "100%");
+  svg.setAttribute("height", H);
+  svg.setAttribute("class", "graph-svg");
+  const defs = document.createElementNS(NS, "defs");
+  defs.innerHTML = '<marker id="g-arrow" viewBox="0 0 10 10" refX="18" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>';
+  svg.appendChild(defs);
+
+  const neighbors = new Set();
+  if (graphSelected) {
+    edges.forEach((e) => {
+      if (e.from === graphSelected) neighbors.add(e.to);
+      if (e.to === graphSelected) neighbors.add(e.from);
+    });
+  }
+  const directed = (k) => ["前置", "包含", "应用"].includes(k);
+  edges.forEach((e) => {
+    const a = graphPos[e.from], b = graphPos[e.to];
+    if (!a || !b) return;
+    const line = document.createElementNS(NS, "line");
+    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+    line.setAttribute("stroke", e.kind === "对比" ? "#f59e0b" : e.kind === "相关" ? "#94a3b8" : "#3b82f6");
+    line.setAttribute("stroke-width", graphSelected && (e.from === graphSelected || e.to === graphSelected) ? "2" : "1.2");
+    if (directed(e.kind)) line.setAttribute("marker-end", "url(#g-arrow)");
+    const t = document.createElementNS(NS, "title");
+    t.textContent = `${e.from} ${e.kind} ${e.to}${e.note ? "：" + e.note : ""}`;
+    line.appendChild(t);
+    svg.appendChild(line);
+  });
+  nodes.forEach((nd) => {
+    const p = graphPos[nd.name];
+    if (!p) return;
+    const g = document.createElementNS(NS, "g");
+    g.setAttribute("class", "graph-node" + (graphSelected === nd.name ? " sel" : graphSelected && !neighbors.has(nd.name) ? " dim" : ""));
+    const c = document.createElementNS(NS, "circle");
+    c.setAttribute("cx", p.x); c.setAttribute("cy", p.y);
+    c.setAttribute("r", graphSelected === nd.name ? 9 : 6);
+    const title = document.createElementNS(NS, "title");
+    title.textContent = nd.name + (nd.paper ? `（${nd.paper}）` : "") + (nd.definition ? "\n" + nd.definition : "");
+    c.appendChild(title);
+    const label = document.createElementNS(NS, "text");
+    label.setAttribute("x", p.x + 10); label.setAttribute("y", p.y + 4);
+    label.textContent = nd.name.length > 12 ? nd.name.slice(0, 11) + "…" : nd.name;
+    g.appendChild(c); g.appendChild(label);
+    g.onclick = (ev) => {
+      ev.stopPropagation();
+      graphSelected = graphSelected === nd.name ? null : nd.name;
+      renderGraph(graphCache);
+    };
+    svg.appendChild(g);
+  });
+  box.appendChild(svg);
+  showGraphInfo(data, graphSelected);
+}
+
+function showGraphInfo(data, name) {
+  const info = $("graph-info");
+  if (!info) return;
+  if (!name) {
+    info.innerHTML = '<span class="muted">点击节点查看定义与关联。</span>';
+    return;
+  }
+  const nd = (data.nodes || []).find((n) => n.name === name) || { name };
+  const rels = (data.edges || []).filter((e) => e.from === name || e.to === name);
+  let html = `<b>${esc(nd.name)}</b>`;
+  if (nd.paper) html += ` <span class="muted">（${esc(nd.paper)}）</span>`;
+  if (nd.definition) html += `<div class="graph-def">${esc(nd.definition)}</div>`;
+  if (rels.length) {
+    html += "<ul>" + rels.map((e) =>
+      `<li>${esc(e.from)} <em>${esc(e.kind)}</em> ${esc(e.to)}${e.note ? "：" + esc(e.note) : ""}</li>`
+    ).join("") + "</ul>";
+  }
+  info.innerHTML = html;
 }
 
 /// 无笔记时隐藏 iframe，显示居中的导入入口（导入只在新笔记时需要）。
@@ -4323,6 +4489,11 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   });
   $("btn-undo").onclick = () => runCommand("undo");
+  $("btn-graph-update").onclick = () => runCommand("graph build");
+  $("btn-graph-rebuild").onclick = () => {
+    if (!confirm("重建会清空现有全部概念关系，再让 LLM 重新判断。确定继续？")) return;
+    runCommand("graph rebuild");
+  };
   $("btn-help").onclick = () => $("help-modal").classList.remove("hidden");
   $("btn-wizard").onclick = () => openWizard(1);
   $("btn-wizard-prev").onclick = () => {

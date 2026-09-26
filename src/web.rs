@@ -102,6 +102,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
         .route("/api/conversation", get(api_conversation))
+        .route("/api/graph", get(api_graph))
         .route(
             "/api/upload",
             post(api_upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES as usize + 1024 * 1024)),
@@ -628,6 +629,44 @@ async fn api_run(
             return;
         }
 
+        // graph build/rebuild：与 ingest 相同的三段式（LLM 阶段不持 App 锁，只改知识库）。
+        let graph_sub = command.split_whitespace().nth(1).unwrap_or("");
+        let graph_build = first == "graph"
+            && matches!(graph_sub, "build" | "update" | "rebuild" | "--all");
+        if graph_build {
+            let rebuild = matches!(graph_sub, "rebuild" | "--all");
+            let prepared: anyhow::Result<crate::app::GraphJob> = {
+                let mut g = app2.lock().await;
+                g.emitter = Emitter::channel(tx.clone());
+                let r = g.prepare_graph(rebuild);
+                g.emitter = Emitter::terminal();
+                r
+            };
+            let job = match prepared {
+                Ok(j) => j,
+                Err(e) => {
+                    emit_result_channel(&tx, Err(e), &what, t0);
+                    return;
+                }
+            };
+            let res = match LLM_GATE.try_lock() {
+                Ok(_guard) => {
+                    let emitter = Emitter::channel(tx.clone());
+                    job.run(&emitter).await
+                }
+                Err(_) => Err(anyhow::anyhow!(LLM_BUSY_MSG)),
+            };
+            let mut g = app2.lock().await;
+            g.emitter = Emitter::channel(tx.clone());
+            let result = match res {
+                Ok(res) => g.commit_graph(job, res),
+                Err(e) => Err(e),
+            };
+            emit_result(&g.emitter, result, &what, t0);
+            g.emitter = Emitter::terminal();
+            return;
+        }
+
         // 其它命令：短命令持锁执行（不再有长时间 LLM 命令走这里）
         let mut guard = app2.lock().await;
         guard.emitter = Emitter::channel(tx.clone());
@@ -840,6 +879,11 @@ fn build_state(a: &App) -> serde_json::Value {
         "blocks": blocks,
         "papers": papers,
         "concepts": concepts,
+        "graph": {
+            "concepts": a.kb.unique_concept_names().len(),
+            "relations": a.kb.relations.len(),
+            "pending": a.kb.pending_graph_names().len(),
+        },
     })
 }
 
@@ -2539,6 +2583,37 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
         })
         .collect();
     Json(json!({ "annotations": list }))
+}
+
+/// 知识图谱数据（节点=去重概念名，边=LLM 判断的概念关系），供主页面实时渲染。
+async fn api_graph(State(app): State<SharedApp>) -> Json<serde_json::Value> {
+    let a = app.lock().await;
+    Json(build_graph(&a.kb))
+}
+
+fn build_graph(kb: &crate::knowledge::KnowledgeBase) -> serde_json::Value {
+    let nodes: Vec<serde_json::Value> = kb
+        .unique_concept_names()
+        .iter()
+        .map(|name| {
+            let c = kb.concepts.iter().find(|c| &c.name == name);
+            json!({
+                "name": name,
+                "paper": c.map(|c| c.paper_title.clone()).unwrap_or_default(),
+                "definition": c.map(|c| c.definition.chars().take(200).collect::<String>()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    let edges: Vec<serde_json::Value> = kb
+        .relations
+        .iter()
+        .map(|r| json!({ "from": r.from, "to": r.to, "kind": r.kind, "note": r.note }))
+        .collect();
+    json!({
+        "nodes": nodes,
+        "edges": edges,
+        "pending": kb.pending_graph_names().len(),
+    })
 }
 
 /// 整会话对话树：所有根节点的嵌套子树 + 当前节点，供「对话树」面板点击 `goto` 切上下文。

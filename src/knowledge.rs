@@ -43,6 +43,22 @@ pub struct Concept {
     /// 是否在列表中置顶。
     #[serde(default)]
     pub pinned: bool,
+    /// 是否已参与过「知识图谱」关系整理（懒惰更新：只处理未整理的新概念）。
+    #[serde(default)]
+    pub graph_seen: bool,
+}
+
+/// 概念间的一条关系（由 LLM 判断，`from`/`to` 为概念名）。
+/// 方向语义随 `kind` 而定：前置/包含/应用有方向（from 是 to 的…），相关/对比无方向。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptRelation {
+    pub from: String,
+    pub to: String,
+    /// 关系类型：前置 / 相关 / 对比 / 包含 / 应用。
+    pub kind: String,
+    /// 一句话说明。
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -51,6 +67,9 @@ pub struct KnowledgeBase {
     pub papers: Vec<Paper>,
     #[serde(default)]
     pub concepts: Vec<Concept>,
+    /// 概念间关系（知识图谱的边）。
+    #[serde(default)]
+    pub relations: Vec<ConceptRelation>,
     /// 跨会话累计用量与成本。
     #[serde(default)]
     pub stats: SessionStats,
@@ -115,6 +134,15 @@ impl KnowledgeBase {
                 counts.concepts_added += 1;
             }
         }
+        for r in &other.relations {
+            if !self
+                .relations
+                .iter()
+                .any(|x| x.from == r.from && x.to == r.to && x.kind == r.kind)
+            {
+                self.relations.push(r.clone());
+            }
+        }
         self.stats.calls = self.stats.calls.max(other.stats.calls);
         self.stats.total_input = self.stats.total_input.max(other.stats.total_input);
         self.stats.total_output = self.stats.total_output.max(other.stats.total_output);
@@ -137,6 +165,69 @@ impl KnowledgeBase {
             .any(|x| x.name == c.name && x.paper_id == c.paper_id)
         {
             self.concepts.push(c);
+        }
+    }
+
+    /// 概念名去重后的列表（保持首次出现顺序），作为知识图谱的节点集合。
+    pub fn unique_concept_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for c in &self.concepts {
+            if !names.iter().any(|n| n == &c.name) {
+                names.push(c.name.clone());
+            }
+        }
+        names
+    }
+
+    /// 尚未参与关系整理的概念名（懒惰更新：只处理这些「新概念」）。
+    pub fn pending_graph_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for c in &self.concepts {
+            if !c.graph_seen && !names.iter().any(|n| n == &c.name) {
+                names.push(c.name.clone());
+            }
+        }
+        names
+    }
+
+    /// 合并关系（按 from+to+kind 去重），返回新增条数；两端概念都必须存在。
+    pub fn merge_relations(&mut self, rels: Vec<ConceptRelation>) -> usize {
+        let known = self.unique_concept_names();
+        let mut added = 0usize;
+        for r in rels {
+            if !known.iter().any(|n| n == &r.from) || !known.iter().any(|n| n == &r.to) {
+                continue;
+            }
+            if r.from == r.to {
+                continue;
+            }
+            if self
+                .relations
+                .iter()
+                .any(|x| x.from == r.from && x.to == r.to && x.kind == r.kind)
+            {
+                continue;
+            }
+            self.relations.push(r);
+            added += 1;
+        }
+        added
+    }
+
+    /// 把给定概念名标记为已整理（同名概念全部标记）。
+    pub fn mark_graph_seen(&mut self, names: &[String]) {
+        for c in &mut self.concepts {
+            if names.iter().any(|n| n == &c.name) {
+                c.graph_seen = true;
+            }
+        }
+    }
+
+    /// 清空关系并重置整理标记（用于「重建」）。
+    pub fn reset_graph(&mut self) {
+        self.relations.clear();
+        for c in &mut self.concepts {
+            c.graph_seen = false;
         }
     }
 
@@ -165,5 +256,56 @@ impl KnowledgeBase {
         }
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().take(5).map(|(_, c)| c).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn concept(name: &str, paper: &str) -> Concept {
+        Concept {
+            name: name.to_string(),
+            definition: format!("{name} 的定义"),
+            paper_id: paper.to_string(),
+            paper_title: paper.to_string(),
+            block_id: None,
+            created_at: String::new(),
+            pinned: false,
+            graph_seen: false,
+        }
+    }
+
+    /// 图谱辅助：概念名去重、待整理标记、关系合并（去重/校验端点/拒绝自环）、重置。
+    #[test]
+    fn graph_helpers() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept("A", "p1"));
+        kb.add_concept(concept("A", "p2"));
+        kb.add_concept(concept("B", "p1"));
+        assert_eq!(kb.unique_concept_names(), vec!["A", "B"]);
+        assert_eq!(kb.pending_graph_names(), vec!["A", "B"]);
+
+        let rel = |from: &str, to: &str, kind: &str| ConceptRelation {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            note: String::new(),
+        };
+        let added = kb.merge_relations(vec![
+            rel("A", "B", "前置"),
+            rel("A", "B", "前置"),
+            rel("A", "幽灵", "相关"),
+            rel("A", "A", "相关"),
+        ]);
+        assert_eq!(added, 1, "重复/未知端点/自环都应被过滤");
+        assert_eq!(kb.relations.len(), 1);
+
+        kb.mark_graph_seen(&["A".to_string()]);
+        assert_eq!(kb.pending_graph_names(), vec!["B"], "同名概念应一并标记");
+
+        kb.reset_graph();
+        assert!(kb.relations.is_empty());
+        assert_eq!(kb.pending_graph_names(), vec!["A", "B"]);
     }
 }

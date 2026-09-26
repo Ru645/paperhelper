@@ -710,6 +710,19 @@ ul.outline li.para { color: #888; font-size: 12px; }
 .conv-num::after { content: "]"; }
 .conv-q { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
+/* ===== 知识图谱面板 ===== */
+.graph-view { border: 1px solid var(--line); border-radius: 6px; background: #fafbfc; overflow: hidden; }
+.graph-svg { display: block; }
+.graph-node circle { fill: var(--blue); cursor: pointer; }
+.graph-node text { font-size: 11px; fill: #334155; pointer-events: none; }
+.graph-node.dim { opacity: 0.22; }
+.graph-node.sel circle { fill: #1d4ed8; stroke: #1e3a8a; stroke-width: 1.5; }
+.graph-info { margin-top: 8px; font-size: 12.5px; line-height: 1.5; }
+.graph-info b { color: #1e293b; }
+.graph-def { color: #475569; margin: 2px 0 4px; }
+.graph-info ul { margin: 4px 0 0 16px; }
+.graph-info em { color: var(--blue); font-style: normal; }
+
 /* ===== 帮助 ===== */
 .help-list { margin: 8px 0 0 18px; }
 .help-list li { font-size: 13px; line-height: 1.9; }

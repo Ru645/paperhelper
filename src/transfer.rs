@@ -432,6 +432,7 @@ mod tests {
             block_id: None,
             created_at: String::new(),
             pinned: false,
+            graph_seen: false,
         });
         remote_kb.stats.total_input = 100;
         remote_kb.stats.calls = 5;
