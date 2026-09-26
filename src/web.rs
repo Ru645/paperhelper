@@ -1177,7 +1177,8 @@ async fn api_note(State(app): State<SharedApp>, Query(q): Query<NoteQuery>) -> R
 fn hidden_expl_ids(sess: &session::Session) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for ann in &sess.annotations {
-        let mut stack = vec![ann.root_node_id.clone()];
+        // 一条批注可能挂多个对话根（森林），所有根的问答都要在正文里隐藏。
+        let mut stack: Vec<String> = ann.roots().into_iter().map(|s| s.to_string()).collect();
         while let Some(id) = stack.pop() {
             if let Some(n) = sess.conversation.nodes.iter().find(|n| n.id == id) {
                 if let Some(e) = &n.explanation_id {
@@ -2555,22 +2556,37 @@ async fn api_annotations(State(app): State<SharedApp>) -> Json<serde_json::Value
         .session
         .annotations
         .iter()
-        .map(|ann| {
-            json!({
-                "id": ann.id,
-                "block_id": ann.block_id,
-                "node_id": ann.node_id,
-                "quote": ann.quote,
-                "quote_tex": ann.quote_tex,
-                "root_node_id": ann.root_node_id,
-                "page": ann.page,
-                "rects": ann.rects,
-                "kind": ann.kind,
-                "thread": build_thread(&a.session.conversation, &ann.root_node_id, &summary_map),
-            })
-        })
+        .map(|ann| annotation_payload(&a.session.conversation, ann, &summary_map))
         .collect();
     Json(json!({ "annotations": list }))
+}
+
+/// 单条批注的 JSON 载荷：`threads` 为全部对话根（森林），`thread`(首根) 与
+/// `root_node_id` 保留以兼容旧前端。
+fn annotation_payload(
+    conv: &crate::conversation::Conversation,
+    ann: &session::Annotation,
+    summary_map: &std::collections::HashMap<String, (Option<String>, bool)>,
+) -> serde_json::Value {
+    let threads: Vec<serde_json::Value> = ann
+        .roots()
+        .into_iter()
+        .map(|r| build_thread(conv, r, summary_map))
+        .collect();
+    json!({
+        "id": ann.id,
+        "block_id": ann.block_id,
+        "node_id": ann.node_id,
+        "quote": ann.quote,
+        "quote_tex": ann.quote_tex,
+        "root_node_id": ann.root_node_id,
+        "root_node_ids": ann.roots(),
+        "page": ann.page,
+        "rects": ann.rects,
+        "kind": ann.kind,
+        "thread": threads.first().cloned().unwrap_or(serde_json::Value::Null),
+        "threads": threads,
+    })
 }
 
 /// 知识图谱数据（节点=去重概念名，边=LLM 判断的概念关系），供主页面实时渲染。
@@ -2992,6 +3008,43 @@ mod tests {
         assert_eq!(payload["thread"]["answer"], "答一");
         assert_eq!(payload["thread"]["children"][0]["node_id"], "c1");
         assert!(thread_payload(&conv, None, "不存在").is_none());
+    }
+
+    /// 多根批注：`annotation_payload` 的 `threads` 覆盖全部根，`thread` 与 `root_node_id` 为首根。
+    #[test]
+    fn annotation_payload_carries_all_roots() {
+        let node = |id: &str, q: &str| crate::conversation::ConvNode {
+            id: id.to_string(),
+            parent: None,
+            question: q.to_string(),
+            quote: None,
+            answer: format!("答{q}"),
+            block_id: None,
+            explanation_id: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            label: q.to_string(),
+        };
+        let mut conv = crate::conversation::Conversation::default();
+        conv.nodes.push(node("r1", "一"));
+        conv.nodes.push(node("r2", "二"));
+        let ann = crate::session::Annotation {
+            id: "a1".into(),
+            block_id: "b1".into(),
+            quote: "x".into(),
+            root_node_id: "r1".into(),
+            root_node_ids: vec!["r1".into(), "r2".into()],
+            ..Default::default()
+        };
+        let map = std::collections::HashMap::new();
+        let payload = annotation_payload(&conv, &ann, &map);
+        assert_eq!(payload["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["threads"][1]["node_id"], "r2");
+        assert_eq!(payload["root_node_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["thread"]["node_id"], "r1");
+        assert_eq!(payload["root_node_id"], "r1");
     }
 
     /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。

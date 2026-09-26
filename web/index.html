@@ -173,6 +173,7 @@
     <span class="ann-quote" id="ann-quote"></span>
     <span class="ann-spacer"></span>
     <span class="ann-progress" id="ann-progress"></span>
+    <button id="ann-dock" class="mini ghost" title="停靠到右侧，随页面一起排布">停靠</button>
     <button id="ann-tree" class="mini ghost" title="显示 / 隐藏本条批注的对话树，点击节点切换上下文">对话树</button>
     <button id="ann-stop" class="mini ghost hidden" title="中止当前提问">停止</button>
     <button id="ann-close" class="mini ghost" title="关闭">×</button>
@@ -184,6 +185,7 @@
       <p class="conv-hint muted">只显示本条批注的对话；点击节点切换上下文，之后的提问会基于该分支。</p>
       <div id="ann-conv-tree" class="conv-tree"><p class="muted">（还没有对话）</p></div>
     </aside>
+    <div id="ann-side-resizer" class="ann-side-resizer" title="拖动调整对话树宽度"></div>
     <div class="ann-main">
       <details id="ann-reasoning" class="reasoning hidden"><summary>思考过程</summary><div id="ann-reasoning-text" class="reasoning-text"></div><div class="reasoning-resize" data-target="ann-reasoning-text" title="拖动调整思考区高度"></div></details>
       <div class="ann-thread" id="ann-thread"></div>
@@ -208,6 +210,7 @@
       </div>
     </div>
   </div>
+  <div id="ann-dock-resizer" class="ann-dock-resizer" title="拖动调整侧栏宽度"></div>
   <div class="ann-rz n" data-dir="n"></div>
   <div class="ann-rz s" data-dir="s"></div>
   <div class="ann-rz e" data-dir="e"></div>

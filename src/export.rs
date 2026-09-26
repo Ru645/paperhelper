@@ -241,7 +241,8 @@ pub fn to_html_bare(note: &Note, conv: &Conversation, hidden: &HashSet<String>) 
 fn annotation_hidden_ids(annotations: &[Annotation], conv: &Conversation) -> HashSet<String> {
     let mut set = HashSet::new();
     for ann in annotations {
-        let mut stack = vec![ann.root_node_id.clone()];
+        // 一条批注可能挂多个对话根（森林），所有根的问答都要在正文里隐藏。
+        let mut stack: Vec<String> = ann.roots().into_iter().map(|s| s.to_string()).collect();
         while let Some(id) = stack.pop() {
             if let Some(n) = conv.nodes.iter().find(|n| n.id == id) {
                 if let Some(e) = &n.explanation_id {
@@ -537,6 +538,11 @@ function renderThread(container, node, depth) {
   container.appendChild(div);
   (node.children || []).forEach((c) => renderThread(container, c, depth + 1));
 }
+function renderThreads(container, ann) {
+  const list = (ann.threads && ann.threads.length) ? ann.threads : (ann.thread ? [ann.thread] : []);
+  if (!list.length) { container.textContent = '（无）'; return; }
+  list.forEach((t) => { if (t) renderThread(container, t, 0); });
+}
 function showAnnPopup(ann, ev) {
   const el = document.getElementById('ann-popup');
   el.innerHTML = '';
@@ -553,7 +559,7 @@ function showAnnPopup(ann, ev) {
   head.appendChild(close);
   const thread = document.createElement('div');
   thread.className = 'ann-thread';
-  if (ann.thread) renderThread(thread, ann.thread, 0); else thread.textContent = '（无）';
+  renderThreads(thread, ann);
   el.appendChild(head);
   el.appendChild(thread);
   el.classList.remove('hidden');
@@ -576,7 +582,7 @@ function renderFallback(failed) {
     div.appendChild(q);
     const thread = document.createElement('div');
     thread.className = 'ann-thread';
-    if (ann.thread) renderThread(thread, ann.thread, 0);
+    renderThreads(thread, ann);
     div.appendChild(thread);
     sec.appendChild(div);
   }
@@ -603,10 +609,17 @@ fn to_html_with(
     let anns: Vec<serde_json::Value> = annotations
         .iter()
         .map(|a| {
+            // 一条批注的全部对话根（森林）；`thread`(首根) 兼容旧渲染。
+            let threads: Vec<serde_json::Value> = a
+                .roots()
+                .into_iter()
+                .map(|r| thread_json(conv, r, &summary_map))
+                .collect();
             serde_json::json!({
                 "block_id": a.block_id,
                 "quote": a.quote,
-                "thread": thread_json(conv, &a.root_node_id, &summary_map),
+                "thread": threads.first().cloned().unwrap_or(serde_json::Value::Null),
+                "threads": threads,
             })
         })
         .collect();
@@ -784,6 +797,41 @@ mod tests {
         assert!(!html.contains("url(fonts/"), "字体 URL 应全部替换");
         assert!(html.contains("marked"), "marked 应内联");
         assert!(html.contains("katex"), "KaTeX 应内联");
+    }
+
+    /// 多根批注：隐藏解释覆盖全部对话根（否则第二个根的问答会漏进正文）。
+    #[test]
+    fn annotation_hidden_ids_covers_all_roots() {
+        let mk = |id: &str, expl: &str| crate::conversation::ConvNode {
+            id: id.into(),
+            parent: None,
+            question: "q".into(),
+            quote: None,
+            answer: "a".into(),
+            block_id: None,
+            explanation_id: Some(expl.into()),
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: 0.0,
+            created_at: String::new(),
+            label: "q".into(),
+        };
+        let mut conv = Conversation::default();
+        conv.nodes.push(mk("r1", "e1"));
+        conv.nodes.push(mk("r2", "e2"));
+        let ann = Annotation {
+            id: "a1".into(),
+            block_id: "b1".into(),
+            quote: "x".into(),
+            root_node_id: "r1".into(),
+            root_node_ids: vec!["r1".into(), "r2".into()],
+            ..Default::default()
+        };
+        let hidden = annotation_hidden_ids(&[ann], &conv);
+        assert!(
+            hidden.contains("e1") && hidden.contains("e2"),
+            "应覆盖所有根的解释"
+        );
     }
 
     /// KaTeX 内联样式不应残留 woff/ttf 备源引用（build.rs 会删除）。

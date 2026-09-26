@@ -2493,7 +2493,43 @@ PaperHelper 命令：
         res: crate::llm::LlmResult,
     ) -> Result<(String, String, Option<String>)> {
         let (node_id, expl_id) = self.commit_ask_local(job, res)?;
+
+        // 笔记 / PDF 基础批注：同一锚点复用同一条批注，把新提问追加为新的对话根（森林），
+        // 于是对同一段选中文字可提出多个互不相关的独立问题，且只保留一个高亮。
+        // 回答批注：每次追问各建一条独立批注（多条批注才能区分高亮、精确跳转）。
+        let mut reused_id: Option<String> = None;
+        {
+            let existing = match &anchor {
+                AnnAnchor::Note { block_id, quote, .. } => self
+                    .session
+                    .annotations
+                    .iter_mut()
+                    .find(|a| a.node_id.is_none() && a.page.is_none() && a.block_id == *block_id && a.quote == *quote),
+                AnnAnchor::Pdf { page, rects, kind, quote } => self
+                    .session
+                    .annotations
+                    .iter_mut()
+                    .find(|a| {
+                        a.node_id.is_none()
+                            && a.page == Some(*page)
+                            && a.kind.as_deref() == Some(kind.as_str())
+                            && a.rects == *rects
+                            && a.quote == *quote
+                    }),
+                AnnAnchor::Answer { .. } => None,
+            };
+            if let Some(ann) = existing {
+                ann.push_root(&node_id);
+                reused_id = Some(ann.id.clone());
+            }
+        }
+        if let Some(ann_id) = reused_id {
+            self.bump_epoch();
+            return Ok((ann_id, node_id, expl_id));
+        }
+
         let ann_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
         let annotation = match anchor {
             AnnAnchor::Note { block_id, quote, quote_tex } => Annotation {
                 id: ann_id.clone(),
@@ -2502,7 +2538,8 @@ PaperHelper 命令：
                 quote_tex,
                 node_id: None,
                 root_node_id: node_id.clone(),
-                created_at: Utc::now().to_rfc3339(),
+                root_node_ids: vec![node_id.clone()],
+                created_at: now,
                 ..Default::default()
             },
             AnnAnchor::Answer { node_id: anchor_node, quote, quote_tex } => Annotation {
@@ -2512,7 +2549,8 @@ PaperHelper 命令：
                 quote_tex,
                 node_id: Some(anchor_node),
                 root_node_id: node_id.clone(),
-                created_at: Utc::now().to_rfc3339(),
+                root_node_ids: vec![node_id.clone()],
+                created_at: now,
                 ..Default::default()
             },
             AnnAnchor::Pdf { page, rects, kind, quote } => Annotation {
@@ -2522,7 +2560,8 @@ PaperHelper 命令：
                 quote_tex: None,
                 node_id: None,
                 root_node_id: node_id.clone(),
-                created_at: Utc::now().to_rfc3339(),
+                root_node_ids: vec![node_id.clone()],
+                created_at: now,
                 page: Some(page),
                 rects,
                 kind: Some(kind),
@@ -2599,7 +2638,7 @@ PaperHelper 命令：
         for ann in &self.session.annotations {
             let mut cur = Some(node_id.to_string());
             while let Some(id) = cur {
-                if id == ann.root_node_id {
+                if ann.roots().iter().any(|r| *r == id.as_str()) {
                     return Some(ann.block_id.clone());
                 }
                 cur = self
@@ -2620,19 +2659,26 @@ PaperHelper 命令：
         let Some(idx) = self.session.annotations.iter().position(|a| a.id == annotation_id) else {
             bail!("找不到该批注");
         };
-        let root = self.session.annotations[idx].root_node_id.clone();
-        self.push_undo();
-        let subtree = self.collect_subtree(&root);
-        let expl_ids: Vec<String> = subtree
-            .iter()
-            .filter_map(|(_, n)| n.explanation_id.clone())
+        // 一条批注可能挂多个对话根（森林），需逐个删除其子树与笔记解释。
+        let roots: Vec<String> = self.session.annotations[idx]
+            .roots()
+            .into_iter()
+            .map(|s| s.to_string())
             .collect();
-        if let Some(note) = self.session.notes.as_mut() {
-            for eid in &expl_ids {
-                let _ = note.remove_explanation(eid);
+        self.push_undo();
+        for root in &roots {
+            let subtree = self.collect_subtree(root);
+            let expl_ids: Vec<String> = subtree
+                .iter()
+                .filter_map(|(_, n)| n.explanation_id.clone())
+                .collect();
+            if let Some(note) = self.session.notes.as_mut() {
+                for eid in &expl_ids {
+                    let _ = note.remove_explanation(eid);
+                }
             }
+            self.session.conversation.remove_subtree(root);
         }
-        self.session.conversation.remove_subtree(&root);
         self.session.annotations.remove(idx);
         self.bump_epoch();
         self.update_completions();
@@ -2929,11 +2975,32 @@ PaperHelper 命令：
         }
         let removed = self.session.conversation.remove_subtree(&cur);
         self.bump_epoch();
-        // 批注线程的根若在被删子树里，批注记录一并清理（否则会悬空）
+        // 批注线程的根若在被删子树里：只摘掉这些根，保留该批注的其它根（森林）；
+        // 一条批注的根被删光时才整体清理（否则会悬空）。
         let removed_set: std::collections::HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
-        let before = self.session.annotations.len();
-        self.session.annotations.retain(|a| !removed_set.contains(a.root_node_id.as_str()));
-        let ann_removed = before - self.session.annotations.len();
+        let mut ann_removed = 0;
+        let mut keep: Vec<Annotation> = Vec::with_capacity(self.session.annotations.len());
+        for mut a in self.session.annotations.drain(..) {
+            let gone: Vec<String> = a
+                .roots()
+                .into_iter()
+                .filter(|r| removed_set.contains(r))
+                .map(|s| s.to_string())
+                .collect();
+            if gone.is_empty() {
+                keep.push(a);
+                continue;
+            }
+            for g in &gone {
+                a.remove_root(g);
+            }
+            if a.roots().is_empty() {
+                ann_removed += 1;
+            } else {
+                keep.push(a);
+            }
+        }
+        self.session.annotations = keep;
         self.update_completions();
         outln!(
             self,

@@ -75,6 +75,8 @@ pub struct Session {
 }
 
 /// 一条批注：笔记里的一段引用文字 + 其对话线程（以 `root_node_id` 为根的会话子树）。
+/// 一条批注可拥有多个对话根节点（森林）：对同一段选中文字提出多个互不相关的独立问题时，
+/// 每次都新增一个根节点。`root_node_id` 保留为「首根」以兼容旧数据。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Annotation {
     pub id: String,
@@ -88,8 +90,11 @@ pub struct Annotation {
     /// 回答批注的锚点：引用文字所在对话节点（笔记批注为 None）。
     #[serde(default)]
     pub node_id: Option<String>,
-    /// 该批注对话线程的根会话节点 id。
+    /// 该批注对话线程的**首个**根节点 id（旧字段，兼容旧数据；等于 `root_node_ids[0]`）。
     pub root_node_id: String,
+    /// 该批注的全部对话根节点 id（森林）。旧数据为空，加载时由 `root_node_id` 回填。
+    #[serde(default)]
+    pub root_node_ids: Vec<String>,
     #[serde(default)]
     pub created_at: String,
     /// PDF 批注：原件页码（从 1 开始；非 PDF 批注为 None）。
@@ -103,6 +108,50 @@ pub struct Annotation {
     /// 非 PDF 批注为 None。
     #[serde(default)]
     pub kind: Option<String>,
+}
+
+impl Annotation {
+    /// 该批注的全部对话根节点；旧数据 `root_node_ids` 为空时回退首根字段。
+    pub fn roots(&self) -> Vec<&str> {
+        if !self.root_node_ids.is_empty() {
+            self.root_node_ids.iter().map(|s| s.as_str()).collect()
+        } else if !self.root_node_id.is_empty() {
+            vec![self.root_node_id.as_str()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 把旧的单根字段迁移进 `root_node_ids`（旧数据只填了 `root_node_id`）。
+    fn sync_roots_from_legacy(&mut self) {
+        if self.root_node_ids.is_empty() && !self.root_node_id.is_empty() {
+            self.root_node_ids.push(self.root_node_id.clone());
+        }
+    }
+
+    /// 追加一个对话根节点，保持 `root_node_id`（首根）与 `root_node_ids` 同步。
+    pub fn push_root(&mut self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.sync_roots_from_legacy();
+        if self.root_node_ids.iter().any(|r| r == id) {
+            return;
+        }
+        self.root_node_ids.push(id.to_string());
+        if self.root_node_id.is_empty() {
+            self.root_node_id = id.to_string();
+        }
+    }
+
+    /// 从 `root_node_ids` 中移除某根，并同步首根字段（供删除子树后清理）。
+    pub fn remove_root(&mut self, id: &str) {
+        self.sync_roots_from_legacy();
+        self.root_node_ids.retain(|r| r != id);
+        if self.root_node_id == id || self.root_node_id.is_empty() {
+            self.root_node_id = self.root_node_ids.first().cloned().unwrap_or_default();
+        }
+    }
 }
 
 impl Session {
@@ -137,6 +186,12 @@ impl Session {
             let stripped = strip_legacy_check_label(&node.label).to_string();
             if stripped != node.label {
                 node.label = stripped;
+            }
+        }
+        // 旧批注只有单根 `root_node_id`：回填多根字段，保证森林逻辑统一。
+        for ann in &mut self.annotations {
+            if ann.root_node_ids.is_empty() && !ann.root_node_id.is_empty() {
+                ann.root_node_ids.push(ann.root_node_id.clone());
             }
         }
     }
@@ -187,6 +242,8 @@ struct AnnLite {
     block_id: String,
     #[serde(default)]
     root_node_id: String,
+    #[serde(default)]
+    root_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -229,7 +286,7 @@ impl SessionScan {
         }
     }
 
-    /// 若该对话节点属于某条批注线程（沿 parent 上溯到根，与批注 root_node_id 比对），
+    /// 若该对话节点属于某条批注线程（沿 parent 上溯到根，与批注的任一 `root_node_id` 比对），
     /// 返回 `(批注 id, 所属块 id)`。
     fn annotation_of(&self, node: &NodeLite) -> Option<(String, String)> {
         let mut root = node.id.clone();
@@ -248,7 +305,10 @@ impl SessionScan {
         }
         self.annotations
             .iter()
-            .find(|a| !a.id.is_empty() && a.root_node_id == root)
+            .find(|a| {
+                !a.id.is_empty()
+                    && (a.root_node_id == root || a.root_node_ids.iter().any(|r| r == &root))
+            })
             .map(|a| (a.id.clone(), a.block_id.clone()))
     }
 }
@@ -460,6 +520,8 @@ mod tests {
         assert!(ann.page.is_none(), "旧数据 page 应为 None");
         assert!(ann.rects.is_empty(), "旧数据 rects 应为空");
         assert!(ann.kind.is_none(), "旧数据 kind 应为 None");
+        assert!(ann.root_node_ids.is_empty(), "旧数据 root_node_ids 应为空");
+        assert_eq!(ann.roots(), vec!["n1"], "旧数据 roots() 应回退到 root_node_id");
 
         // 新字段可正常往返
         let ann = Annotation {
@@ -490,6 +552,39 @@ mod tests {
         assert_eq!(back.page, Some(3));
         assert_eq!(back.rects.len(), 2);
         assert_eq!(back.kind.as_deref(), Some("text"));
+    }
+
+    /// 多根批注：push_root/remove_root 与 roots() 行为，且旧数据加载时回填根列表。
+    #[test]
+    fn annotation_multi_root_and_legacy_backfill() {
+        let mut ann = Annotation {
+            id: "a1".into(),
+            root_node_id: "r1".into(),
+            ..Default::default()
+        };
+        assert_eq!(ann.roots(), vec!["r1"]);
+        ann.push_root("r2");
+        ann.push_root("r2"); // 去重
+        assert_eq!(ann.roots(), vec!["r1", "r2"]);
+        assert_eq!(ann.root_node_id, "r1", "首根字段应保持");
+        ann.remove_root("r1");
+        assert_eq!(ann.roots(), vec!["r2"]);
+        assert_eq!(ann.root_node_id, "r2", "首根被删后应顺延");
+        ann.remove_root("r2");
+        assert!(ann.roots().is_empty());
+
+        // 旧会话加载：root_node_id 回填进 root_node_ids
+        let dir = std::env::temp_dir().join("paperhelper_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("legacy_multiroot.json");
+        let old = r#"{"session_id":"20250101_000000","annotations":[
+            {"id":"a1","block_id":"b1","quote":"x","root_node_id":"n1"}
+        ]}"#;
+        std::fs::write(&path, old).unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.annotations[0].root_node_ids, vec!["n1"]);
+        assert_eq!(loaded.annotations[0].roots(), vec!["n1"]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

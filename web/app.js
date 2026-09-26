@@ -29,6 +29,8 @@ let annotationsCache = [];
 let currentAnnotation = null; // { id, block_id, quote }
 let annSelectedNode = null;   // 弹窗内当前选中的节点（追问挂到它下面）
 let annNavigated = false;     // 用户是否在弹窗对话树里点过节点（之后提问挂到选中节点）
+let annNewRoot = false;       // 用户点了对话树空白处：下一次提问作为新的对话根（森林）
+let annHostId = null;         // 回答批注发起时所在的基础批注 id（发送完回到它继续看整条森林）
 
 // ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
 const SEL_SEP = "\u0001";
@@ -628,34 +630,37 @@ async function refreshState() {
 
 // ===== 弹窗内对话树（只显示当前弹窗这条批注的线程；点节点切上下文但不收窄右侧） =====
 
-/// 当前弹窗这条批注的线程：已有批注取缓存里最新的一份，新建尚未落库时用暂存。
-let currentAnnThread = null;
-function popupThread() {
+/// 当前弹窗这条批注的全部对话根（森林）：已有批注取缓存里最新的一份，新建尚未落库时用暂存。
+let currentAnnThreads = null;
+function popupThreads() {
   if (currentAnnotation && currentAnnotation.id) {
     const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
-    if (ann) return ann.thread;
+    if (ann) return ann.threads || (ann.thread ? [ann.thread] : []);
   }
-  return currentAnnThread;
+  return currentAnnThreads;
 }
 
 /// 设置弹窗线程并同步渲染左侧导航树（右侧内容由调用方另外渲染）。
-function setPopupThread(thread) {
-  currentAnnThread = thread || null;
-  renderPopupTree(currentAnnThread);
+function setPopupThreads(threads) {
+  currentAnnThreads = threads || null;
+  renderPopupTree(currentAnnThreads);
 }
 
 /// 刷新弹窗左侧对话树（跟随当前弹窗，不再拉整会话）。
 function refreshConversation() {
-  renderPopupTree(popupThread());
+  renderPopupTree(popupThreads());
 }
 
-function renderPopupTree(thread) {
+/// 渲染弹窗左侧的对话森林：多条根各占一棵树，不再显示 DFS 编号。
+function renderPopupTree(threads) {
   const box = $("ann-conv-tree");
   if (!box) return;
+  const list = (threads || []).filter(Boolean);
   const count = $("sel-count-conv");
-  if (count) count.textContent = thread ? countThreadNodes(thread) : "";
+  const total = list.reduce((s, t) => s + countThreadNodes(t), 0);
+  if (count) count.textContent = total ? total : "";
   box.innerHTML = "";
-  if (!thread) {
+  if (!list.length) {
     box.innerHTML = '<p class="muted">（还没有对话）</p>';
     return;
   }
@@ -667,19 +672,15 @@ function renderPopupTree(thread) {
       + (node.node_id === annSelectedNode ? " current" : "");
     row.style.paddingLeft = 6 + depth * 12 + "px";
     row.title = node.question || "";
-    const num = document.createElement("span");
-    num.className = "conv-num";
-    num.textContent = node.n;
     const text = document.createElement("span");
     text.className = "conv-q";
     text.textContent = node.summary || node.question || "";
-    row.appendChild(num);
     row.appendChild(text);
-    row.onclick = () => annGotoNode(node);
+    row.onclick = (e) => { e.stopPropagation(); annNewRoot = false; annGotoNode(node); };
     container.appendChild(row);
     (node.children || []).forEach((c) => add(c, depth + 1, container));
   };
-  add(thread, 0, box);
+  list.forEach((t) => add(t, 0, box));
 }
 
 function countThreadNodes(node) {
@@ -687,16 +688,16 @@ function countThreadNodes(node) {
 }
 
 /// 弹窗左侧树点节点：选中它作为下一次提问的挂载点并切换全局上下文；
-/// 右侧仍显示整条线程（不再收窄成该节点子树），只把选中节点滚动到视野内。
+/// 右侧仍显示整条森林，只把选中节点滚动到视野内。
 async function annGotoNode(node) {
   if (!node || !node.node_id) return;
   annSelectedNode = node.node_id;
   annNavigated = true;
   await runCommand("goto " + node.n, { skipReload: true });
-  const thread = popupThread();
-  if (thread) {
-    renderAnnThread(thread);
-    renderPopupTree(thread);
+  const threads = popupThreads();
+  if (threads && threads.length) {
+    renderAnnThread(threads);
+    renderPopupTree(threads);
   }
   const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${node.node_id}"]`);
   if (el) el.scrollIntoView({ block: "center" });
@@ -2062,6 +2063,7 @@ async function deleteEditBlock() {
 
 function positionPopup(x, y) {
   const el = $("ann-popup");
+  if (annDocked()) return; // 停靠态由 CSS 固定到右侧，不再自由定位
   const r = el.getBoundingClientRect();
   const w = r.width || 380, h = r.height || 460;
   // 弹窗允许比视口大：这时只保证左/上边可见，不再往负方向推
@@ -2106,6 +2108,7 @@ function setupAnnDrag() {
   const HEAD_H = 44;        // 纵向至少露出头部
 
   head.addEventListener("pointerdown", (e) => {
+    if (annDocked()) return; // 停靠态固定在右侧，不可拖动
     if (e.target.closest("button, input, textarea")) return; // 按钮/输入框不触发拖动
     const r = popup.getBoundingClientRect();
     const off = { dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width };
@@ -2127,6 +2130,7 @@ function setupAnnDrag() {
 
   // 窗口尺寸变化后把可见的弹窗拉回视口内
   window.addEventListener("resize", () => {
+    if (annDocked()) { applyAnnDock(); return; }
     if (popup.classList.contains("hidden")) return;
     const r = popup.getBoundingClientRect();
     popup.style.left = Math.min(window.innerWidth - MIN_VISIBLE_X, Math.max(MIN_VISIBLE_X - r.width, r.left)) + "px";
@@ -2198,6 +2202,96 @@ function setupAnnResize() {
     });
     handle.addEventListener("dblclick", resetSize);
   }
+}
+
+const ANN_SIDE_W_KEY = "ph.ann.sideW";
+
+/// 弹窗左侧对话树宽度：拖动 #ann-side-resizer 调整，尺寸存 localStorage（可伸缩）。
+function setupAnnSideResize() {
+  const handle = $("ann-side-resizer");
+  const side = $("ann-side");
+  const popup = $("ann-popup");
+  if (!handle || !side || !popup) return;
+  try {
+    const w = Number(localStorage.getItem(ANN_SIDE_W_KEY) || 0);
+    if (w >= 120) popup.style.setProperty("--ann-side-w", Math.round(w) + "px");
+  } catch (e) { /* 忽略损坏的存储 */ }
+  handle.addEventListener("pointerdown", (e) => {
+    const start = { x: e.clientX, w: side.getBoundingClientRect().width };
+    handle.classList.add("dragging");
+    startPointerDrag(handle, e, {
+      cursor: "col-resize",
+      onMove: (ev) => {
+        const max = Math.max(160, popup.getBoundingClientRect().width * 0.6);
+        const w = Math.min(Math.max(120, start.w + (ev.clientX - start.x)), max);
+        popup.style.setProperty("--ann-side-w", Math.round(w) + "px");
+      },
+      onEnd: () => {
+        handle.classList.remove("dragging");
+        try {
+          localStorage.setItem(ANN_SIDE_W_KEY, String(Math.round(side.getBoundingClientRect().width)));
+        } catch (err) { /* 忽略 */ }
+      },
+    });
+  });
+}
+
+const ANN_DOCK_KEY = "ph.ann.dock";
+const ANN_DOCK_W_KEY = "ph.ann.dockW";
+
+/// 弹窗是否停靠为右侧栏（停靠态下挤压页面布局，见 CSS `body.ann-docked`）。
+function annDocked() {
+  return localStorage.getItem(ANN_DOCK_KEY) === "1";
+}
+
+/// 应用停靠状态：切换 body/弹窗 class、按钮文案、顶边与宽度变量。
+function applyAnnDock() {
+  const popup = $("ann-popup");
+  if (!popup) return;
+  const on = annDocked();
+  const visible = !popup.classList.contains("hidden");
+  document.body.classList.toggle("ann-docked", on && visible); // 只在弹窗可见时挤压页面
+  popup.classList.toggle("docked", on);
+  const btn = $("ann-dock");
+  if (btn) {
+    btn.textContent = on ? "浮动" : "停靠";
+    btn.title = on ? "取消停靠，恢复为浮动窗口" : "停靠到右侧，随页面一起排布";
+  }
+  if (on) {
+    const w = Number(localStorage.getItem(ANN_DOCK_W_KEY) || 0) || 420;
+    document.documentElement.style.setProperty("--ann-dock-w", Math.round(w) + "px");
+    const tb = document.querySelector(".topbar");
+    const top = tb ? tb.getBoundingClientRect().bottom : 48;
+    document.documentElement.style.setProperty("--ann-dock-top", Math.round(top) + "px");
+  }
+}
+
+function toggleAnnDock() {
+  try { localStorage.setItem(ANN_DOCK_KEY, annDocked() ? "0" : "1"); } catch (e) { /* 忽略 */ }
+  applyAnnDock();
+  const popup = $("ann-popup");
+  if (!annDocked() && popup && !popup.classList.contains("hidden")) {
+    positionPopup(window.innerWidth - 480, 90); // 取消停靠：拉回视口内
+  }
+}
+
+/// 停靠宽度：拖动左缘把手（仅停靠态可见）改变右侧栏宽度，尺寸存 localStorage（可伸缩）。
+function setupAnnDockResize() {
+  const handle = $("ann-dock-resizer");
+  if (!handle) return;
+  handle.addEventListener("pointerdown", (e) => {
+    startPointerDrag(handle, e, {
+      cursor: "col-resize",
+      onMove: (ev) => {
+        const w = Math.min(Math.max(280, window.innerWidth - ev.clientX), window.innerWidth - 120);
+        document.documentElement.style.setProperty("--ann-dock-w", Math.round(w) + "px");
+      },
+      onEnd: () => {
+        const v = getComputedStyle(document.documentElement).getPropertyValue("--ann-dock-w");
+        try { localStorage.setItem(ANN_DOCK_W_KEY, String(parseInt(v, 10) || 420)); } catch (err) { /* 忽略 */ }
+      },
+    });
+  });
 }
 
 /// 思考过程区高度：底部拖动条调整（按面板存 localStorage）。
@@ -2285,6 +2379,8 @@ function clearAnnSubquote() {
 async function openAnnotationCreate(anchor) {
   const isAnswer = !!anchor.node_id;
   const isPdf = !!anchor.pdf;
+  // 回答批注：记住发起时所在的「基础批注」，发送完成后再回到它的整条对话森林。
+  annHostId = isAnswer && currentAnnotation && currentAnnotation.id ? currentAnnotation.id : null;
   currentAnnotation = {
     id: null,
     block_id: anchor.block_id || "",
@@ -2296,6 +2392,7 @@ async function openAnnotationCreate(anchor) {
   };
   if (!isAnswer) annSelectedNode = null;
   annNavigated = false;
+  annNewRoot = true;   // 新建批注的首次提问即一个新的对话根
   await loadMathLibs();
   $("ann-quote").textContent = anchor.quote;
   showAnnSubquote(anchor.quote);
@@ -2303,6 +2400,7 @@ async function openAnnotationCreate(anchor) {
     $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
   }
   $("ann-popup").classList.remove("hidden");
+  applyAnnDock();
   if ((isAnswer || isPdf) && anchor.rect) {
     positionPopup(anchor.rect.left, anchor.rect.bottom + 10);
   } else {
@@ -2315,7 +2413,7 @@ async function openAnnotationCreate(anchor) {
   $("ann-q").value = "";
   annInputGrow();
   clearAnnAttachments();
-  currentAnnThread = null;
+  currentAnnThreads = null;
   applyAnnSide();
   renderPopupTree(null);
   $("ann-q").focus();
@@ -2334,16 +2432,19 @@ async function openAnnotationView(annId, opts = {}) {
     pdf: ann.page != null ? { page: ann.page, rects: ann.rects || [], kind: ann.kind || "text" } : null,
     image: null,
   };
-  annSelectedNode = ann.thread ? ann.thread.node_id : null;
+  const viewThreads = ann.threads || (ann.thread ? [ann.thread] : []);
+  annSelectedNode = viewThreads.length ? viewThreads[0].node_id : null;
   annNavigated = false;
+  annNewRoot = false;
   await loadMathLibs();
   clearAnnSubquote();
   clearAnnAttachments();
   $("ann-quote").textContent = cleanQuote(ann.quote);
-  setPopupThread(ann.thread);
-  renderAnnThread(ann.thread);
+  setPopupThreads(viewThreads);
+  renderAnnThread(viewThreads);
   $("ann-popup").classList.remove("hidden");
   applyAnnSide();
+  applyAnnDock();
   if (ann.page != null) {
     // PDF 批注：高亮在阅读器里（不在笔记 iframe），用点击位置或居中定位
     if (opts.rect) positionPopup(opts.rect.left, opts.rect.bottom + 10);
@@ -2387,7 +2488,7 @@ function onAnnNodeClick(el, fn) {
   });
 }
 
-let renderedThreadRoot = null; // 当前弹窗里渲染的线程根（点击回答高亮时需要重渲染）
+let renderedThreads = null; // 当前弹窗里渲染的对话森林（点击回答高亮时需要重渲染）
 
 /// 节点引文行：提问所针对的原文/回答片段（回看时能看出“问的是哪一段”）。
 function annQuoteEl(quote) {
@@ -2400,11 +2501,13 @@ function annQuoteEl(quote) {
   return el;
 }
 
-function renderAnnThread(root) {
+/// 渲染弹窗右侧内容：整片对话森林（每条根一棵树）。
+function renderAnnThread(roots) {
   const box = $("ann-thread");
   box.innerHTML = "";
-  renderedThreadRoot = root || null;
-  if (!root) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
+  const list = (roots || []).filter(Boolean);
+  renderedThreads = list.length ? list : null;
+  if (!list.length) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
   const add = (node, depth, container) => {
     const div = document.createElement("div");
     div.className = "ann-node" + (annSelectedNode === node.node_id ? " selected" : "");
@@ -2465,9 +2568,10 @@ function renderAnnThread(root) {
     div.appendChild(q);
     div.appendChild(a);
     onAnnNodeClick(div, () => {
+      annNewRoot = false;
       annSelectedNode = node.node_id;
-      renderAnnThread(root);
-      renderPopupTree(popupThread());
+      renderAnnThread(list);
+      renderPopupTree(popupThreads());
       runCommand("goto " + node.n, { skipReload: true });
     });
     div.oncontextmenu = (e) => {
@@ -2478,7 +2582,7 @@ function renderAnnThread(root) {
     container.appendChild(div);
     (node.children || []).forEach((c) => add(c, depth + 1, container));
   };
-  add(root, 0, box);
+  list.forEach((r) => add(r, 0, box));
 }
 
 function showAnnNodeMenu(x, y, node) {
@@ -2504,21 +2608,28 @@ async function afterAnnotationChange() {
   await refreshAnnotations();
   if (currentAnnotation && currentAnnotation.id) {
     const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
-    if (ann) renderAnnThread(ann.thread);
-    else closeAnnPopup();
+    if (ann) {
+      const roots = ann.threads || (ann.thread ? [ann.thread] : []);
+      setPopupThreads(roots);
+      renderAnnThread(roots);
+    } else {
+      closeAnnPopup();
+    }
   }
   reloadNote(null, true);
 }
 
 function closeAnnPopup() {
   $("ann-popup").classList.add("hidden");
+  applyAnnDock(); // 关闭后不再挤压页面布局
   $("ann-sel-btn").classList.add("hidden");
   clearAnnSubquote();
   clearAnnAttachments();
   currentAnnotation = null;
   annSelectedNode = null;
   annNavigated = false;
-  currentAnnThread = null;
+  annNewRoot = false;
+  currentAnnThreads = null;
   renderPopupTree(null);
 }
 
@@ -2534,6 +2645,8 @@ function applyAnnSide() {
   const shown = annSideShown();
   side.classList.toggle("hidden", !shown);
   if (btn) btn.classList.toggle("active", shown);
+  const rz = $("ann-side-resizer");
+  if (rz) rz.classList.toggle("hidden", !shown);
 }
 function toggleAnnSide() {
   try {
@@ -2714,6 +2827,39 @@ function onAnnFiles(fileList) {
   if (inp) inp.value = "";
 }
 
+/// 按锚点（笔记块 / 回答节点 / PDF 页）在批注缓存里找对应批注（取最新一条）。
+function findAnnByAnchor(anchor) {
+  const list = [...annotationsCache].reverse();
+  if (anchor.node_id) {
+    return list.find((a) => a.node_id === anchor.node_id && a.quote === anchor.quote) || null;
+  }
+  if (anchor.pdf) {
+    const same = (a) =>
+      a.page === anchor.pdf.page &&
+      (a.kind || "text") === (anchor.pdf.kind || "text") &&
+      JSON.stringify(a.rects || []) === JSON.stringify(anchor.pdf.rects || []);
+    return list.find((a) => !a.node_id && same(a) && a.quote === anchor.quote) || null;
+  }
+  return (
+    list.find(
+      (a) => !a.node_id && a.page == null && (a.block_id || "") === (anchor.block_id || "") && a.quote === anchor.quote
+    ) || null
+  );
+}
+
+/// 批注缓存项 → currentAnnotation 结构（PDF 用批注页码，否则沿用发送前的 pdf）。
+function annToCurrent(ann, prevPdf) {
+  return {
+    id: ann.id,
+    block_id: ann.block_id,
+    node_id: ann.node_id || null,
+    quote: ann.quote,
+    quote_tex: ann.quote_tex || ann.quote,
+    pdf: ann.page != null ? { page: ann.page, rects: ann.rects || [], kind: ann.kind || "text" } : (prevPdf || null),
+    image: null,
+  };
+}
+
 async function sendAnnotation() {
   const q = $("ann-q").value.trim();
   if (!q || !currentAnnotation) return;
@@ -2727,15 +2873,18 @@ async function sendAnnotation() {
   setAnnProgress("思考中…");
   resetReasoning("ann");
   const ansEl = appendPendingNode(q, currentAnnotation.quote);
-  let url, body;
   const answerAnchorNode = currentAnnotation.node_id && !currentAnnotation.id ? currentAnnotation.node_id : null;
-  if (currentAnnotation.id || annNavigated) {
-    // 已有批注继续追问 / 在弹窗对话树里点节点后提问：新问答挂到选中节点下
-    if (!annSelectedNode) { $("ann-send").disabled = false; setAnnProgress(""); return; }
+  const pdfPrev = currentAnnotation.pdf;
+  // reply：已有批注 + 已选节点 + 未点空白新根 → 挂到选中节点下；
+  // answer：在弹窗回答里选文字首次提问 → 锚定该回答节点；
+  // note：其余（笔记/PDF 基础批注）→ 新建或复用同锚点批注、追加一个新的对话根。
+  let mode, url, body;
+  if (currentAnnotation.id && annSelectedNode && !annNewRoot) {
+    mode = "reply";
     url = "/api/annotate/reply";
     body = { node_id: annSelectedNode, question: q, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
   } else if (answerAnchorNode) {
-    // 回答批注：锚定该回答所在节点，新问答成为它的子节点
+    mode = "answer";
     url = "/api/annotate/answer";
     body = {
       node_id: answerAnchorNode,
@@ -2746,6 +2895,7 @@ async function sendAnnotation() {
       attachments: currentAnnAttachments(),
     };
   } else {
+    mode = "note";
     url = "/api/annotate";
     body = {
       block_id: currentAnnotation.block_id,
@@ -2760,6 +2910,11 @@ async function sendAnnotation() {
       if (currentAnnotation.image) body.image = currentAnnotation.image;
     }
   }
+  // 记录锚点与宿主，发送完成后据此定位要展示的该条批注（回答批注要回到发起时的宿主弹窗）。
+  const anchor = { block_id: currentAnnotation.block_id, node_id: answerAnchorNode, pdf: currentAnnotation.pdf, quote: currentAnnotation.quote };
+  const hostId = annHostId;
+  const replyAnnId = currentAnnotation.id;
+  annNewRoot = false;
   clearAnnAttachments();
   let streamed = "";
   const controller = new AbortController();
@@ -2816,61 +2971,34 @@ async function sendAnnotation() {
   if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
   await refreshState();
   await refreshAnnotations();
-  if (currentAnnotation.id) {
-    const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
-    if (ann) {
-      currentAnnotation = {
-        id: ann.id,
-        block_id: ann.block_id,
-        node_id: ann.node_id || null,
-        quote: ann.quote,
-        quote_tex: ann.quote_tex || ann.quote,
-        pdf: currentAnnotation.pdf,
-        image: null,
-      };
-      setPopupThread(ann.thread);
-      renderAnnThread(ann.thread);
-    }
-  } else if (annNavigated && annSelectedNode) {
-    // 对话树导航下追问：仍显示整条线程（新子节点已在其中）
-    const thread = popupThread();
-    if (thread) { renderAnnThread(thread); renderPopupTree(thread); }
+  // 发送完成后要展示的该条批注：回复→原批注；回答→发起时的宿主（保持整条对话森林）；
+  // 笔记/PDF→按锚点定位（同锚点已复用同一条批注，新根已并入其中）。
+  let focusAnn = null;
+  if (mode === "reply") {
+    focusAnn = annotationsCache.find((a) => a.id === replyAnnId) || null;
+  } else if (mode === "answer") {
+    focusAnn = (hostId && annotationsCache.find((a) => a.id === hostId)) || findAnnByAnchor(anchor);
   } else {
-    // 新建：匹配最新一条（同块/同节点/同页 + 同引用）
-    const latest = annotationsCache[annotationsCache.length - 1];
-    const curPage = currentAnnotation.pdf ? currentAnnotation.pdf.page : null;
-    const sameAnchor = latest &&
-      (latest.block_id || "") === (currentAnnotation.block_id || "") &&
-      (latest.node_id || "") === (currentAnnotation.node_id || "") &&
-      ((latest.page == null ? null : latest.page) === curPage);
-    if (sameAnchor && latest.quote === currentAnnotation.quote) {
-      currentAnnotation = {
-        id: latest.id,
-        block_id: latest.block_id,
-        node_id: latest.node_id || null,
-        quote: latest.quote,
-        quote_tex: latest.quote_tex || latest.quote,
-        pdf: currentAnnotation.pdf,
-        image: null,
-      };
-      annSelectedNode = latest.thread ? latest.thread.node_id : null;
-      setPopupThread(latest.thread);
-      renderAnnThread(latest.thread);
-    }
+    focusAnn = findAnnByAnchor(anchor);
   }
-  // 回答批注：在父线程里选中并滚动到刚创建的子节点
-  if (answerAnchorNode) {
-    const latest = [...annotationsCache].reverse().find((a) => a.node_id === answerAnchorNode);
-    if (latest) {
-      annSelectedNode = latest.root_node_id;
-      const parent = currentAnnotation.id
-        ? annotationsCache.find((a) => a.id === currentAnnotation.id)
-        : null;
-      if (parent) { setPopupThread(parent.thread); renderAnnThread(parent.thread); }
-      const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${latest.root_node_id}"]`);
-      if (el) el.scrollIntoView({ block: "center" });
+  if (focusAnn) {
+    currentAnnotation = annToCurrent(focusAnn, pdfPrev);
+    const roots = focusAnn.threads || (focusAnn.thread ? [focusAnn.thread] : []);
+    if (mode === "answer") {
+      // 选中刚创建的子节点（它已并入宿主森林里）
+      const created = findAnnByAnchor(anchor);
+      annSelectedNode = (created && created.root_node_id) || (roots[0] && roots[0].node_id) || null;
+    } else if (mode === "note") {
+      // 森林新根：选中间题文本等于本次提问的那条根
+      const t = roots.find((r) => r.question === q);
+      annSelectedNode = (t && t.node_id) || (roots.length ? roots[roots.length - 1].node_id : null);
     }
+    setPopupThreads(roots);
+    renderAnnThread(roots);
+    const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${annSelectedNode}"]`);
+    if (el) el.scrollIntoView({ block: "center" });
   }
+  annHostId = null;
   reloadNote(null, true);
 }
 
@@ -4498,6 +4626,7 @@ async function wizardNext() {
 // ===== 侧栏：活动栏切换 + 宽度拖拽 =====
 const PANEL_KEY = "ph.panel";
 const WIDTH_KEY = "ph.sidebarWidth";
+const COLLAPSE_KEY = "ph.sidebarCollapsed";
 
 function setupSidebar() {
   const acts = document.querySelectorAll("#activitybar .act");
@@ -4513,15 +4642,19 @@ function setupSidebar() {
   let current = localStorage.getItem(PANEL_KEY) || "outline";
   if (![...panels].some((p) => p.dataset.panel === current)) current = "outline";
   apply(current);
+  // 侧栏折叠状态持久化（可折叠）
+  if (localStorage.getItem(COLLAPSE_KEY) === "1") sidebar.classList.add("collapsed");
 
   acts.forEach((b) => {
     b.onclick = () => {
       // 再点当前面板 = 收起/展开侧栏（VS Code 行为）
       if (b.classList.contains("active") && !sidebar.classList.contains("collapsed")) {
         sidebar.classList.add("collapsed");
+        try { localStorage.setItem(COLLAPSE_KEY, "1"); } catch (e) { /* 忽略 */ }
         return;
       }
       sidebar.classList.remove("collapsed");
+      try { localStorage.setItem(COLLAPSE_KEY, "0"); } catch (e) { /* 忽略 */ }
       current = b.dataset.panel;
       localStorage.setItem(PANEL_KEY, current);
       apply(current);
@@ -4668,11 +4801,23 @@ document.addEventListener("DOMContentLoaded", () => {
     e.stopPropagation();
     const ann = annotationsCache.find((a) => a.id === mark.dataset.annId);
     if (!ann) return;
-    annSelectedNode = ann.root_node_id;
-    if (renderedThreadRoot) renderAnnThread(renderedThreadRoot);
-    const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${ann.root_node_id}"]`);
+    const roots = ann.threads || (ann.thread ? [ann.thread] : []);
+    annNewRoot = false;
+    annSelectedNode = roots.length ? roots[0].node_id : ann.root_node_id;
+    if (renderedThreads) renderAnnThread(renderedThreads);
+    const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${annSelectedNode}"]`);
     if (el) el.scrollIntoView({ block: "center" });
   });
+  // 对话树空白处点击：下一次提问作为新的对话根（森林），不再显示编号/提示
+  const convTree = $("ann-conv-tree");
+  if (convTree) {
+    convTree.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest(".conv-row")) return;
+      annNewRoot = true;
+      annSelectedNode = null;
+      renderPopupTree(popupThreads());
+    });
+  }
   $("ann-thread").addEventListener("contextmenu", (e) => {
     const mark = e.target.closest ? e.target.closest("mark.ann-mark") : null;
     if (!mark) return;
@@ -4687,9 +4832,13 @@ document.addEventListener("DOMContentLoaded", () => {
   $("ann-q").addEventListener("input", annInputGrow);
   setupAnnInputResize();
   setupAnnResize();
+  setupAnnSideResize();
+  setupAnnDockResize();
   setupReasoningResize();
   setupReasoningPref();
   applyAnnSide();
+  applyAnnDock();
+  if ($("ann-dock")) $("ann-dock").onclick = toggleAnnDock;
   $("btn-config").onclick = () => openConfig("model");
   $("btn-settings-close").onclick = () => $("config-modal").classList.add("hidden");
   document.querySelectorAll("#settings-tabs .settings-tab").forEach(
