@@ -11,12 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::conversation::Conversation;
+use crate::conversation::{strip_legacy_check_label, Conversation};
 use crate::notes::Note;
 use crate::paths;
 
 /// 每次 API 调用的 token 与成本累计（会话级）。
-/// 由 `ask/check/ingest/…` 在 LLM 返回后累加，退出时并入跨会话 knowledge.json。
+/// 由 `ask/ingest/…` 在 LLM 返回后累加，退出时并入跨会话 knowledge.json。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionStats {
     #[serde(default)]
@@ -127,7 +127,18 @@ impl Session {
         if sess.created_at.is_empty() {
             sess.created_at = chrono::Utc::now().to_rfc3339();
         }
+        sess.normalize_legacy();
         Ok(sess)
+    }
+
+    /// 旧数据迁移：移除已废弃的「核对(check)」标记，节点保留为普通问答。
+    fn normalize_legacy(&mut self) {
+        for node in &mut self.conversation.nodes {
+            let stripped = strip_legacy_check_label(&node.label).to_string();
+            if stripped != node.label {
+                node.label = stripped;
+            }
+        }
     }
 }
 
@@ -244,7 +255,14 @@ impl SessionScan {
 
 fn scan(path: &Path) -> Option<SessionScan> {
     let s = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<SessionScan>(&s).ok()
+    let mut sc = serde_json::from_str::<SessionScan>(&s).ok()?;
+    for node in &mut sc.conversation.nodes {
+        let stripped = strip_legacy_check_label(&node.label).to_string();
+        if stripped != node.label {
+            node.label = stripped;
+        }
+    }
+    Some(sc)
 }
 
 /// 找包含指定论文的会话，取 `updated_at` 最新者。
@@ -411,6 +429,23 @@ mod tests {
         assert_eq!(loaded.conversation.nodes.len(), 1);
         assert_eq!(loaded.stats.calls, 1);
         assert_eq!(loaded.conversation.current.as_deref(), Some("n1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 旧会话里的 `[核对] ` 标签应在加载时剥离，节点保留为普通问答。
+    #[test]
+    fn load_strips_legacy_check_label() {
+        let dir = std::env::temp_dir().join("paperhelper_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("legacy_check.json");
+        let old = r#"{"conversation":{"nodes":[
+            {"id":"n1","question":"q1","answer":"a1","created_at":"t","label":"[核对] 余弦相似度"},
+            {"id":"n2","parent":"n1","question":"q2","answer":"a2","created_at":"t","label":"BERT"}
+        ]}}"#;
+        std::fs::write(&path, old).unwrap();
+        let loaded = Session::load(&path).unwrap();
+        assert_eq!(loaded.conversation.nodes[0].label, "余弦相似度");
+        assert_eq!(loaded.conversation.nodes[1].label, "BERT", "非核对标签不应改动");
         let _ = std::fs::remove_file(&path);
     }
 

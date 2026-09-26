@@ -112,7 +112,6 @@ paperhelper --version       # 查看版本号（排查 / 反馈时用）
    ...
 > ask 3.2 BERTScore的公式里max_k是什么意思   # 按编号追问，解释插入 3.2 节
 > ask 3.2 它和余弦相似度有什么区别            # 对上一个回答再追问，自动嵌套
-> check 3.2 我觉得这就是余弦相似度，对吗      # 核对想法，不写入笔记
 > sum                             # 折叠当前追问子树为「总结」
 > stats                           # 看 token 用量和成本
 > exit                            # 退出，自动保存
@@ -144,7 +143,7 @@ paperhelper --version       # 查看版本号（排查 / 反馈时用）
 ### REPL 操作
 
 - `↑↓` 历史命令，`←→` 移动光标，`Ctrl-C` 立即打断当前任务
-- Tab 补全：命令名、文件路径（`ingest/save/load/export`）、节点/笔记编号（`goto/ask/check`）、配置键（`config set`）
+- Tab 补全：命令名、文件路径（`ingest/save/load/export`）、节点/笔记编号（`goto/ask`）、配置键（`config set`）
 
 ## 命令一览
 
@@ -155,7 +154,6 @@ paperhelper --version       # 查看版本号（排查 / 反馈时用）
 | `ingest --read <pdf>` | 仅阅读 PDF 原件（不调 LLM、不生成笔记、不自动导出） |
 | `ingest --text <txt>` / `ingest --ocr <pdf>` | 直读文本 / OCR 扫描件 |
 | `ask <编号> <问题>` / `ask --no-concept <编号> <问题>` | 按编号定位追问，解释插入相关位置，递归嵌套 |
-| `check <编号> <想法>` | 核对理解，不写入笔记 |
 | `sum [n]` / `del [n] [--yes]` | 折叠/删除节点 n（默认当前）的子树 |
 | `undo` | 撤销上一次编辑 / 删除（内存多级，最多 20 步） |
 | `blocks` / `note` / `tree` / `goto <n>` | 看笔记结构 / 全文 / 对话轨迹 / 跳到对话节点 |
@@ -168,6 +166,8 @@ paperhelper --version       # 查看版本号（排查 / 反馈时用）
 | `config show` / `config set <k> <v>` / `config presets [id]` | 查看 / 设置配置（见下）；预设一键预填 DeepSeek 等 |
 | `config test` | 用当前配置发一条最小请求测试（失败打印原始响应） |
 | `exit` | 退出（自动保存，并提示恢复方式） |
+
+> **变更（0.8.0）**：已移除 `check` 命令与「核对」模式——提问一律写入笔记。旧会话里带 `[核对]` 标记的节点在加载时会自动清理为普通问答（不丢历史）。
 
 ---
 
@@ -202,7 +202,7 @@ brew install tesseract tesseract-lang                    # macOS
 ```bash
 git clone <仓库地址> && cd paperhelper
 cargo build            # 编译
-cargo test             # 运行测试（108 个）
+cargo test             # 运行测试（109 个）
 ```
 
 产物在 `./target/debug/paperhelper`；Windows 上多一个 `./target/debug/paperhelper-desktop.exe` 桌面窗口版。
@@ -344,7 +344,7 @@ PAPERHELPER_DATA_DIR="$HOME/PaperHelper/.paperhelper" paperhelper web
 
 ```bash
 cargo build            # 构建
-cargo test             # 108 个单元测试
+cargo test             # 109 个单元测试
 cargo build --release  # 发布构建
 ```
 

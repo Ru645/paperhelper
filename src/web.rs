@@ -566,9 +566,9 @@ async fn api_run(
             return;
         }
 
-        // ask/check/sum：与 ingest 相同的三段式（LLM 阶段不持 App 锁，
+        // ask/sum：与 ingest 相同的三段式（LLM 阶段不持 App 锁，
         // 期间用户可浏览/切换会话；结果由 commit 写回发起会话）。
-        if matches!(first.as_str(), "ask" | "q" | "check" | "sum") {
+        if matches!(first.as_str(), "ask" | "q" | "sum") {
             enum Job {
                 Ask(crate::app::AskJob),
                 Sum(crate::app::SumJob),
@@ -583,7 +583,7 @@ async fn api_run(
                 let r = if first == "sum" {
                     g.prepare_sum(&rest).map(Job::Sum)
                 } else {
-                    g.prepare_ask_command(&rest, first == "check").map(Job::Ask)
+                    g.prepare_ask_command(&rest).map(Job::Ask)
                 };
                 g.emitter = Emitter::terminal();
                 r
@@ -2272,9 +2272,6 @@ struct AnnotateReq {
     #[serde(default)]
     quote_tex: Option<String>,
     question: String,
-    /// "ask"（默认，写入笔记解释）或 "check"（只进批注线程）。
-    #[serde(default)]
-    mode: Option<String>,
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
@@ -2308,7 +2305,6 @@ async fn api_annotate(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("批注提问「{}」", req.question);
         let t0 = std::time::Instant::now();
         let mut extra = match parse_attachments(req.attachments) {
@@ -2331,7 +2327,6 @@ async fn api_annotate(
                     pdf.kind.as_deref().unwrap_or("text"),
                     &req.quote,
                     &req.question,
-                    is_check,
                     req.record_concept,
                     &extra,
                 )
@@ -2341,7 +2336,6 @@ async fn api_annotate(
                     &req.quote,
                     req.quote_tex.as_deref(),
                     &req.question,
-                    is_check,
                     req.record_concept,
                     &extra,
                 )
@@ -2391,8 +2385,6 @@ struct AnnotateAnswerReq {
     #[serde(default)]
     quote_tex: Option<String>,
     question: String,
-    #[serde(default)]
-    mode: Option<String>,
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
@@ -2409,7 +2401,6 @@ async fn api_annotate_answer(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("回答批注「{}」", req.question);
         let t0 = std::time::Instant::now();
         let extra = match parse_attachments(req.attachments) {
@@ -2427,7 +2418,6 @@ async fn api_annotate_answer(
                 &req.quote,
                 req.quote_tex.as_deref(),
                 &req.question,
-                is_check,
                 req.record_concept,
                 &extra,
             );
@@ -2471,8 +2461,6 @@ async fn api_annotate_answer(
 struct AnnotateReplyReq {
     node_id: String,
     question: String,
-    #[serde(default)]
-    mode: Option<String>,
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
@@ -2488,7 +2476,6 @@ async fn api_annotate_reply(
     let (tx, rx) = mpsc::unbounded_channel::<OutEvent>();
     let app2 = app.clone();
     tokio::spawn(async move {
-        let is_check = matches!(req.mode.as_deref(), Some("check"));
         let what = format!("批注追问「{}」", req.question);
         let t0 = std::time::Instant::now();
         let extra = match parse_attachments(req.attachments) {
@@ -2501,7 +2488,7 @@ async fn api_annotate_reply(
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
-            let r = g.prepare_annotate_reply(&req.node_id, &req.question, is_check, req.record_concept, &extra);
+            let r = g.prepare_annotate_reply(&req.node_id, &req.question, req.record_concept, &extra);
             g.emitter = Emitter::terminal();
             r
         };
@@ -2692,7 +2679,6 @@ fn build_thread_opts(
             "question": n.question,
             "quote": n.quote,
             "answer": if include_answer { n.answer.clone() } else { String::new() },
-            "is_check": n.explanation_id.is_none(),
             "summary": summary,
             "collapsed": collapsed,
             "children": children,

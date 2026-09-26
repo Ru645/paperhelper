@@ -4,7 +4,7 @@
 //! `run_command()` 按命令名分发给各 `cmd_*`。核心业务流程：
 //! - ingest：抽 PDF 文本 → LLM 生成四段笔记 Markdown → Rust 解析成笔记树并编号 →
 //!   登记论文 → 首次交互式询问导出文件名（后续 ask 自动同步导出）。
-//! - ask/check：用 `build_context_messages` 拼上下文（笔记块 + 论文全文 +
+//! - ask：用 `build_context_messages` 拼上下文（笔记块 + 论文全文 +
 //!   知识库相关概念 + 对话根路径），LLM 流式回答；ask 建 Explanation 挂到
 //!   locate 定位的块并递归嵌套，check 只建对话节点不写笔记。
 //! - sum：把当前节点子树收集后让 LLM 概括，折叠进 Explanation。
@@ -48,7 +48,7 @@ macro_rules! outerr {
     ($slf:expr, $($arg:tt)*) => { $slf.emitter.stderr(format!($($arg)*)) };
 }
 
-/// ask/check 的 system prompt：优先用 .paperhelper/prompts/ask.txt（用户可编辑），
+/// ask 的 system prompt：优先用 .paperhelper/prompts/ask.txt（用户可编辑），
 /// 不存在则用内置默认并首启写出。
 fn sys_ask() -> String {
     crate::prompts::load_prompt(
@@ -59,7 +59,7 @@ fn sys_ask() -> String {
 }
 
 const COMMANDS: &[&str] = &[
-    "ingest", "ask", "check", "sum", "del", "undo", "blocks", "note", "tree", "goto", "stats",
+    "ingest", "ask", "sum", "del", "undo", "blocks", "note", "tree", "goto", "stats",
     "budget", "save", "load", "export", "papers", "concepts", "graph", "styles", "config", "new",
     "help", "exit",
 ];
@@ -106,7 +106,7 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
 /// 命令补全器：
 /// - 第一个词：补全命令名
 /// - ingest/save/load/export 的参数：补全文件路径
-/// - goto/ask/check 的第一个参数：补全节点编号或 section 编号
+/// - goto/ask 的第一个参数：补全节点编号或 section 编号
 /// - config：子命令 / 键名（表驱动）/ 值候选（bool 表驱动，模型与端点来自 presets）
 struct CommandCompleter {
     file_completer: FilenameCompleter,
@@ -216,8 +216,8 @@ impl Completer for CommandCompleter {
             return Ok((start, matches));
         }
 
-        // ask/check 的第一个参数：补全 section 编号
-        if matches!(cmd, "ask" | "check") {
+        // ask 的第一个参数：补全 section 编号
+        if matches!(cmd, "ask") {
             let nums = self.section_numbers.lock().unwrap();
             let matches: Vec<String> = nums
                 .iter()
@@ -324,11 +324,10 @@ pub struct AskJob {
     parent: Option<String>,
     question: String,
     block_id: Option<String>,
-    is_check: bool,
     quote: Option<String>,
     record_concept: bool,
     approx_tokens: usize,
-    /// 是否把解释写进笔记树（普通 ask/check 为 true；PDF 页面提问为 false，
+    /// 是否把解释写进笔记树（普通 ask 为 true；PDF 页面提问为 false，
     /// 只建独立对话线程 + 批注，不改动生成的笔记）。
     attach_note: bool,
 }
@@ -377,8 +376,7 @@ impl AskJob {
     pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
         interrupt::reset();
         emitter.progress(&format!(
-            "{}（上下文约 {} token）",
-            if self.is_check { "核对中…" } else { "思考中…" },
+            "思考中…（上下文约 {} token）",
             self.approx_tokens
         ));
         let mut first = true;
@@ -926,7 +924,6 @@ impl App {
             "export" => self.cmd_export(rest).await,
             "ingest" | "pdf" => self.cmd_ingest(rest).await,
             "ask" | "q" => self.cmd_ask(rest).await,
-            "check" => self.cmd_check(rest).await,
             "sum" => self.cmd_sum(rest).await,
             "del" | "rm" => self.cmd_del(rest).await,
             "undo" => self.cmd_undo().await,
@@ -961,8 +958,6 @@ PaperHelper 命令：
   ask <编号> <问题>        基于论文全文+笔记回答，解释插入笔记对应位置
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
-  check <编号> <想法>      与 ask 类似但不写入笔记，用于核对想法
-                          例: check 3.2 我觉得BERTScore就是余弦相似度，对吗
   sum                      把当前节点子树的追问折叠并替换为「总结：…」（可点击展开）
   del [--yes]              删除当前节点及其子树（需 --yes 确认；根节点不可删）
   undo                     撤销上一次编辑/删除（内存多级，最多 20 步）
@@ -1788,13 +1783,13 @@ PaperHelper 命令：
             outln!(self, "说明: 解释会插入笔记对应 Section 下方。不填编号则退化为关键词匹配。");
             return Ok(());
         }
-        let job = self.prepare_ask_command(args, false)?;
+        let job = self.prepare_ask_command(args)?;
         self.run_ask(job).await.map(|_| ())
     }
 
-    /// ask/check 的 **prepare 段入口**（CLI 与 Web 三段式共用）：
+    /// ask 的 **prepare 段入口**（CLI 与 Web 三段式共用）：
     /// 解析参数 → 定位块 → `prepare_ask`；返回的 `AskJob` 可在不持 App 锁时流式执行。
-    pub fn prepare_ask_command(&mut self, args: &str, is_check: bool) -> Result<AskJob> {
+    pub fn prepare_ask_command(&mut self, args: &str) -> Result<AskJob> {
         let args = args.trim();
         // `--no-concept`：本次回答不写入「已学概念」（适合“这段什么意思”这类操作性提问）
         let (record_concept, args) = if let Some(rest) = strip_flag(args, "--no-concept") {
@@ -1806,11 +1801,7 @@ PaperHelper 命令：
         let (block_num, question) = parse_ask_args(args);
         let question = question.trim();
         if question.is_empty() {
-            bail!(
-                "用法: {} <编号> <问题>   例: {} 3.2 BERTScore是什么",
-                if is_check { "check" } else { "ask" },
-                if is_check { "check" } else { "ask" }
-            );
+            bail!("用法: ask <编号> <问题>   例: ask 3.2 BERTScore是什么");
         }
         if block_num.is_none() {
             outerr!(self, "{} 未指定编号，将用关键词匹配定位（可能不准）。建议用 `ask <编号> <问题>`。", "⚠️ ".yellow());
@@ -1819,27 +1810,10 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.prepare_ask(question, block_id, is_check, None, record_concept)
+        self.prepare_ask(question, block_id, None, record_concept)
     }
 
-    /// check <编号> <想法>：与 ask 类似调 LLM 回答，但不写入笔记、不增加追问嵌套。
-    /// 对话树仍记录此节点（用于上下文），但 explanation_id 为 None。
-    async fn cmd_check(&mut self, args: &str) -> Result<()> {
-        let args = args.trim();
-        if args == "--help" || args == "-h" || args.is_empty() {
-            outln!(self, "用法: check <编号> <想法>");
-            outln!(self, "  <编号>    笔记中 Section 的编号（见 blocks 或导出笔记标题，如 3.2）");
-            outln!(self, "  <想法>    你想核对/验证的想法或理解");
-            outln!(self, "例:");
-            outln!(self, "  check 3.2 我觉得BERTScore本质上就是余弦相似度，对吗");
-            outln!(self, "说明: 回答只显示在终端，不写入笔记。对话树会记录此节点。");
-            return Ok(());
-        }
-        let job = self.prepare_ask_command(args, true)?;
-        self.run_ask(job).await.map(|_| ())
-    }
-
-    /// 按编号/关键词定位笔记块（ask/check 共用）。
+    /// 按编号/关键词定位笔记块（ask 用）。
     fn resolve_block_id(&self, question: &str, block_num: &Option<String>) -> Option<String> {
         let note = self.session.notes.as_ref()?;
         match block_num {
@@ -1851,15 +1825,12 @@ PaperHelper 命令：
         }
     }
 
-    /// ask/check 共用核心：预算检查 → 构建上下文 → 流式 LLM → 写解释（仅 ask）→
-    /// 记录会话节点。返回 `(新节点 id, 新解释 id 或 None)`。
-    /// ask/check 的 **prepare 段**（持锁）：预算检查 + 组装上下文。
-    /// 返回的 `AskJob` 自带 msgs/config/client/emitter，可在**不持 App 锁**时流式执行。
+    /// ask 的 **prepare 段**（持锁）：预算检查 + 构建上下文 + 组装 `AskJob`。
+    /// 返回的 `AskJob` 可在**不持 App 锁**时流式执行；结果由 `commit_ask` 落地。
     pub fn prepare_ask(
         &mut self,
         question: &str,
         block_id: Option<String>,
-        is_check: bool,
         quote: Option<&str>,
         record_concept: bool,
     ) -> Result<AskJob> {
@@ -1880,7 +1851,6 @@ PaperHelper 命令：
             parent: self.session.conversation.current.clone(),
             question: question.to_string(),
             block_id,
-            is_check,
             quote: quote.map(|s| s.to_string()),
             record_concept,
             approx_tokens,
@@ -1902,7 +1872,7 @@ PaperHelper 命令：
         self.session.conversation.current = job.restore_current.clone();
     }
 
-    /// ask/check 的 **落地段**（持锁）：写解释/概念/对话节点。
+    /// ask 的 **落地段**（持锁）：写解释/概念/对话节点。
     /// 用户已切走时把结果写回发起会话；发起会话被改动/删除则拒写（不污染任何会话）。
     pub fn commit_ask(&mut self, job: AskJob, res: crate::llm::LlmResult) -> Result<(String, Option<String>)> {
         let target = job.session.clone();
@@ -1930,7 +1900,7 @@ PaperHelper 命令：
         Ok(out)
     }
 
-    /// ask/check 落地到「当前会话」（调用前已确保目标会话就是当前会话）。
+    /// ask 落地到「当前会话」（调用前已确保目标会话就是当前会话）。
     pub(crate) fn commit_ask_local(&mut self, job: &AskJob, res: crate::llm::LlmResult) -> Result<(String, Option<String>)> {
         self.record_usage(res.input_tokens, res.output_tokens);
         let (clean_answer, concept) = extract_concept(&res.content);
@@ -1941,7 +1911,7 @@ PaperHelper 命令：
         let mut explanation_id: Option<String> = None;
         let mut is_nested = false;
 
-        if !job.is_check && job.attach_note {
+        if job.attach_note {
             let expl_id = uuid::Uuid::new_v4().to_string();
             let parent_expl_id = job
                 .parent
@@ -2027,14 +1997,14 @@ PaperHelper 命令：
             question: job.question.clone(),
             quote: job.quote.clone(),
             answer: clean_answer.clone(),
-            block_id: if job.is_check || is_nested { None } else { job.block_id.clone() },
+            block_id: if is_nested { None } else { job.block_id.clone() },
             explanation_id: explanation_id.clone(),
             input_tokens: res.input_tokens,
             output_tokens: res.output_tokens,
             cost: res.input_tokens as f64 * self.config.pricing.input_price_per_1m / 1_000_000.0
                 + res.output_tokens as f64 * self.config.pricing.output_price_per_1m / 1_000_000.0,
             created_at: now.clone(),
-            label: if job.is_check { format!("[核对] {}", concept_label) } else { concept_label.clone() },
+            label: concept_label.clone(),
         });
         self.session.conversation.current = Some(node_id.clone());
 
@@ -2400,7 +2370,6 @@ PaperHelper 命令：
         quote: &str,
         quote_tex: Option<&str>,
         question: &str,
-        is_check: bool,
         record_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
@@ -2430,7 +2399,7 @@ PaperHelper 命令：
         self.session.conversation.current = None; // 独立线程：新根
         // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
         let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
-        let mut job = match self.prepare_ask(question, insert_block, is_check, Some(ctx), record_concept) {
+        let mut job = match self.prepare_ask(question, insert_block, Some(ctx), record_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2457,14 +2426,13 @@ PaperHelper 命令：
         kind: &str,
         quote: &str,
         question: &str,
-        is_check: bool,
         record_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
         let ctx = if quote.trim().is_empty() { None } else { Some(quote) };
-        let mut job = match self.prepare_ask(question, None, is_check, ctx, record_concept) {
+        let mut job = match self.prepare_ask(question, None, ctx, record_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2570,7 +2538,6 @@ PaperHelper 命令：
         &mut self,
         node_id: &str,
         question: &str,
-        is_check: bool,
         record_concept: bool,
         extra: &ExtraInput,
     ) -> Result<AskJob> {
@@ -2580,7 +2547,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, is_check, None, record_concept) {
+        let mut job = match self.prepare_ask(question, fallback_block, None, record_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2599,7 +2566,6 @@ PaperHelper 命令：
         quote: &str,
         quote_tex: Option<&str>,
         question: &str,
-        is_check: bool,
         record_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
@@ -2611,7 +2577,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, is_check, Some(ctx), record_concept) {
+        let mut job = match self.prepare_ask(question, fallback_block, Some(ctx), record_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -3085,7 +3051,7 @@ PaperHelper 命令：
         *self.node_numbers.lock().unwrap() = nodes;
     }
 
-    /// 构建 ask/check 共用的上下文消息序列（论文全文+笔记+对话路径+概念注入）。
+    /// 构建 ask 共用的上下文消息序列（论文全文+笔记+对话路径+概念注入）。
     /// 消息编排：system=ask 提示词；user=论文全文；assistant=已生成笔记
     /// （把它们放进多轮对话让 LLM"看过"长文，再以多轮 Q&A 追加历史）；
     /// user=问题（追加检索到的知识库相关概念提示语）。`block_id` 由调用方
@@ -3143,7 +3109,7 @@ PaperHelper 命令：
         }
 
         let related = self.kb.search(question);
-        // 批注提问时，把用户选中的原文一并作为上下文（普通 ask/check 无 quote）
+        // 批注提问时，把用户选中的原文一并作为上下文（普通 ask 无 quote）
         let mut q_final = String::new();
         if let Some(qt) = quote {
             if !qt.trim().is_empty() {

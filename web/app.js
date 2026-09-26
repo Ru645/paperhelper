@@ -9,7 +9,7 @@ const noteFrame = $("note-frame");
 let running = false;
 // 正在执行的 LLM 任务名（导入/提问/AI 生成…）：LLM 任务互斥，非 LLM 操作可并行
 let llmBusyTask = "";
-const LLM_CMD_RE = /^(ingest|ask|q|check|sum)\b/;
+const LLM_CMD_RE = /^(ingest|ask|q|sum)\b/;
 let streamSpan = null;      // 当前流式 token 的容器
 let lastState = null;       // 最近一次 /api/state 快照
 let currentAbort = null;    // 当前 /api/run 的 AbortController
@@ -28,7 +28,6 @@ const dynamicTabs = new Map(); // key -> { btn, pane }
 let annotationsCache = [];
 let currentAnnotation = null; // { id, block_id, quote }
 let annSelectedNode = null;   // 弹窗内当前选中的节点（追问挂到它下面）
-let annMode = "ask";          // ask | check
 
 // ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
 const SEL_SEP = "\u0001";
@@ -643,7 +642,6 @@ function renderConversation(data) {
     if (!node) return;
     const row = document.createElement("div");
     row.className = "conv-row"
-      + (node.is_check ? " check" : "")
       + (node.collapsed ? " collapsed" : "")
       + (node.node_id === current ? " current" : "");
     row.style.paddingLeft = 6 + depth * 12 + "px";
@@ -653,7 +651,7 @@ function renderConversation(data) {
     num.textContent = node.n;
     const text = document.createElement("span");
     text.className = "conv-q";
-    text.textContent = (node.is_check ? "[核对] " : "") + (node.summary || node.question || "");
+    text.textContent = node.summary || node.question || "";
     row.appendChild(num);
     row.appendChild(text);
     row.onclick = async () => {
@@ -2340,13 +2338,13 @@ function renderAnnThread(root) {
   if (!root) { box.innerHTML = '<p class="muted">（尚无问答）</p>'; return; }
   const add = (node, depth, container) => {
     const div = document.createElement("div");
-    div.className = "ann-node" + (node.is_check ? " check" : "") + (annSelectedNode === node.node_id ? " selected" : "");
+    div.className = "ann-node" + (annSelectedNode === node.node_id ? " selected" : "");
     div.dataset.nodeId = node.node_id;
     div.style.marginLeft = depth * 10 + "px";
 
     const q = document.createElement("div");
     q.className = "ann-q";
-    q.textContent = (node.is_check ? "[核对] " : "") + node.question;
+    q.textContent = node.question;
     const quoteEl = annQuoteEl(node.quote);
     if (quoteEl) div.appendChild(quoteEl);
     const a = document.createElement("div");
@@ -2646,7 +2644,6 @@ async function sendAnnotation() {
         quote: currentAnnotation.quote,
         quote_tex: currentAnnotation.quote_tex || null,
         question: q,
-        mode: annMode,
         record_concept: recordConceptOn(),
         attachments: currentAnnAttachments(),
       };
@@ -2657,7 +2654,6 @@ async function sendAnnotation() {
         quote: currentAnnotation.quote,
         quote_tex: currentAnnotation.quote_tex || null,
         question: q,
-        mode: annMode,
         record_concept: recordConceptOn(),
         attachments: currentAnnAttachments(),
       };
@@ -2670,7 +2666,7 @@ async function sendAnnotation() {
     const nodeId = annSelectedNode;
     if (!nodeId) { $("ann-send").disabled = false; setAnnProgress(""); return; }
     url = "/api/annotate/reply";
-    body = { node_id: nodeId, question: q, mode: annMode, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
+    body = { node_id: nodeId, question: q, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
   }
   clearAnnAttachments();
   let streamed = "";
@@ -4586,11 +4582,6 @@ document.addEventListener("DOMContentLoaded", () => {
     e.stopPropagation();
     showAnnMarkMenu(mark.dataset.annId, e.clientX, e.clientY);
   });
-  $("ann-mode").onclick = () => {
-    annMode = annMode === "ask" ? "check" : "ask";
-    $("ann-mode").textContent = annMode;
-    $("ann-mode").classList.toggle("check", annMode === "check");
-  };
   $("ann-q").addEventListener("keydown", (e) => {
     // Enter 发送；Shift+Enter 换行；中文输入法组词中的回车不发送
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendAnnotation(); }

@@ -4,12 +4,21 @@
 //! 触发它的节点。`tree`/`goto` 让人跳回任意节点继续，从根到当前节点的路径
 //! 就是下一次 ask 的对话上下文（见 app.rs `build_context_messages`）。
 //! 节点还记录 `block_id`（定位笔记段落）与 `explanation_id`（该回答创建的
-//! Explanation，check 节点为 None）；`explanation_ancestor` 沿父链跳过
-//! check 找到最近的真实解释，供笔记嵌套定位使用。
+//! Explanation，无解释节点如 PDF 页面提问为 None）；`explanation_ancestor`
+//! 沿父链跳过无解释节点找到最近的真实解释，供笔记嵌套定位使用。
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+
+/// 旧版本「核对(check)」对话节点标签前缀（如 `[核对] 余弦相似度`）。
+/// 该功能已移除：加载旧会话时剥离此前缀，节点保留为普通问答。
+pub const LEGACY_CHECK_PREFIX: &str = "[核对] ";
+
+/// 去掉旧版核对标签前缀（历史会话迁移）。
+pub fn strip_legacy_check_label(label: &str) -> &str {
+    label.strip_prefix(LEGACY_CHECK_PREFIX).unwrap_or(label)
+}
 
 /// 对话树的一个节点 = 一次问答交换（用户问 + 助手答）。
 /// 跳到某节点时，从根到该节点的路径即为对话上下文。
@@ -51,9 +60,9 @@ impl Conversation {
         self.nodes.push(node);
     }
 
-    /// 从 from 节点沿父链向上找第一个携带 explanation_id 的节点（跳过 check 等
-    /// 无解释节点），返回其 explanation_id。用于笔记嵌套定位：check 节点的儿子，
-    /// 其笔记中的父亲应是 check 往上第一个非 check 节点。
+    /// 从 from 节点沿父链向上找第一个携带 explanation_id 的节点（跳过无解释
+    /// 节点），返回其 explanation_id。用于笔记嵌套定位：无解释节点的儿子，
+    /// 其笔记中的父亲应是再往上第一个有解释的节点。
     pub fn explanation_ancestor(nodes: &[ConvNode], from: &str) -> Option<String> {
         let mut cur = Some(from.to_string());
         while let Some(id) = cur {

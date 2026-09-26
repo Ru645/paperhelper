@@ -1070,8 +1070,8 @@ mod tests {
     }
 
     #[test]
-    fn explanation_ancestor_skips_check() {
-        // check 节点（explanation_id=None）的儿子向上找父时应跳过 check
+    fn explanation_ancestor_skips_nodes_without_explanation() {
+        // 无解释节点（explanation_id=None，如 PDF 页面提问）的儿子向上找父时应跳过它
         use crate::conversation::{Conversation, ConvNode};
         let mk = |id: &str, parent: Option<&str>, expl: Option<&str>| ConvNode {
             id: id.into(),
@@ -1090,13 +1090,13 @@ mod tests {
         let nodes = vec![
             mk("root", None, None),
             mk("ask1", Some("root"), Some("e1")),
-            mk("chk", Some("ask1"), None),       // check 节点
-            mk("ask2", Some("chk"), None),       // check 的儿子（ask）
+            mk("noexpl", Some("ask1"), None),    // 无解释节点
+            mk("ask2", Some("noexpl"), None),    // 无解释节点的儿子（ask）
         ];
-        // 从 ask2 向上：跳过 chk，命中 ask1 的 e1
+        // 从 ask2 向上：跳过 noexpl，命中 ask1 的 e1
         assert_eq!(Conversation::explanation_ancestor(&nodes, "ask2").as_deref(), Some("e1"));
-        // 从 chk 向上：命中 ask1 的 e1
-        assert_eq!(Conversation::explanation_ancestor(&nodes, "chk").as_deref(), Some("e1"));
+        // 从 noexpl 向上：命中 ask1 的 e1
+        assert_eq!(Conversation::explanation_ancestor(&nodes, "noexpl").as_deref(), Some("e1"));
         // 从 root：无
         assert_eq!(Conversation::explanation_ancestor(&nodes, "root"), None);
     }

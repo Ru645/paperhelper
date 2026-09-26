@@ -260,7 +260,7 @@ fn annotation_hidden_ids(annotations: &[Annotation], conv: &Conversation) -> Has
     set
 }
 
-/// 把以 `root` 为根的会话子树转成 JSON（`{question, answer, is_check, summary, collapsed, children}`）。
+/// 把以 `root` 为根的会话子树转成 JSON（`{question, answer, summary, collapsed, children}`）。
 fn thread_json(
     conv: &Conversation,
     root: &str,
@@ -285,7 +285,6 @@ fn thread_json(
         "question": n.question,
         "quote": n.quote,
         "answer": n.answer,
-        "is_check": n.explanation_id.is_none(),
         "summary": summary,
         "collapsed": collapsed,
         "children": children,
@@ -312,7 +311,6 @@ const ANN_CSS: &str = r#"
   .ann-close { margin-left: auto; border: none; background: none; font-size: 18px; cursor: pointer; color: #888; }
   .ann-thread { overflow-y: auto; padding: 8px 10px; }
   .ann-node { border-left: 2px solid #dbeafe; padding: 6px 8px; margin: 6px 0; border-radius: 0 6px 6px 0; background: #fafafa; }
-  .ann-node.check { border-left-color: #f59e0b; }
   .ann-q { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
   .ann-q-quote { font-size: 11px; color: #8a6d3b; background: #fffbea; border-left: 2px solid #f0d58c; padding: 2px 6px; margin-bottom: 4px; border-radius: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ann-a { font-size: 13px; line-height: 1.6; color: #333; }
@@ -493,11 +491,11 @@ function applyAnnotations() {
 }
 function renderThread(container, node, depth) {
   const div = document.createElement('div');
-  div.className = 'ann-node' + (node.is_check ? ' check' : '');
+  div.className = 'ann-node';
   div.style.marginLeft = depth * 10 + 'px';
   const q = document.createElement('div');
   q.className = 'ann-q';
-  q.textContent = (node.is_check ? '[核对] ' : '') + node.question;
+  q.textContent = node.question;
   if (node.quote) {
     const qq = document.createElement('div');
     qq.className = 'ann-q-quote';

@@ -196,7 +196,6 @@
     <div id="ann-chips" class="ann-chips hidden"></div>
     <textarea id="ann-q" rows="1" placeholder="针对选中文字提问，回车发送，Shift+回车换行…"></textarea>
     <div class="ann-input-row">
-      <button id="ann-mode" class="mini" title="切换 ask / check">ask</button>
       <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
         <input type="checkbox" id="ann-record" checked> 记概念
       </label>
@@ -362,7 +361,7 @@
       <li><b>自定义风格</b>：导入时选风格，还可填一句「本次额外要求」（如“只翻译”“只留公式和结论”）；「另存为风格」把它存成新风格；「设置 → 笔记风格」里可新建 / 编辑 / 复制 / 删除 / 恢复默认。文件在 <code>.paperhelper/styles/</code>（清单 <code>styles.toml</code>，提示词可直接编辑）。</li>
       <li><b>HTML 讲义</b>：上传 HTML 会自动转成 Markdown（公式按 KaTeX 隐藏层还原，脚本/事件属性会被剔除；MathJax 的 <code>\newcommand</code> 宏定义会自动注册，公式里的自定义宏也能渲染）。</li>
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。编辑**主标题**时多一个「按风格重写全文」：选一种笔记风格（可加额外要求）让 AI 重写整篇（会重建块 id、清空批注，可用「撤销」恢复）。</li>
-      <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（可切 ask / check）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
+      <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（回答写进笔记对应位置）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
       <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。选区不会被清掉，输入框上方还有「引用」附件条显示这次问的是哪一段；「记概念」勾选框可决定是否把知识点写进「已学概念」。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
