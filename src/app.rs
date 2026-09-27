@@ -455,6 +455,18 @@ fn readonly_extract_notice(outcome: &ExtractOutcome) -> Option<String> {
     }
 }
 
+/// 去掉 Web 上传时给文件名加的 `YYYYMMDD_HHMMSS_` 前缀。
+/// 上传目录里的文件名带时间戳（避免重名），但展示用标题 / 默认导出名不该带上它。
+fn strip_upload_stamp(stem: &str) -> &str {
+    let b = stem.as_bytes();
+    let stamped = b.len() >= 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'_'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'_';
+    if stamped { &stem[16..] } else { stem }
+}
+
 /// 简单 LLM 任务（AI 重写 / 按风格重写全文）：只生成内容，不改会话（除用量统计）。
 pub struct SimpleJob {
     msgs: Vec<Message>,
@@ -1621,7 +1633,7 @@ PaperHelper 命令：
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
-        let title_guess: String = stem.chars().take(20).collect();
+        let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
         let mut note = notes::parse_import_note(&raw_text, &title_guess);
         note.material_kind = kind.to_string();
         let title = note.title.clone();
@@ -1668,7 +1680,7 @@ PaperHelper 命令：
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("paper");
-        let title: String = stem.chars().take(40).collect();
+        let title: String = strip_upload_stamp(stem).chars().take(40).collect();
         let note = notes::readonly_note(title.as_str(), raw_text);
         outln!(self, "{} 已打开: 《{}》(仅阅读，不生成笔记，不调 LLM)", "✓".green().bold(), title);
         self.register_note(note, file_path, "", 0, 0, true, true)
@@ -1766,7 +1778,7 @@ PaperHelper 命令：
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
-        let title_guess: String = stem.chars().take(20).collect();
+        let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
         let default_name = format!("笔记_{title_guess}.md");
         if self.emitter.is_terminal() {
             print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
@@ -3798,6 +3810,20 @@ mod tests {
             failed.contains("失败") && !failed.contains("Traceback"),
             "失败提示应友好、不含技术堆栈: {failed}"
         );
+    }
+
+    /// 上传文件名的 `YYYYMMDD_HHMMSS_` 前缀只用于磁盘去重，展示标题要剥掉。
+    #[test]
+    fn strip_upload_stamp_removes_only_timestamp_prefix() {
+        assert_eq!(
+            super::strip_upload_stamp("20260926_191635_组成原理13 data-ecc"),
+            "组成原理13 data-ecc"
+        );
+        // 本地 CLI 文件名 / 非时间戳前缀保持不变
+        assert_eq!(super::strip_upload_stamp("组成原理13 data-ecc"), "组成原理13 data-ecc");
+        assert_eq!(super::strip_upload_stamp("2026_abc"), "2026_abc");
+        assert_eq!(super::strip_upload_stamp("20260926_19163_x"), "20260926_19163_x");
+        assert_eq!(super::strip_upload_stamp(""), "");
     }
 }
 
