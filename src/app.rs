@@ -36,7 +36,7 @@ use crate::llm::{self, Message};
 use crate::notes::{self, Explanation};
 use crate::output::Emitter;
 use crate::pdf;
-use crate::session::{Annotation, Session};
+use crate::session::{strip_upload_stamp, Annotation, Session};
 
 /// 输出宏：把标准输出的语义接到 `$slf.emitter` 上（终端或 Web/SSE 由 emitter 决定）。
 /// 需显式传入 `self`（macro_rules 对 self 是卫生的，无法从调用点隐式取得）。
@@ -453,18 +453,6 @@ fn readonly_extract_notice(outcome: &ExtractOutcome) -> Option<String> {
                 .to_string(),
         ),
     }
-}
-
-/// 去掉 Web 上传时给文件名加的 `YYYYMMDD_HHMMSS_` 前缀。
-/// 上传目录里的文件名带时间戳（避免重名），但展示用标题 / 默认导出名不该带上它。
-fn strip_upload_stamp(stem: &str) -> &str {
-    let b = stem.as_bytes();
-    let stamped = b.len() >= 16
-        && b[..8].iter().all(u8::is_ascii_digit)
-        && b[8] == b'_'
-        && b[9..15].iter().all(u8::is_ascii_digit)
-        && b[15] == b'_';
-    if stamped { &stem[16..] } else { stem }
 }
 
 /// 简单 LLM 任务（AI 重写 / 按风格重写全文）：只生成内容，不改会话（除用量统计）。
@@ -3810,20 +3798,6 @@ mod tests {
             failed.contains("失败") && !failed.contains("Traceback"),
             "失败提示应友好、不含技术堆栈: {failed}"
         );
-    }
-
-    /// 上传文件名的 `YYYYMMDD_HHMMSS_` 前缀只用于磁盘去重，展示标题要剥掉。
-    #[test]
-    fn strip_upload_stamp_removes_only_timestamp_prefix() {
-        assert_eq!(
-            super::strip_upload_stamp("20260926_191635_组成原理13 data-ecc"),
-            "组成原理13 data-ecc"
-        );
-        // 本地 CLI 文件名 / 非时间戳前缀保持不变
-        assert_eq!(super::strip_upload_stamp("组成原理13 data-ecc"), "组成原理13 data-ecc");
-        assert_eq!(super::strip_upload_stamp("2026_abc"), "2026_abc");
-        assert_eq!(super::strip_upload_stamp("20260926_19163_x"), "20260926_19163_x");
-        assert_eq!(super::strip_upload_stamp(""), "");
     }
 }
 

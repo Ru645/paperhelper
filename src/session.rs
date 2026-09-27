@@ -199,6 +199,11 @@ impl Session {
 
     /// 旧数据迁移：移除已废弃的「核对(check)」标记，节点保留为普通问答。
     fn normalize_legacy(&mut self) {
+        // Web 上传文件名带 `YYYYMMDD_HHMMSS_` 去重前缀，旧数据的会话名可能残留它。
+        let cleaned = strip_upload_stamp(&self.session_name).to_string();
+        if cleaned != self.session_name {
+            self.session_name = cleaned;
+        }
         for node in &mut self.conversation.nodes {
             let stripped = strip_legacy_check_label(&node.label).to_string();
             if stripped != node.label {
@@ -212,6 +217,18 @@ impl Session {
             }
         }
     }
+}
+
+/// 去掉 Web 上传时给文件名加的 `YYYYMMDD_HHMMSS_` 前缀。
+/// 上传目录里的文件名带时间戳（避免重名），但展示用标题 / 默认导出名不该带上它。
+pub fn strip_upload_stamp(stem: &str) -> &str {
+    let b = stem.as_bytes();
+    let stamped = b.len() >= 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'_'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'_';
+    if stamped { &stem[16..] } else { stem }
 }
 
 /// 会话元信息（轻量解析，忽略 raw_text 等大字段，供列表/扫描使用）。
@@ -453,6 +470,34 @@ mod tests {
     use super::*;
     use crate::conversation::{Conversation, ConvNode};
     use crate::notes::parse_markdown_note;
+
+    /// 上传文件名的 `YYYYMMDD_HHMMSS_` 前缀只用于磁盘去重，展示标题要剥掉。
+    #[test]
+    fn strip_upload_stamp_removes_only_timestamp_prefix() {
+        assert_eq!(
+            strip_upload_stamp("20260926_191635_组成原理13 data-ecc"),
+            "组成原理13 data-ecc"
+        );
+        // 本地 CLI 文件名 / 非时间戳前缀保持不变
+        assert_eq!(strip_upload_stamp("组成原理13 data-ecc"), "组成原理13 data-ecc");
+        assert_eq!(strip_upload_stamp("2026_abc"), "2026_abc");
+        assert_eq!(strip_upload_stamp("20260926_19163_x"), "20260926_19163_x");
+        assert_eq!(strip_upload_stamp(""), "");
+    }
+
+    /// 旧会话加载时自动剥掉残留的时间戳前缀（无需重新导入）。
+    #[test]
+    fn normalize_legacy_strips_session_name_stamp() {
+        let mut sess = Session::default();
+        sess.session_name = "20260926_191635_组成原理13 data-ecc".into();
+        sess.normalize_legacy();
+        assert_eq!(sess.session_name, "组成原理13 data-ecc");
+
+        let mut clean = Session::default();
+        clean.session_name = "组成原理12-1 Instructions".into();
+        clean.normalize_legacy();
+        assert_eq!(clean.session_name, "组成原理12-1 Instructions");
+    }
 
     #[test]
     fn session_save_load_roundtrip() {

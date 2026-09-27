@@ -1721,10 +1721,11 @@ async fn api_sessions() -> Json<serde_json::Value> {
         .iter()
         .map(|id| {
             let meta = session::read_meta(&paths::session_path(id)).unwrap_or_default();
-            let name = if meta.session_name.is_empty() {
+            let raw = session::strip_upload_stamp(&meta.session_name);
+            let name = if raw.is_empty() {
                 "（未命名）".to_string()
             } else {
-                meta.session_name
+                raw.to_string()
             };
             json!({
                 "id": id,

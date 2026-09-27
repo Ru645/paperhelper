@@ -213,7 +213,7 @@ pub(crate) fn session_name_of(id: &str) -> String {
             if rest.starts_with('"') {
                 let rest = &rest[1..];
                 if let Some(end) = rest.find('"') {
-                    return rest[..end].to_string();
+                    return session::strip_upload_stamp(&rest[..end]).to_string();
                 }
             }
         }
