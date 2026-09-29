@@ -233,22 +233,18 @@ impl KnowledgeBase {
 
     /// 检索与查询相关的已学概念（关键词重叠打分，跨论文关联）。
     ///
-    /// 实现方式：把查询切成 ≥2 字符的单词，对每个概念计算"词项在
-    /// 概念名+定义中出现的次数"之和作为分数，取分最高的 5 条。简单词袋匹配，
-    /// 足够在追问注入场景用；返回带定义供 prompt 拼上下文。
+    /// 分词规则：英文/数字按非字母数字切分（保留 ≥2 字符的词）；连续汉字切成
+    /// 2-gram（单个汉字单独保留）——这样中文整句也能命中中文概念名/定义。
+    /// 匹配范围是「概念名 + 定义 + 来源论文标题」，因此提到某篇论文标题也能带出它的概念。
+    /// 取分最高的 5 条，返回带定义供 prompt 拼上下文。
     pub fn search(&self, query: &str) -> Vec<&Concept> {
-        let terms: Vec<String> = query
-            .to_lowercase()
-            .split_whitespace()
-            .filter(|t| t.chars().count() >= 2)
-            .map(|t| t.to_string())
-            .collect();
+        let terms = query_terms(query);
         if terms.is_empty() {
             return Vec::new();
         }
         let mut scored: Vec<(usize, &Concept)> = Vec::new();
         for c in &self.concepts {
-            let hay = format!("{} {}", c.name, c.definition).to_lowercase();
+            let hay = format!("{} {} {}", c.name, c.definition, c.paper_title).to_lowercase();
             let score = terms.iter().map(|t| hay.matches(t.as_str()).count()).sum::<usize>();
             if score > 0 {
                 scored.push((score, c));
@@ -257,6 +253,97 @@ impl KnowledgeBase {
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().take(5).map(|(_, c)| c).collect()
     }
+
+    /// 提问中「被提及的已学论文」（论文关联增强用）：
+    /// ①标题在问题里命中（归一化后子串匹配）；②上面检索到的相关概念的来源论文。
+    /// 按「标题命中优先、其次概念得分」排序，去重。数量不设上限，由调用方决定如何使用。
+    pub fn related_papers(&self, query: &str) -> Vec<Paper> {
+        let q = normalize_for_match(query);
+        let mut out: Vec<Paper> = Vec::new();
+        for p in &self.papers {
+            let t = normalize_for_match(&p.title);
+            if t.chars().count() >= 4 && q.contains(&t) {
+                push_unique_paper(&mut out, p);
+            }
+        }
+        for c in self.search(query) {
+            if let Some(p) = self.papers.iter().find(|p| p.id == c.paper_id) {
+                push_unique_paper(&mut out, p);
+            }
+        }
+        out
+    }
+}
+
+fn push_unique_paper(out: &mut Vec<Paper>, p: &Paper) {
+    if !out.iter().any(|x| x.id == p.id) {
+        out.push(p.clone());
+    }
+}
+
+/// 是否汉字（含扩展 A 区），用于中文 2-gram 分词与归一化匹配。
+fn is_cjk(c: char) -> bool {
+    ('\u{3400}'..='\u{9fff}').contains(&c)
+}
+
+/// 归一化：小写，只保留字母/数字/汉字（去掉空白、标点、书名号等），便于标题子串匹配。
+fn normalize_for_match(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || is_cjk(*c))
+        .collect()
+}
+
+/// 查询分词：英文/数字词（≥2 字符）+ 中文 2-gram（单汉字保留），去重。
+fn query_terms(query: &str) -> Vec<String> {
+    fn flush_ascii(ascii: &mut String, terms: &mut Vec<String>) {
+        if ascii.chars().count() >= 2 {
+            terms.push(ascii.clone());
+        }
+        ascii.clear();
+    }
+    fn flush_cjk(cjk: &mut Vec<char>, terms: &mut Vec<String>) {
+        if cjk.len() == 1 {
+            terms.push(cjk[0].to_string());
+        } else {
+            for w in cjk.windows(2) {
+                terms.push(format!("{}{}", w[0], w[1]));
+            }
+        }
+        cjk.clear();
+    }
+    let mut terms: Vec<String> = Vec::new();
+    let mut ascii = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    for ch in query.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if !cjk.is_empty() {
+                flush_cjk(&mut cjk, &mut terms);
+            }
+            ascii.push(ch);
+        } else if is_cjk(ch) {
+            if !ascii.is_empty() {
+                flush_ascii(&mut ascii, &mut terms);
+            }
+            cjk.push(ch);
+        } else {
+            if !ascii.is_empty() {
+                flush_ascii(&mut ascii, &mut terms);
+            }
+            if !cjk.is_empty() {
+                flush_cjk(&mut cjk, &mut terms);
+            }
+        }
+    }
+    if !ascii.is_empty() {
+        flush_ascii(&mut ascii, &mut terms);
+    }
+    if !cjk.is_empty() {
+        flush_cjk(&mut cjk, &mut terms);
+    }
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 #[cfg(test)]
@@ -307,5 +394,76 @@ mod tests {
         kb.reset_graph();
         assert!(kb.relations.is_empty());
         assert_eq!(kb.pending_graph_names(), vec!["A", "B"]);
+    }
+
+    fn paper(id: &str, title: &str) -> Paper {
+        Paper {
+            id: id.to_string(),
+            title: title.to_string(),
+            path: format!("{id}.pdf"),
+            read_at: String::new(),
+            kind: "paper".into(),
+            pinned: false,
+        }
+    }
+
+    fn concept_of(name: &str, def: &str, paper_id: &str, paper_title: &str) -> Concept {
+        Concept {
+            name: name.to_string(),
+            definition: def.to_string(),
+            paper_id: paper_id.to_string(),
+            paper_title: paper_title.to_string(),
+            block_id: None,
+            created_at: String::new(),
+            pinned: false,
+            graph_seen: false,
+        }
+    }
+
+    /// 中文整句也能切出 2-gram，英文词按 ≥2 字符保留。
+    #[test]
+    fn query_terms_splits_cjk_and_ascii() {
+        let terms = query_terms("Transformer 的注意力机制");
+        assert!(terms.contains(&"transformer".to_string()), "{terms:?}");
+        assert!(terms.contains(&"注意".to_string()), "{terms:?}");
+        assert!(terms.contains(&"意力".to_string()), "{terms:?}");
+        assert!(terms.contains(&"机制".to_string()), "{terms:?}");
+        assert!(!terms.contains(&"a".to_string()), "单字母英文词应丢弃");
+    }
+
+    /// 中文整句提问能命中中文概念名/定义（旧版按空格分词时命中不了）。
+    #[test]
+    fn search_matches_chinese_sentence() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept_of("注意力机制", "用权重加权求和", "p1", "深度学习"));
+        let hits = kb.search("请解释一下注意力机制的原理");
+        assert_eq!(hits.len(), 1, "应命中注意力机制");
+        assert_eq!(hits[0].name, "注意力机制");
+    }
+
+    /// 匹配范围含来源论文标题，提到论文标题也能带出它的概念。
+    #[test]
+    fn search_haystack_includes_paper_title() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept_of("反向传播", "链式法则求梯度", "p1", "深度学习入门"));
+        let hits = kb.search("《深度学习入门》讲了什么");
+        assert_eq!(hits.len(), 1, "标题命中应带出概念");
+    }
+
+    /// related_papers：①标题命中；②相关概念的来源论文；去重；无命中返回空。
+    #[test]
+    fn related_papers_by_title_and_concept() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_paper(paper("p1", "深度学习入门"));
+        kb.add_paper(paper("p2", "计算机组成原理"));
+        kb.add_concept(concept_of("神经网络", "多层感知机", "p1", "深度学习入门"));
+
+        let by_title = kb.related_papers("和《深度学习入门》里的方法比呢");
+        assert_eq!(by_title.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
+
+        let by_concept = kb.related_papers("神经网络是怎么工作的");
+        assert_eq!(by_concept.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
+
+        assert!(kb.related_papers("完全无关的问题").is_empty());
     }
 }

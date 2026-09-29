@@ -61,6 +61,22 @@ pub struct LlmConfig {
     /// false=使用 pdf-extract 抽纯文本塞入 prompt（text 模式，全模型通用）。
     #[serde(default)]
     pub pdf_input: bool,
+    /// 论文关联增强：提问提及「另一篇已学论文」时如何纳入上下文。
+    /// `concept`=只注入相关概念摘要（默认）；`note`=额外注入该论文整篇笔记；
+    /// `full`=再额外注入该论文原文全文。后两档会显著增大每次提问的 token 消耗。
+    #[serde(default = "default_paper_relation")]
+    pub paper_relation: String,
+}
+
+/// 论文关联增强的合法取值。
+pub const PAPER_RELATION_MODES: [&str; 3] = ["concept", "note", "full"];
+
+pub fn valid_paper_relation(v: &str) -> bool {
+    PAPER_RELATION_MODES.contains(&v)
+}
+
+fn default_paper_relation() -> String {
+    "concept".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +140,7 @@ impl Default for Config {
                 context_length: 8192,
                 thinking_mode: false,
                 pdf_input: false,
+                paper_relation: "concept".into(),
             },
             pricing: PricingConfig {
                 input_price_per_1m: 0.15,
@@ -152,6 +169,10 @@ impl Config {
         };
         // presets 字段缺失/为空时回落默认
         cfg.presets.fill_missing_defaults();
+        // 手改 toml 写坏的值回落默认，避免后续匹配落空
+        if !valid_paper_relation(&cfg.llm.paper_relation) {
+            cfg.llm.paper_relation = default_paper_relation();
+        }
 
         if let Ok(v) = std::env::var("PAPERHELPER_API_KEY") {
             cfg.llm.api_key = v;
@@ -172,6 +193,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("PAPERHELPER_PDF_INPUT") {
             cfg.llm.pdf_input = matches!(v.as_str(), "1" | "true" | "TRUE");
+        }
+        if let Ok(v) = std::env::var("PAPERHELPER_PAPER_RELATION") {
+            let v = v.trim();
+            if valid_paper_relation(v) {
+                cfg.llm.paper_relation = v.to_string();
+            }
         }
         if let Ok(v) = std::env::var("PAPERHELPER_INPUT_PRICE") {
             if let Ok(n) = v.parse() {
@@ -206,5 +233,29 @@ impl Config {
         let s = toml::to_string_pretty(self).context("序列化 config")?;
         fs::write(paths::config_path(), s).context("写入 config.toml")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧 config.toml 没有 paper_relation 字段时应回落到默认 concept。
+    #[test]
+    fn legacy_llm_config_defaults_paper_relation() {
+        let llm: LlmConfig = toml::from_str(
+            "api_endpoint = \"e\"\napi_key = \"\"\nmodel = \"m\"\ncontext_length = 8192\nthinking_mode = false\n",
+        )
+        .unwrap();
+        assert_eq!(llm.paper_relation, "concept");
+    }
+
+    #[test]
+    fn paper_relation_validates_modes() {
+        assert!(valid_paper_relation("concept"));
+        assert!(valid_paper_relation("note"));
+        assert!(valid_paper_relation("full"));
+        assert!(!valid_paper_relation("everything"));
+        assert!(!valid_paper_relation(""));
     }
 }

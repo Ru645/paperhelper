@@ -3986,6 +3986,7 @@ async function openConfig(tab = "model") {
     $("cfg-inprice").value = c.pricing.input_price_per_1m;
     $("cfg-outprice").value = c.pricing.output_price_per_1m;
     $("cfg-budget").value = c.budget.token_budget;
+    $("cfg-paper-relation").value = c.llm.paper_relation || "concept";
     $("cfg-status").textContent = "";
     $("cfg-status").className = "status";
     $("cfg-test-result").classList.add("hidden");
@@ -4024,6 +4025,7 @@ async function saveConfig() {
     await setConfig("pricing.input_price_per_1m", String(parseFloat($("cfg-inprice").value) || 0));
     await setConfig("pricing.output_price_per_1m", String(parseFloat($("cfg-outprice").value) || 0));
     await setConfig("budget.token_budget", String(parseInt($("cfg-budget").value, 10) || 0));
+    await setConfig("llm.paper_relation", $("cfg-paper-relation").value);
     const key = $("cfg-key").value.trim();
     if (key) await setConfig("llm.api_key", key);
     status.textContent = "✓ 已保存";

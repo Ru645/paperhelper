@@ -311,6 +311,14 @@
       <label>输入单价 / 1M token<input id="cfg-inprice" type="number" step="0.01"></label>
       <label>输出单价 / 1M token<input id="cfg-outprice" type="number" step="0.01"></label>
       <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
+      <label>论文关联增强
+        <select id="cfg-paper-relation">
+          <option value="concept">仅相关概念（默认，最省 token）</option>
+          <option value="note">相关概念 + 关联论文笔记</option>
+          <option value="full">相关概念 + 关联论文原文与笔记</option>
+        </select>
+      </label>
+      <p class="muted">开启后，提问提到你学过的另一篇论文时，会把它的内容一并发给模型。选 note / full 会明显增加每次提问的 token 消耗与费用。</p>
       <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
       <div id="cfg-test-result" class="test-result hidden"></div>
       <p id="cfg-status" class="status"></p>

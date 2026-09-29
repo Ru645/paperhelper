@@ -1631,6 +1631,7 @@ async fn api_config_get(State(app): State<SharedApp>) -> Json<serde_json::Value>
             "context_length": a.config.llm.context_length,
             "thinking_mode": a.config.llm.thinking_mode,
             "pdf_input": a.config.llm.pdf_input,
+            "paper_relation": a.config.llm.paper_relation,
         },
         "pricing": {
             "input_price_per_1m": a.config.pricing.input_price_per_1m,

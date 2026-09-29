@@ -96,6 +96,7 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
     ConfigKeyDef { key: "llm.context_length", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "llm.thinking_mode", is_bool: true, from_presets: None },
     ConfigKeyDef { key: "llm.pdf_input", is_bool: true, from_presets: None },
+    ConfigKeyDef { key: "llm.paper_relation", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "pricing.input_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "pricing.output_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
@@ -1032,6 +1033,7 @@ PaperHelper 命令：
                 outln!(self, "llm.context_length  = {}", k.context_length);
                 outln!(self, "llm.thinking_mode   = {}", k.thinking_mode);
                 outln!(self, "llm.pdf_input       = {} (file模式未实现,均走text)", k.pdf_input);
+                outln!(self, "llm.paper_relation  = {} (论文关联增强: concept=仅概念 / note=加笔记 / full=加原文+笔记)", k.paper_relation);
                 outln!(self, "pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
                 outln!(self, "pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
                 outln!(self, "budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
@@ -1055,6 +1057,15 @@ PaperHelper 命令：
                 // api_key 脱敏回显，避免明文泄露
                 let display = if key == "llm.api_key" { mask_key(&val) } else { val.clone() };
                 outln!(self, "已设置 {key} = {display}（已写入 .paperhelper/config.toml）");
+                if key == "llm.paper_relation" && val != "concept" {
+                    outerr!(
+                        self,
+                        "{} 论文关联增强已开启（{}）：提问提及某篇已学论文时，会额外把它的{}发给模型，token 消耗会明显增加。",
+                        "⚠️ ".yellow(),
+                        val,
+                        if val == "full" { "原文全文与笔记" } else { "笔记" }
+                    );
+                }
             }
             "test" => self.cmd_config_test().await?,
             "presets" | "preset" => self.cmd_config_presets(args)?,
@@ -1159,6 +1170,13 @@ PaperHelper 命令：
             "llm.context_length" => self.config.llm.context_length = val.parse().context("需要整数")?,
             "llm.thinking_mode" => self.config.llm.thinking_mode = parse_bool(val),
             "llm.pdf_input" => self.config.llm.pdf_input = parse_bool(val),
+            "llm.paper_relation" => {
+                let v = val.trim();
+                if !crate::config::valid_paper_relation(v) {
+                    bail!("llm.paper_relation 只能是 concept / note / full");
+                }
+                self.config.llm.paper_relation = v.to_string();
+            }
             "pricing.input_price_per_1m" => self.config.pricing.input_price_per_1m = val.parse().context("需要数字")?,
             "pricing.output_price_per_1m" => self.config.pricing.output_price_per_1m = val.parse().context("需要数字")?,
             "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
@@ -3167,7 +3185,10 @@ PaperHelper 命令：
             .collect();
 
         let ctx = self.config.llm.context_length;
-        let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4;
+        // 论文关联增强：先取被提及论文的笔记/全文（按配置档位），纳入 base 预算后再裁剪历史
+        let ref_msgs = self.paper_relation_messages(question);
+        let ref_tokens: usize = ref_msgs.iter().map(|m| m.content.chars().count() / 4).sum();
+        let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4 + ref_tokens;
         if base_tokens > ctx {
             outerr!(self, "{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。", "⚠️ ".yellow(), base_tokens, ctx);
         }
@@ -3195,6 +3216,7 @@ PaperHelper 命令：
             msgs.push(Message::text("user", format!("【原文材料】\n{raw_text}")));
         }
         msgs.push(Message::text("assistant", format!("【已生成笔记】\n{notes_md}")));
+        msgs.extend(ref_msgs);
         for (q, a) in &kept_pairs {
             msgs.push(Message::text("user", q.clone()));
             msgs.push(Message::text("assistant", a.clone()));
@@ -3220,6 +3242,52 @@ PaperHelper 命令：
         }
         msgs.push(Message::text("user", q_final));
         (msgs, block_id)
+    }
+
+    /// 论文关联增强：找出问题提及的其它已学论文，按其配置档位取「笔记」或「原文+笔记」，
+    /// 返回插入到当前笔记之后的消息。`concept` 档不产生消息（概念仍走 ask 原有注入）。
+    /// 不限制关联论文数量、不做截断——内容过长导致模型报错时由 llm 的错误提示引导用户调低档位。
+    fn paper_relation_messages(&self, question: &str) -> Vec<Message> {
+        let mode = self.config.llm.paper_relation.as_str();
+        if mode != "note" && mode != "full" {
+            return Vec::new();
+        }
+        let current_pid = self
+            .session
+            .current_paper_id
+            .clone()
+            .or_else(|| self.session.notes.as_ref().map(|n| n.paper_id.clone()))
+            .unwrap_or_default();
+        let mut msgs = Vec::new();
+        for p in self.kb.related_papers(question) {
+            if p.id.is_empty() || p.id == current_pid {
+                continue;
+            }
+            let Some((sid, _)) = crate::session::find_session_by_paper(&p.id, &p.title) else {
+                crate::logging::debug(format!("论文关联增强：未找到论文《{}》的会话", p.title));
+                continue;
+            };
+            let Ok(sess) = Session::load(&crate::paths::session_path(&sid)) else {
+                continue;
+            };
+            let Some(note) = sess.notes.as_ref() else {
+                continue;
+            };
+            if mode == "full" && !note.raw_text.trim().is_empty() {
+                msgs.push(Message::text(
+                    "user",
+                    format!("【关联论文《{}》原文】\n{}", p.title, note.raw_text),
+                ));
+            }
+            let notes_md = note.to_markdown();
+            if !notes_md.trim().is_empty() {
+                msgs.push(Message::text(
+                    "assistant",
+                    format!("【关联论文《{}》笔记】\n{}", p.title, notes_md),
+                ));
+            }
+        }
+        msgs
     }
 }
 
@@ -3797,6 +3865,23 @@ mod tests {
         assert!(
             failed.contains("失败") && !failed.contains("Traceback"),
             "失败提示应友好、不含技术堆栈: {failed}"
+        );
+    }
+
+    /// 论文关联增强只在 note/full 档、且确实命中关联论文时才注入消息。
+    #[test]
+    fn paper_relation_messages_gated_by_mode_and_hits() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        let app = super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        assert!(app.paper_relation_messages("任意问题").is_empty(), "concept 档不注入");
+
+        let mut cfg = Config::default();
+        cfg.llm.paper_relation = "full".into();
+        let app = super::App::new(cfg, KnowledgeBase::default(), reqwest::Client::new());
+        assert!(
+            app.paper_relation_messages("没有任何关联论文的问题").is_empty(),
+            "无命中的关联论文时不注入"
         );
     }
 }

@@ -204,10 +204,18 @@ fn friendly_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> anyho
                 || lower.contains("too long")
                 || lower.contains("maximum") =>
         {
+            let extra = if cfg.paper_relation != "concept" {
+                format!(
+                    "若开启了「论文关联增强」（llm.paper_relation={}），可改回 concept 以显著减少输入。",
+                    cfg.paper_relation
+                )
+            } else {
+                String::new()
+            };
             (
                 "输入超出模型上下文长度".to_string(),
                 format!(
-                    "减少输入（少带对话历史/缩短论文文本）或调大 llm.context_length（当前 {}）。",
+                    "减少输入（少带对话历史/缩短论文文本）或调大 llm.context_length（当前 {}）。{extra}",
                     cfg.context_length
                 ),
             )
