@@ -228,12 +228,35 @@ pub fn clean_pua(text: &str) -> (String, usize) {
     (cleaned, removed)
 }
 
+/// 删除 PDF 抽出的 C0 控制字符（保留制表/换行/回车/分页）。
+///
+/// 部分公式字体缺映射时，PyMuPDF 会吐出 NUL（`\x00`）、`\x01`、`\x0e` 等控制符，
+/// 界面显示为乱码方框、发给 LLM 也是噪声。返回（清理后的文本, 删除的字符数）。
+pub fn strip_control(text: &str) -> (String, usize) {
+    let mut removed = 0usize;
+    let cleaned: String = text
+        .chars()
+        .filter(|c| {
+            let u = *c as u32;
+            let ctrl = (u < 0x20 && !matches!(u, 0x09 | 0x0a | 0x0c | 0x0d)) || u == 0x7f;
+            if ctrl {
+                removed += 1;
+            }
+            !ctrl
+        })
+        .collect();
+    (cleaned, removed)
+}
+
 /// 抽取文本统一清洗：有删除时写日志并在 CLI 提示（字体缺映射属数据质量问题）。
 fn clean_extracted(text: String, what: &str) -> String {
     let (cleaned, removed) = clean_pua(&text);
-    if removed > 0 {
-        let msg =
-            format!("{what} 有 {removed} 个字符因字体缺少 Unicode 映射（私有编码）无法识别，已跳过");
+    let (cleaned, ctrl) = strip_control(&cleaned);
+    let total = removed + ctrl;
+    if total > 0 {
+        let msg = format!(
+            "{what} 有 {total} 个字符因字体缺少 Unicode 映射或为控制符无法识别，已跳过"
+        );
         logging::warn(&msg);
         eprintln!("⚠️  {msg}");
     }
@@ -393,6 +416,15 @@ mod tests {
         let (clean, removed) = clean_pua(raw);
         assert_eq!(removed, 0);
         assert_eq!(clean, raw);
+    }
+
+    #[test]
+    fn strip_control_removes_c0_but_keeps_whitespace() {
+        // 模拟公式处的 NUL/SOH/SO，保留 \t \n \r 与分页 \x0c
+        let raw = "a\x00b\x01c\x0ed\ne\tf\rg\x0ch\x7f";
+        let (clean, removed) = strip_control(raw);
+        assert_eq!(removed, 4, "应删除 \\x00 \\x01 \\x0e \\x7f");
+        assert_eq!(clean, "abcd\ne\tf\rg\x0ch");
     }
 
     #[test]

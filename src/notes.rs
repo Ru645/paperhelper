@@ -530,11 +530,56 @@ pub fn take_macros_comment(md: &str) -> (Option<String>, String) {
     (if raw.is_empty() { None } else { Some(raw) }, after)
 }
 
+/// 剥离推理模型混进正文的思考过程。
+///
+/// 部分推理模型（或其中转网关）会把「思考 → `</think>` → 正式回答」整段塞进
+/// `content`：直接解析会把思考草稿当成正文写进笔记，表现为中英文混杂、内容
+/// 重复、渲染异常。本函数只在能可靠识别时动手：
+/// - 优先取「其后紧接 `#` 标题」的结束标记之后的内容（最强的泄漏信号）；
+/// - 若正文本就以 `#` 标题开头（符合输出契约、只是引用了标记），原样返回，
+///   避免误伤讨论 `</think>` 的论文；
+/// - 否则退而取第一个结束标记之后的内容（模板自动注入开始标记时通常只有一个）。
+pub fn strip_reasoning(md: &str) -> String {
+    const CLOSERS: [&str; 3] = ["</think>", "</thinking>", "</reasoning>"];
+    let starts_heading = md.trim_start().starts_with('#');
+    let mut ends: Vec<usize> = Vec::new();
+    for c in CLOSERS {
+        let mut from = 0;
+        while let Some(p) = md[from..].find(c) {
+            let abs = from + p;
+            ends.push(abs + c.len());
+            from = abs + c.len();
+        }
+    }
+    ends.sort_unstable();
+    // 强信号：结束标记后紧跟 `#` 标题（正文真正起点）——正文里引用标记时
+    // 不会出现「标记后面直接是标题」的形状。
+    for &e in &ends {
+        let rest = md[e..].trim_start_matches(['\r', '\n', ' ', '\t']);
+        if rest.starts_with('#') {
+            return rest.to_string();
+        }
+    }
+    // 以 `#` 开头说明已是规范正文，不再冒险按结束标记截断。
+    if starts_heading {
+        return md.to_string();
+    }
+    // 退而取第一个结束标记（模板注入开始标记时通常只有一个）。
+    if let Some(&e) = ends.first() {
+        let rest = md[e..].trim_start_matches(['\r', '\n', ' ', '\t']);
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    md.to_string()
+}
+
 /// 解析 LLM 输出的 Markdown 为笔记树。
 /// 约定：`#`=标题；`##`/`###`…=按层级嵌套的 Section；`$$…$$`=Formula；
 /// 其余非空行=Paragraph（连续行合并为一段），挂到最近的 Section 下。
 pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
-    let (macros, md) = take_macros_comment(md);
+    let md = strip_reasoning(md);
+    let (macros, md) = take_macros_comment(&md);
     let (mut title, mut roots) = parse_blocks_core(&md, true);
 
     if title.is_empty() {
@@ -956,6 +1001,46 @@ mod tests {
         assert!(out.contains("## 1 要解决的问题"), "应为 '## 1 要解决的问题': {out}");
         assert!(out.contains("## 2 本文方案"), "应为 '## 2 本文方案': {out}");
         assert!(!out.contains("三、本文方案"), "不应残留中文序号: {out}");
+    }
+
+    #[test]
+    fn strips_reasoning_leaked_into_content() {
+        use super::strip_reasoning;
+        // 模板注入开始标记时，模型只吐结束标记：思考 → </think> → 正文
+        let md = "`? Let's draft.\n\n## 2 草稿\n草稿内容\n</think># 真标题\n## 一、真章节\n正文\n";
+        let out = strip_reasoning(md);
+        assert!(out.starts_with("# 真标题"), "应剥掉思考前缀: {out:?}");
+        assert!(!out.contains("Let's draft"), "思考不应保留: {out:?}");
+        let note = parse_markdown_note(md, "raw");
+        assert_eq!(note.title, "真标题");
+        let texts: Vec<&str> = note.flatten().iter().map(|(b, _)| b.text.as_str()).collect();
+        assert!(!texts.iter().any(|t| t.contains("草稿")), "草稿块不应入笔记: {texts:?}");
+    }
+
+    #[test]
+    fn strip_reasoning_keeps_clean_note_mentioning_tags() {
+        use super::strip_reasoning;
+        // 正文本身以 # 开头，即使引用 </think> 也不应被误剥
+        let md = "# 标题\n\n论文讨论 `</think>` 标记。\n";
+        assert_eq!(strip_reasoning(md), md);
+    }
+
+    #[test]
+    fn strip_reasoning_picks_boundary_before_heading() {
+        use super::strip_reasoning;
+        let md = "<think>思考一</think>继续想\n</think># T\n正文\n";
+        let out = strip_reasoning(md);
+        assert!(out.starts_with("# T"), "应取标题前的结束标记: {out:?}");
+    }
+
+    #[test]
+    fn strip_reasoning_handles_reasoning_starting_with_heading() {
+        use super::strip_reasoning;
+        // 思考草稿本身以 # 开头，但结束标记后面紧跟真正的标题 → 仍应剥离
+        let md = "# 草稿\n思路…\n</think># 真标题\n正文\n";
+        let out = strip_reasoning(md);
+        assert!(out.starts_with("# 真标题"), "紧跟标题的标记应被识别: {out:?}");
+        assert!(!out.contains("草稿"), "草稿不应保留: {out:?}");
     }
 
     #[test]
