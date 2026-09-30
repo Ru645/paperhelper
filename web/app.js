@@ -4056,6 +4056,7 @@ function setSettingsTab(tab) {
     t.classList.toggle("active", t.dataset.tab === tab)
   );
   $("settings-model").classList.toggle("hidden", tab !== "model");
+  $("settings-ui").classList.toggle("hidden", tab !== "ui");
   $("settings-style").classList.toggle("hidden", tab !== "style");
 }
 
@@ -4080,6 +4081,10 @@ async function openConfig(tab = "model") {
     $("cfg-outprice").value = c.pricing.output_price_per_1m;
     $("cfg-budget").value = c.budget.token_budget;
     $("cfg-paper-relation").value = c.llm.paper_relation || "concept";
+    pendingShortcut = parseShortcut(c.ui && c.ui.toggle_sidebar);
+    reflectShortcutInput();
+    $("cfg-ui-status").textContent = "";
+    $("cfg-ui-status").className = "status";
     $("cfg-status").textContent = "";
     $("cfg-status").className = "status";
     $("cfg-test-result").classList.add("hidden");
@@ -4125,6 +4130,72 @@ async function saveConfig() {
     status.className = "status ok";
     await refreshState();
     setTimeout(() => $("config-modal").classList.add("hidden"), 600);
+  } catch (e) {
+    status.textContent = "❌ " + e.message;
+    status.className = "status err";
+  }
+}
+
+let recordingShortcut = false;
+let pendingShortcut = null;
+
+/// 同步「清除 / 恢复默认」按钮可用态（无可做即置灰）。
+function syncShortcutButtons() {
+  const empty = !pendingShortcut;
+  const isDefault = !!pendingShortcut && serializeShortcut(pendingShortcut) === DEFAULT_SIDEBAR_SHORTCUT;
+  if ($("btn-config-shortcut-clear")) $("btn-config-shortcut-clear").disabled = empty;
+  if ($("btn-config-shortcut-reset")) $("btn-config-shortcut-reset").disabled = isDefault;
+}
+
+/// 把当前 pending 快捷键反映到输入框（空 → 未设置提示）。
+function reflectShortcutInput() {
+  const input = $("cfg-sidebar-key");
+  if (!input) return;
+  input.value = pendingShortcut ? formatShortcut(pendingShortcut) : "";
+  input.placeholder = pendingShortcut ? "" : "未设置（不启用快捷键）";
+  syncShortcutButtons();
+}
+
+/// 快捷键录制：聚焦后按下组合键捕获；Esc 取消、Backspace / Delete 清除。
+function setupShortcutRecorder() {
+  const input = $("cfg-sidebar-key");
+  if (!input) return;
+  input.addEventListener("focus", () => {
+    recordingShortcut = true;
+    input.value = "";
+    input.placeholder = "按下组合键…（Esc 取消，Backspace 清除）";
+  });
+  input.addEventListener("blur", () => {
+    recordingShortcut = false;
+    reflectShortcutInput();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (!recordingShortcut) return;
+    if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return; // 放行 Tab 切焦点
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") { input.blur(); return; }
+    if (e.key === "Backspace" || e.key === "Delete") { pendingShortcut = null; input.blur(); return; }
+    const sc = shortcutFromEvent(e);
+    // 仅按修饰键 / 只有 Shift：不提交，继续等待
+    if (!sc || !(sc.ctrl || sc.alt || sc.meta)) return;
+    pendingShortcut = sc;
+    input.blur();
+  });
+  $("btn-config-shortcut-clear").onclick = () => { pendingShortcut = null; reflectShortcutInput(); };
+  $("btn-config-shortcut-reset").onclick = () => { pendingShortcut = parseShortcut(DEFAULT_SIDEBAR_SHORTCUT); reflectShortcutInput(); };
+}
+
+/// 只保存快捷键设置（立即生效，不关闭弹窗）。
+async function saveUiConfig() {
+  const status = $("cfg-ui-status");
+  status.textContent = "保存中…";
+  status.className = "status";
+  try {
+    await setConfig("ui.toggle_sidebar", serializeShortcut(pendingShortcut));
+    sidebarShortcut = pendingShortcut;
+    status.textContent = pendingShortcut ? `✓ 已保存（${formatShortcut(pendingShortcut)}）` : "✓ 已保存（不启用快捷键）";
+    status.className = "status ok";
   } catch (e) {
     status.textContent = "❌ " + e.message;
     status.className = "status err";
@@ -4765,6 +4836,93 @@ async function wizardNext() {
 const PANEL_KEY = "ph.panel";
 const WIDTH_KEY = "ph.sidebarWidth";
 const COLLAPSE_KEY = "ph.sidebarCollapsed";
+const DEFAULT_SIDEBAR_SHORTCUT = "ctrl+b";
+// 左侧栏开关快捷键（解析后的对象；null = 不启用）。启动时从 /api/config 覆盖。
+let sidebarShortcut = parseShortcut(DEFAULT_SIDEBAR_SHORTCUT);
+
+/// 把配置字符串解析成快捷键对象（空串 / 非法 → null）。
+function parseShortcut(str) {
+  const s = String(str || "").trim().toLowerCase();
+  if (!s) return null;
+  const parts = s.split("+").map((p) => p.trim()).filter((p) => p.length);
+  if (parts.length < 2) return null;
+  const sc = { ctrl: false, alt: false, shift: false, meta: false, key: parts[parts.length - 1] };
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (p === "ctrl" || p === "control") sc.ctrl = true;
+    else if (p === "alt" || p === "option") sc.alt = true;
+    else if (p === "shift") sc.shift = true;
+    else if (p === "meta" || p === "cmd" || p === "command") sc.meta = true;
+  }
+  if (!sc.key || ["ctrl", "alt", "shift", "meta"].includes(sc.key)) return null;
+  return sc;
+}
+
+/// 序列化成配置字符串（如 ctrl+b）。
+function serializeShortcut(sc) {
+  if (!sc) return "";
+  const mods = [];
+  if (sc.ctrl) mods.push("ctrl");
+  if (sc.alt) mods.push("alt");
+  if (sc.shift) mods.push("shift");
+  if (sc.meta) mods.push("meta");
+  return mods.concat([sc.key]).join("+");
+}
+
+/// 展示文案（Mac 的 meta 显示 ⌘）。
+function formatShortcut(sc) {
+  if (!sc) return "";
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform || "");
+  const mods = [];
+  if (sc.ctrl) mods.push(isMac ? "⌃" : "Ctrl");
+  if (sc.alt) mods.push(isMac ? "⌥" : "Alt");
+  if (sc.shift) mods.push("Shift");
+  if (sc.meta) mods.push(isMac ? "⌘" : "Meta");
+  const named = { plus: "+", space: "Space", minus: "-", equal: "=", arrowup: "↑", arrowdown: "↓", arrowleft: "←", arrowright: "→" }[sc.key];
+  return mods.concat([named || sc.key.toUpperCase()]).join("+");
+}
+
+/// 从 keydown 事件提取快捷键对象（仅按修饰键 → null）。
+function shortcutFromEvent(e) {
+  const raw = String(e.key || "");
+  if (!raw || ["control", "alt", "shift", "meta"].includes(raw.toLowerCase())) return null;
+  let key = raw.toLowerCase();
+  if (key === " ") key = "space";
+  else if (key === "+") key = "plus";
+  return { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, key };
+}
+
+/// 事件是否与该快捷键精确匹配（修饰键必须完全一致）。
+function shortcutMatches(e, sc) {
+  if (!sc || e.isComposing) return false;
+  if (!!e.ctrlKey !== sc.ctrl || !!e.altKey !== sc.alt || !!e.shiftKey !== sc.shift || !!e.metaKey !== sc.meta) return false;
+  let key = String(e.key || "").toLowerCase();
+  if (key === " ") key = "space";
+  else if (key === "+") key = "plus";
+  return key === sc.key;
+}
+
+/// 设置左侧栏折叠状态（持久化）。
+function setLeftSidebarCollapsed(on) {
+  const sidebar = $("sidebar");
+  if (!sidebar) return;
+  sidebar.classList.toggle("collapsed", !!on);
+  try { localStorage.setItem(COLLAPSE_KEY, on ? "1" : "0"); } catch (e) { /* 忽略 */ }
+}
+
+function toggleLeftSidebar() {
+  const sidebar = $("sidebar");
+  if (!sidebar) return;
+  setLeftSidebarCollapsed(!sidebar.classList.contains("collapsed"));
+}
+
+/// 启动时读一次界面配置（快捷键）。失败则沿用默认，不影响使用。
+async function loadUiConfig() {
+  try {
+    const c = await (await fetch("/api/config")).json();
+    sidebarShortcut = parseShortcut(c.ui && c.ui.toggle_sidebar);
+  } catch (e) { /* 忽略 */ }
+}
 
 function setupSidebar() {
   const acts = document.querySelectorAll("#activitybar .act");
@@ -4787,12 +4945,10 @@ function setupSidebar() {
     b.onclick = () => {
       // 再点当前面板 = 收起/展开侧栏（VS Code 行为）
       if (b.classList.contains("active") && !sidebar.classList.contains("collapsed")) {
-        sidebar.classList.add("collapsed");
-        try { localStorage.setItem(COLLAPSE_KEY, "1"); } catch (e) { /* 忽略 */ }
+        setLeftSidebarCollapsed(true);
         return;
       }
-      sidebar.classList.remove("collapsed");
-      try { localStorage.setItem(COLLAPSE_KEY, "0"); } catch (e) { /* 忽略 */ }
+      setLeftSidebarCollapsed(false);
       current = b.dataset.panel;
       localStorage.setItem(PANEL_KEY, current);
       apply(current);
@@ -4985,6 +5141,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config-test").onclick = testConfig;
   $("btn-config-test-stop").onclick = stopConfigTest;
   $("btn-config-save").onclick = saveConfig;
+  $("btn-config-ui-save").onclick = saveUiConfig;
+  setupShortcutRecorder();
 
   // 版本更新：顶栏提示 / 更新弹窗 / 设置页手动检查
   $("btn-update").onclick = () => showUpdateModal(null);
@@ -5032,9 +5190,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
   document.addEventListener("keydown", (e) => {
+    if (recordingShortcut) return; // 录制中：交给录制输入框处理
+    if (!e.repeat && shortcutMatches(e, sidebarShortcut)) {
+      e.preventDefault();
+      toggleLeftSidebar();
+      return;
+    }
     if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }
   });
 
+  loadUiConfig();
   refreshState();
   setInterval(refreshState, 15000);
   // 启动自动检查更新（24h 节流；失败静默，不影响使用）

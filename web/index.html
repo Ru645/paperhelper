@@ -307,6 +307,7 @@
     <h2>设置</h2>
     <div class="settings-tabs" id="settings-tabs">
       <button class="settings-tab active" data-tab="model">模型设置</button>
+      <button class="settings-tab" data-tab="ui">界面</button>
       <button class="settings-tab" data-tab="style">笔记风格</button>
     </div>
 
@@ -338,6 +339,21 @@
       <div class="update-row">
         <span class="muted" id="cfg-version">当前版本 —</span>
         <button id="btn-update-check" class="mini ghost">检查更新</button>
+      </div>
+    </div>
+
+    <div id="settings-ui" class="settings-pane hidden">
+      <label>左侧栏开关快捷键
+        <span class="style-row">
+          <input id="cfg-sidebar-key" readonly placeholder="点击输入框后按下组合键…">
+          <button id="btn-config-shortcut-clear" class="mini ghost" title="不启用快捷键">清除</button>
+          <button id="btn-config-shortcut-reset" class="mini ghost" title="恢复为 Ctrl+B">恢复默认</button>
+        </span>
+      </label>
+      <p class="muted" id="cfg-sidebar-hint">点击输入框进入录制，直接按下组合键（如 Ctrl+B）；Esc 取消，Backspace / Delete 清除。「清除」表示不启用快捷键；保存后立即生效。</p>
+      <p id="cfg-ui-status" class="status"></p>
+      <div class="modal-actions">
+        <button id="btn-config-ui-save" class="primary">保存快捷键</button>
       </div>
     </div>
 
@@ -399,6 +415,7 @@
       <li><b>撤销</b>：删除后点「撤销」恢复。</li>
       <li><b>设置</b>：「设置」分两部分——「模型设置」改 API 端点/密钥/模型/价格/上下文/预算；「笔记风格」管理生成笔记的风格提示词。</li>
       <li><b>列表多选</b>：侧栏的会话 / 论文 / 概念列表，Ctrl(⌘) 点选、Shift 连选，右键可批量置顶 / 删除；Esc 取消选择。</li>
+      <li><b>快捷键</b>：<b>Ctrl(⌘)+B</b> 显隐左侧栏（笔记结构 / 会话 / 论文 / 概念）。可在「设置 → 界面」里改键、清除（不启用）或恢复默认。</li>
     </ul>
     <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
   </div>

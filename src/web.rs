@@ -1638,6 +1638,9 @@ async fn api_config_get(State(app): State<SharedApp>) -> Json<serde_json::Value>
             "output_price_per_1m": a.config.pricing.output_price_per_1m,
         },
         "budget": { "token_budget": a.config.budget.token_budget },
+        "ui": {
+            "toggle_sidebar": a.config.ui.toggle_sidebar,
+        },
         "presets": {
             "models": a.config.presets.models,
             "endpoints": a.config.presets.endpoints,

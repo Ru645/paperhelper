@@ -24,6 +24,61 @@ pub struct Config {
     /// 更新检查（旧配置缺 `[update]` 节时用默认：自动检查开、官方源）。
     #[serde(default)]
     pub update: UpdateConfig,
+    /// 界面偏好（旧配置缺 `[ui]` 节时用默认）。
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// 界面偏好（`[ui]` 节）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// 左侧栏开关快捷键，形如 `ctrl+b`；空字符串 = 不启用快捷键。
+    /// 需至少包含一个 Ctrl / Alt / ⌘ 修饰键，末位为普通按键。
+    #[serde(default = "default_sidebar_shortcut")]
+    pub toggle_sidebar: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        UiConfig {
+            toggle_sidebar: default_sidebar_shortcut(),
+        }
+    }
+}
+
+fn default_sidebar_shortcut() -> String {
+    "ctrl+b".into()
+}
+
+/// 校验快捷键字符串：空串合法（表示不启用）；否则须为 `修饰键(+修饰键)*+按键`。
+/// 修饰键仅允许 ctrl / alt / shift / meta，且至少一个、不重复；末位为具体按键（不能是修饰键）。
+pub fn valid_shortcut(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return true;
+    }
+    let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let (mods, key) = parts.split_at(parts.len() - 1);
+    let key = key[0];
+    // 末键不能为空、也不能是修饰键本身（必须至少有一个真正的按键）
+    if key.is_empty() || matches!(key.to_lowercase().as_str(), "ctrl" | "alt" | "shift" | "meta") {
+        return false;
+    }
+    // 前置 token 只能是修饰键，且不能重复
+    let mut seen = std::collections::HashSet::new();
+    for m in mods {
+        let m = m.to_lowercase();
+        if !matches!(m.as_str(), "ctrl" | "alt" | "shift" | "meta") {
+            return false;
+        }
+        if !seen.insert(m) {
+            return false;
+        }
+    }
+    true
 }
 
 /// 版本更新检查配置（`[update]` 节）。
@@ -151,6 +206,7 @@ impl Default for Config {
             },
             presets: PresetsConfig::default(),
             update: UpdateConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -172,6 +228,10 @@ impl Config {
         // 手改 toml 写坏的值回落默认，避免后续匹配落空
         if !valid_paper_relation(&cfg.llm.paper_relation) {
             cfg.llm.paper_relation = default_paper_relation();
+        }
+        // 手改 toml 写坏的快捷键回落默认（空串合法 = 不启用，保留）
+        if !valid_shortcut(&cfg.ui.toggle_sidebar) {
+            cfg.ui.toggle_sidebar = default_sidebar_shortcut();
         }
 
         if let Ok(v) = std::env::var("PAPERHELPER_API_KEY") {
@@ -224,6 +284,12 @@ impl Config {
         if let Ok(v) = std::env::var("PAPERHELPER_AUTO_UPDATE") {
             cfg.update.auto_check = matches!(v.as_str(), "1" | "true" | "TRUE");
         }
+        if let Ok(v) = std::env::var("PAPERHELPER_UI_TOGGLE_SIDEBAR") {
+            let v = v.trim();
+            if valid_shortcut(v) {
+                cfg.ui.toggle_sidebar = v.to_string();
+            }
+        }
 
         Ok(cfg)
     }
@@ -257,5 +323,33 @@ mod tests {
         assert!(valid_paper_relation("full"));
         assert!(!valid_paper_relation("everything"));
         assert!(!valid_paper_relation(""));
+    }
+
+    /// 旧 config.toml 没有 [ui] 节时应回落到默认快捷键。
+    #[test]
+    fn legacy_config_defaults_sidebar_shortcut() {
+        let cfg: Config = toml::from_str(
+            "[llm]\napi_endpoint = \"e\"\napi_key = \"\"\nmodel = \"m\"\ncontext_length = 8192\nthinking_mode = false\n\n[pricing]\ninput_price_per_1m = 0\noutput_price_per_1m = 0\n\n[budget]\ntoken_budget = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.ui.toggle_sidebar, "ctrl+b");
+    }
+
+    #[test]
+    fn shortcut_validation() {
+        // 空串合法 = 不启用快捷键
+        assert!(valid_shortcut(""));
+        assert!(valid_shortcut("   "));
+        assert!(valid_shortcut("ctrl+b"));
+        assert!(valid_shortcut("Ctrl+Shift+B"));
+        assert!(valid_shortcut("alt+1"));
+        assert!(valid_shortcut("meta+/"));
+        assert!(valid_shortcut("ctrl+f12"));
+        // 必须有非修饰末键、至少一个修饰键、不能重复
+        assert!(!valid_shortcut("b"));
+        assert!(!valid_shortcut("ctrl"));
+        assert!(!valid_shortcut("b+ctrl"));
+        assert!(!valid_shortcut("ctrl+ctrl+b"));
+        assert!(!valid_shortcut("super+b"));
     }
 }

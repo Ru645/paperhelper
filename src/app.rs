@@ -102,6 +102,7 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
     ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "update.auto_check", is_bool: true, from_presets: None },
     ConfigKeyDef { key: "update.source_url", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.toggle_sidebar", is_bool: false, from_presets: None },
 ];
 
 /// 命令补全器：
@@ -1182,6 +1183,13 @@ PaperHelper 命令：
             "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
             "update.auto_check" => self.config.update.auto_check = parse_bool(val),
             "update.source_url" => self.config.update.source_url = val.trim().into(),
+            "ui.toggle_sidebar" => {
+                let v = val.trim();
+                if !crate::config::valid_shortcut(v) {
+                    bail!("ui.toggle_sidebar 需形如 ctrl+b（至少含一个 Ctrl/Alt/⌘ 修饰键），或留空表示不启用");
+                }
+                self.config.ui.toggle_sidebar = v.to_string();
+            }
             _ => {
                 let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
                 bail!("未知配置项: {key}。可设: {}", keys.join(" "));
