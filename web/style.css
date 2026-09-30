@@ -476,7 +476,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .blk-edit-btn.hidden { display: none; }
 
 /* 笔记块编辑弹窗 */
-.edit-box { width: 760px; max-width: 94vw; }
+.edit-box { width: 1120px; max-width: 96vw; }
 .edit-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; }
 .edit-tab {
   border: 1px solid var(--line); background: #fff; border-radius: 6px;
@@ -487,11 +487,46 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .edit-ai-row.hidden { display: none; }
 .edit-ai-row input { flex: 1; min-width: 0; }
 #edit-text {
-  width: 100%; box-sizing: border-box; resize: vertical;
+  flex: 1 1 auto; min-width: 220px; box-sizing: border-box; resize: vertical;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 13px; line-height: 1.6; padding: 10px; border: 1px solid var(--line);
   border-radius: 6px; background: #fff; color: var(--fg);
 }
+.edit-split { display: flex; align-items: stretch; }
+.edit-prev-resizer {
+  flex: 0 0 7px; margin: 0 6px; cursor: col-resize; touch-action: none;
+  position: relative; align-self: stretch;
+}
+.edit-prev-resizer::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 1px; background: var(--line);
+}
+.edit-prev-resizer:hover::after { background: var(--blue); }
+.edit-prev-resizer.hidden { display: none; }
+.edit-preview {
+  flex: 0 0 var(--edit-prev-w, 420px); width: var(--edit-prev-w, 420px);
+  min-width: 200px; display: flex; flex-direction: column;
+  border: 1px solid var(--line); border-radius: 6px; background: #fff; overflow: hidden;
+}
+.edit-preview.hidden { display: none; }
+.edit-prev-head {
+  flex: 0 0 auto; padding: 6px 12px; font-size: 12px; color: var(--muted);
+  border-bottom: 1px solid var(--line); background: #faf9f7;
+}
+.edit-preview-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px;
+  font-size: 13px; line-height: 1.7; word-break: break-word;
+}
+.edit-preview-body p { margin: 6px 0; }
+.edit-preview-body h1, .edit-preview-body h2, .edit-preview-body h3, .edit-preview-body h4 { margin: 12px 0 6px; }
+.edit-preview-body ul, .edit-preview-body ol { margin: 6px 0 6px 22px; }
+.edit-preview-body .katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+.edit-preview-body code { background: #eceae6; padding: 1px 4px; border-radius: 4px; font-size: 12.5px; }
+.edit-preview-body pre { background: #f6f5f2; padding: 8px 10px; border-radius: 6px; overflow-x: auto; }
+.edit-preview-body pre code { background: none; padding: 0; }
+.edit-preview-body blockquote { border-left: 3px solid var(--blue); background: var(--blue-light); margin: 8px 0; padding: 6px 12px; border-radius: 0 6px 6px 0; }
+.edit-preview-body table { border-collapse: collapse; margin: 6px 0; }
+.edit-preview-body th, .edit-preview-body td { border: 1px solid var(--line); padding: 4px 8px; }
+.edit-preview-body img { max-width: 100%; }
 .edit-tools { display: flex; gap: 8px; margin-top: 8px; }
 .edit-tools button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 

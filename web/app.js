@@ -1805,6 +1805,95 @@ function editModalOpen(bid) {
   return !$("edit-modal").classList.contains("hidden") && editBlockId === bid;
 }
 
+// ===== 编辑弹窗：Markdown 实时预览（右侧，可拖动 / 可折叠 / 与编辑区滚动联动）=====
+const EDIT_PREVIEW_OPEN_KEY = "ph.edit.previewOpen";
+const EDIT_PREVIEW_W_KEY = "ph.edit.previewW";
+
+/// 渲染编辑框当前内容到预览区；公式库未就绪时先纯文本，加载完再补渲。
+function renderEditPreview() {
+  const box = $("edit-preview-body");
+  if (!box || $("edit-preview").classList.contains("hidden")) return;
+  const md = $("edit-text").value;
+  if (!window.marked) { box.textContent = md || "（无内容）"; return; }
+  box.innerHTML = renderMathMarkdown(md) || '<p class="muted">（无内容）</p>';
+}
+
+let editPrevTimer = null;
+/// 输入 / 流式回填时防抖渲染，避免每敲一个字符都重排公式。
+function scheduleEditPreview() {
+  clearTimeout(editPrevTimer);
+  editPrevTimer = setTimeout(renderEditPreview, 150);
+}
+
+/// 折叠 / 展开预览（状态持久化）。
+function setEditPreviewOpen(open) {
+  $("edit-preview").classList.toggle("hidden", !open);
+  $("edit-prev-resizer").classList.toggle("hidden", !open);
+  $("btn-edit-preview").textContent = open ? "隐藏预览" : "显示预览";
+  try { localStorage.setItem(EDIT_PREVIEW_OPEN_KEY, open ? "1" : "0"); } catch (e) { /* 忽略 */ }
+  if (open) {
+    syncEditPreviewHeight();
+    renderEditPreview();
+  }
+}
+
+/// 预览高度对齐编辑框（编辑框可竖向拖动，预览随之等高、内部滚动，滚动才能联动）。
+function syncEditPreviewHeight() {
+  const preview = $("edit-preview");
+  const ta = $("edit-text");
+  if (!preview || !ta || preview.classList.contains("hidden")) return;
+  preview.style.height = Math.round(ta.getBoundingClientRect().height) + "px";
+}
+
+/// 编辑区与预览区按滚动比例双向联动（带标志位防回环）。
+let editPrevSyncing = false;
+function syncEditScroll(from, to) {
+  if (editPrevSyncing || !to) return;
+  editPrevSyncing = true;
+  const fromMax = from.scrollHeight - from.clientHeight;
+  const toMax = to.scrollHeight - to.clientHeight;
+  const ratio = fromMax > 0 ? from.scrollTop / fromMax : 0;
+  to.scrollTop = Math.round(ratio * toMax);
+  requestAnimationFrame(() => { editPrevSyncing = false; });
+}
+
+/// 初始化：恢复折叠/宽度、绑定输入、滚动联动、拖动条。
+function setupEditPreview() {
+  const ta = $("edit-text");
+  const body = $("edit-preview-body");
+  const resizer = $("edit-prev-resizer");
+  let open = true;
+  try { if (localStorage.getItem(EDIT_PREVIEW_OPEN_KEY) === "0") open = false; } catch (e) { /* 忽略 */ }
+  setEditPreviewOpen(open);
+  try {
+    const w = Number(localStorage.getItem(EDIT_PREVIEW_W_KEY) || 0);
+    if (w >= 200) document.documentElement.style.setProperty("--edit-prev-w", Math.round(w) + "px");
+  } catch (e) { /* 忽略损坏的存储 */ }
+  ta.addEventListener("input", scheduleEditPreview);
+  ta.addEventListener("scroll", () => syncEditScroll(ta, body));
+  body.addEventListener("scroll", () => syncEditScroll(body, ta));
+  if (window.ResizeObserver) {
+    new ResizeObserver(syncEditPreviewHeight).observe(ta);
+  }
+  $("btn-edit-preview").onclick = () =>
+    setEditPreviewOpen($("edit-preview").classList.contains("hidden"));
+  resizer.addEventListener("pointerdown", (e) => {
+    const start = { x: e.clientX, w: $("edit-preview").getBoundingClientRect().width };
+    startPointerDrag(resizer, e, {
+      cursor: "col-resize",
+      onMove: (ev) => {
+        const maxW = Math.max(240, $("edit-split").getBoundingClientRect().width - 260);
+        const w = Math.min(Math.max(220, Math.round(start.w - (ev.clientX - start.x))), maxW);
+        document.documentElement.style.setProperty("--edit-prev-w", w + "px");
+      },
+      onEnd: () => {
+        const v = getComputedStyle(document.documentElement).getPropertyValue("--edit-prev-w");
+        try { localStorage.setItem(EDIT_PREVIEW_W_KEY, String(parseInt(v, 10) || 420)); } catch (err) { /* 忽略 */ }
+      },
+    });
+  });
+}
+
 /// 按后台生成状态刷新「生成/停止」按钮（生成属于别的块时只禁用生成）。
 function reflectEditRun() {
   const mine = !!editRun && editRun.blockId === editBlockId;
@@ -1867,6 +1956,8 @@ async function openEditModal(id) {
         : "支持 Markdown；数学公式用 $...$ 或 $$...$$。";
     }
     $("btn-edit-delete").classList.toggle("hidden", isTitle);
+    renderEditPreview();
+    loadMathLibs().then(renderEditPreview);
     $("edit-text").focus();
   } catch (e) {
     $("edit-status").textContent = "❌ " + e.message;
@@ -1919,6 +2010,7 @@ async function generateEdit() {
   setStatus("生成中…");
   if (editModalOpen(bid)) {
     $("edit-text").value = "";
+    scheduleEditPreview();
     $("btn-edit-gen").disabled = true;
   }
   showBar("edit-ai-bar", true);
@@ -1938,6 +2030,7 @@ async function generateEdit() {
         if (editModalOpen(bid)) {
           $("edit-text").value = acc;
           $("edit-text").scrollTop = $("edit-text").scrollHeight;
+          scheduleEditPreview();
         }
       } else if (name === "reasoning") {
         if (editModalOpen(bid)) appendReasoning("edit", text);
@@ -4877,6 +4970,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupAnnDockResize();
   setupReasoningResize();
   setupReasoningPref();
+  setupEditPreview();
   applyAnnSide();
   applyAnnDock();
   if ($("ann-dock")) $("ann-dock").onclick = toggleAnnDock;
