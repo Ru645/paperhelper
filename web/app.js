@@ -1371,6 +1371,8 @@ function onNoteLoaded() {
   if (!doc) return;
   if (!doc.__annBound) {
     doc.__annBound = true;
+    // 焦点在笔记 iframe 内时 keydown 不会冒泡到父文档，快捷键因此失效；这里补绑同一入口。
+    doc.addEventListener("keydown", handleGlobalKeydown);
     doc.addEventListener("mouseup", () => setTimeout(showSelButton, 0));
     // 注意：鼠标从笔记移到「✎ 编辑」（在父文档里）会触发 iframe 的 mouseleave，
     // 若立即隐藏按钮，指针就又落回笔记内容上 → 按钮反复闪烁、首次点击落空。
@@ -5083,6 +5085,40 @@ function dispatchShortcut(key) {
   }
 }
 
+/// Esc 关闭当前最上层弹窗（按 DOM 顺序倒序 = 从最上层往下找）。
+function closeTopModal() {
+  const closers = [
+    ["wizard-modal", closeWizard],
+    ["update-modal", () => $("update-modal").classList.add("hidden")],
+    ["help-modal", () => $("help-modal").classList.add("hidden")],
+    ["config-modal", () => $("config-modal").classList.add("hidden")],
+    ["edit-modal", closeEditModal],
+    ["import-modal", () => closeImportModal(null)],
+  ];
+  for (const [id, close] of closers) {
+    const el = $(id);
+    if (el && !el.classList.contains("hidden")) { close(); return true; }
+  }
+  return false;
+}
+
+/// 全局快捷键入口：父文档与笔记 iframe 的 keydown 都走这里。
+/// （笔记区是一层 iframe，焦点在其内部时事件不会冒泡到父文档，故两处都要绑。）
+function handleGlobalKeydown(e) {
+  if (recordingKey) return; // 录制中：交给录制输入框处理
+  if (e.repeat) return;
+  for (const a of SHORTCUT_ACTIONS) {
+    const sc = liveShortcuts[a.key];
+    if (!sc || !shortcutMatches(e, sc)) continue;
+    if (a.key === "undo" && isEditableTarget(e.target)) return; // 输入框内让浏览器撤销文字
+    e.preventDefault();
+    dispatchShortcut(a.key);
+    return;
+  }
+  if (e.key === "Escape" && closeTopModal()) return;
+  if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }
+}
+
 function setupSidebar() {
   const acts = document.querySelectorAll("#activitybar .act");
   const sidebar = $("sidebar");
@@ -5432,39 +5468,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-edit-delete").onclick = deleteEditBlock;
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
-  // Esc：优先关闭当前打开的最上层弹窗（向导 / 更新 / 帮助 / 设置 / 编辑 / 导入）；
-  // 没有弹窗时才清右键菜单与多选。顺序按 DOM（后者在上）从顶到底。
-  document.addEventListener("keydown", (e) => {
-    if (recordingKey) return; // 录制中：交给录制输入框处理
-    if (e.repeat) return;
-    for (const a of SHORTCUT_ACTIONS) {
-      const sc = liveShortcuts[a.key];
-      if (!sc || !shortcutMatches(e, sc)) continue;
-      if (a.key === "undo" && isEditableTarget(e.target)) return; // 输入框内让浏览器撤销文字
-      e.preventDefault();
-      dispatchShortcut(a.key);
-      return;
-    }
-    if (e.key === "Escape" && closeTopModal()) return;
-    if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }
-  });
-
-  // Esc 关闭当前最上层弹窗（按 DOM 顺序倒序 = 从最上层往下找）。
-  function closeTopModal() {
-    const closers = [
-      ["wizard-modal", closeWizard],
-      ["update-modal", () => $("update-modal").classList.add("hidden")],
-      ["help-modal", () => $("help-modal").classList.add("hidden")],
-      ["config-modal", () => $("config-modal").classList.add("hidden")],
-      ["edit-modal", closeEditModal],
-      ["import-modal", () => closeImportModal(null)],
-    ];
-    for (const [id, close] of closers) {
-      const el = $(id);
-      if (el && !el.classList.contains("hidden")) { close(); return true; }
-    }
-    return false;
-  }
+  document.addEventListener("keydown", handleGlobalKeydown);
 
   loadUiConfig();
   refreshState();
