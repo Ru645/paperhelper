@@ -3752,6 +3752,13 @@ async function saveImportAsStyle() {
   }
 }
 
+/// 只有「新建且尚未导入」的会话才允许把文件拖进窗口触发导入：
+/// 已有笔记 / 仅阅读 / 已挂 PDF 的会话一律不导入，避免误覆盖当前内容。
+function canDropImport() {
+  const st = lastState || {};
+  return !st.has_note && !st.read_only && !(st.pdf && st.pdf.available);
+}
+
 async function importFile(file) {
   if (!file) return;
   if (running || llmBusyTask) { showBusyHint(); return; }
@@ -5173,11 +5180,24 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   let dragDepth = 0;
   const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+  const dropOverlay = $("drop-overlay");
+  // 拖进窗口：只有「新建未导入」会话才提示导入，否则提示不可导入（不做任何 ingest）
+  const showDropOverlay = () => {
+    const ok = canDropImport();
+    const inner = dropOverlay.querySelector(".drop-inner");
+    if (inner) {
+      inner.textContent = ok
+        ? "松开鼠标，导入文件（论文 / 笔记 / 讲义）"
+        : "当前会话已有内容，不能导入；如需导入新文件，请先新建会话";
+    }
+    dropOverlay.classList.toggle("nope", !ok);
+    dropOverlay.classList.remove("hidden");
+  };
   document.addEventListener("dragenter", (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
     dragDepth++;
-    $("drop-overlay").classList.remove("hidden");
+    showDropOverlay();
   });
   document.addEventListener("dragover", (e) => {
     if (hasFiles(e)) e.preventDefault();
@@ -5185,14 +5205,20 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("dragleave", (e) => {
     if (!hasFiles(e)) return;
     dragDepth = Math.max(0, dragDepth - 1);
-    if (dragDepth === 0) $("drop-overlay").classList.add("hidden");
+    if (dragDepth === 0) dropOverlay.classList.add("hidden");
   });
   document.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
     e.preventDefault();
     dragDepth = 0;
-    $("drop-overlay").classList.add("hidden");
-    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) importFile(f);
+    dropOverlay.classList.add("hidden");
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (!files || !files.length) return;
+    if (!canDropImport()) {
+      showBusyHint("当前会话已有内容，未导入。如需导入新文件，请先「新建会话」");
+      return;
+    }
+    importFile(files[0]);
   });
 
   $("btn-refresh").onclick = () => { refreshState(); reloadNote(); };
@@ -5220,6 +5246,62 @@ document.addEventListener("DOMContentLoaded", () => {
   $("ann-send").onclick = sendAnnotation;
   $("ann-attach").onclick = () => $("ann-file").click();
   $("ann-file").onchange = () => onAnnFiles($("ann-file").files);
+  // 附件增强：粘贴图片 / 文件，或把文件拖到提问弹窗（含输入框）里，都作为附件。
+  // 这里 stopPropagation，避免落到全局「拖进窗口导入」而误触发 ingest。
+  const annPopup = $("ann-popup");
+  if (annPopup) {
+    annPopup.addEventListener("paste", (e) => {
+      const dt = e.clipboardData;
+      if (!dt) return;
+      const files = [];
+      if (dt.files && dt.files.length) {
+        files.push(...Array.from(dt.files));
+      } else if (dt.items) {
+        for (const it of dt.items) {
+          if (it.kind === "file") { const f = it.getAsFile(); if (f) files.push(f); }
+        }
+      }
+      if (!files.length) return; // 普通文字粘贴：交给浏览器默认行为
+      e.preventDefault();
+      files.forEach((f, i) => {
+        if (f.name) { addAnnFile(f); return; }
+        const ext = ((f.type || "").split("/")[1] || "png").replace("jpeg", "jpg");
+        const fallback = `粘贴的图片${files.length > 1 ? i + 1 : ""}.${ext}`;
+        addAnnFile(new File([f], fallback, { type: f.type || "image/png" }));
+      });
+      $("ann-q").focus();
+    });
+    const annDropClear = () => annPopup.classList.remove("ann-drop");
+    annPopup.addEventListener("dragenter", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepth = 0;
+      dropOverlay.classList.add("hidden");
+      annPopup.classList.add("ann-drop");
+    });
+    annPopup.addEventListener("dragover", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      annPopup.classList.add("ann-drop");
+    });
+    annPopup.addEventListener("dragleave", (e) => {
+      if (!hasFiles(e)) return;
+      if (e.target === annPopup || !annPopup.contains(e.relatedTarget)) annDropClear();
+    });
+    annPopup.addEventListener("drop", (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragDepth = 0;
+      dropOverlay.classList.add("hidden");
+      annDropClear();
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length) onAnnFiles(files);
+    });
+  }
   // 弹窗线程内：选中回答文字浮出「提问」；回答里的高亮可点击/右键
   document.addEventListener("mouseup", () => setTimeout(showAnnSelButton, 0));
   $("ann-thread").addEventListener("click", (e) => {

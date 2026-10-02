@@ -97,8 +97,14 @@ pub fn router(app: SharedApp) -> Router {
             "/api/annotate",
             post(api_annotate).layer(DefaultBodyLimit::max(MAX_IMAGE_BODY_BYTES as usize)),
         )
-        .route("/api/annotate/answer", post(api_annotate_answer))
-        .route("/api/annotate/reply", post(api_annotate_reply))
+        .route(
+            "/api/annotate/answer",
+            post(api_annotate_answer).layer(DefaultBodyLimit::max(MAX_IMAGE_BODY_BYTES as usize)),
+        )
+        .route(
+            "/api/annotate/reply",
+            post(api_annotate_reply).layer(DefaultBodyLimit::max(MAX_IMAGE_BODY_BYTES as usize)),
+        )
         .route("/api/annotate/delete", post(api_annotation_delete))
         .route("/api/annotations", get(api_annotations))
         .route("/api/conversation", get(api_conversation))

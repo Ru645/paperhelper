@@ -725,23 +725,15 @@ mark.ann-mark:hover { background: #ffe066; }
   display: flex; align-items: center; justify-content: center; pointer-events: none;
 }
 .drop-overlay.hidden { display: none; }
+.drop-overlay.nope { background: rgba(107, 114, 128, .12); border-color: #9ca3af; }
 .drop-inner {
   background: #fff; color: var(--blue); font-size: 18px; font-weight: 600;
   padding: 16px 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
 }
+.drop-overlay.nope .drop-inner { color: #6b7280; }
 
-/* ===== 文件导入 ===== */
-.cmdbar #btn-upload { flex-shrink: 0; }
-.drop-overlay {
-  position: fixed; inset: 0; z-index: 80;
-  background: rgba(37, 99, 235, .12); border: 3px dashed var(--blue);
-  display: flex; align-items: center; justify-content: center; pointer-events: none;
-}
-.drop-overlay.hidden { display: none; }
-.drop-inner {
-  background: #fff; color: var(--blue); font-size: 18px; font-weight: 600;
-  padding: 16px 28px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
-}
+/* 提问弹窗接收附件拖放时的高亮 */
+.ann-popup.ann-drop { outline: 2px dashed var(--blue); outline-offset: -4px; }
 
 /* 批注弹窗：右上角进度 + 待回答节点 */
 .ann-progress { font-size: 12px; color: var(--blue); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
