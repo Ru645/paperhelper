@@ -559,7 +559,8 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
   right: auto !important; bottom: auto !important; z-index: 1;
   flex: 0 0 auto; align-self: stretch;
   width: var(--ann-dock-w, 420px) !important; height: auto !important;
-  border-radius: 0; border-right: none; border-left: 1px solid var(--line); box-shadow: none;
+  border-radius: 0; border-top: none; border-bottom: none; border-right: none;
+  border-left: 1px solid var(--line); box-shadow: none;
 }
 .ann-popup.docked .ann-head { cursor: default; }
 .ann-popup.docked .ann-rz { display: none; }

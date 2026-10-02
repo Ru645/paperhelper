@@ -5432,6 +5432,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-edit-delete").onclick = deleteEditBlock;
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
+  // Esc：优先关闭当前打开的最上层弹窗（向导 / 更新 / 帮助 / 设置 / 编辑 / 导入）；
+  // 没有弹窗时才清右键菜单与多选。顺序按 DOM（后者在上）从顶到底。
   document.addEventListener("keydown", (e) => {
     if (recordingKey) return; // 录制中：交给录制输入框处理
     if (e.repeat) return;
@@ -5443,8 +5445,26 @@ document.addEventListener("DOMContentLoaded", () => {
       dispatchShortcut(a.key);
       return;
     }
+    if (e.key === "Escape" && closeTopModal()) return;
     if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }
   });
+
+  // Esc 关闭当前最上层弹窗（按 DOM 顺序倒序 = 从最上层往下找）。
+  function closeTopModal() {
+    const closers = [
+      ["wizard-modal", closeWizard],
+      ["update-modal", () => $("update-modal").classList.add("hidden")],
+      ["help-modal", () => $("help-modal").classList.add("hidden")],
+      ["config-modal", () => $("config-modal").classList.add("hidden")],
+      ["edit-modal", closeEditModal],
+      ["import-modal", () => closeImportModal(null)],
+    ];
+    for (const [id, close] of closers) {
+      const el = $(id);
+      if (el && !el.classList.contains("hidden")) { close(); return true; }
+    }
+    return false;
+  }
 
   loadUiConfig();
   refreshState();
