@@ -763,6 +763,11 @@ mark.ann-mark:hover { background: #ffe066; }
 .ann-summary .katex-display { overflow-x: auto; }
 .ann-summary-hint { font-size: 11px; color: var(--blue); margin-top: 4px; }
 .ann-original { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e5c76b; }
+/* 总结节点展开后，子树根节点自己的那条问答：与下面的子对话同样用灰蓝底 */
+.ann-orig-root {
+  background: #fafafa; border-left: 2px solid var(--blue-light);
+  padding: 6px 8px; margin: 6px 0; border-radius: 0 6px 6px 0;
+}
 
 /* ===== 顶栏下拉 ===== */
 .dropdown { position: relative; }

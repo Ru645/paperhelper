@@ -32,6 +32,7 @@ let annNavigated = false;     // 用户是否在弹窗对话树里点过节点�
 let annNewRoot = false;       // 用户点了对话树空白处：下一次提问作为新的对话根（森林）
 let annHostId = null;         // 回答批注发起时所在的基础批注 id（发送完回到它继续看整条森林）
 let annFolded = new Set();    // 弹窗对话里被手动折叠的节点 id（折叠后只留窄一行，不写入后端）
+let annExpandedSummaries = new Set(); // 被手动「展开原对话」的总结节点 id（重渲染后保持展开）
 
 // ===== 侧栏列表多选（Ctrl/⌘ 点选，Shift 连选，右键批量置顶/删除）=====
 const SEL_SEP = "\u0001";
@@ -2670,29 +2671,42 @@ function renderAnnThread(roots) {
     }
 
     if (node.summary) {
-      // 总结节点：显示总结，折叠原对话（点击展开）
+      // 总结节点：显示总结，原对话默认收起（点击展开；展开状态重渲染后保持，
+      // 否则在展开的历史里折叠 / 跳转任意节点都会把整段历史重新收起）
       div.classList.add("summary");
       const sum = document.createElement("div");
       sum.className = "ann-summary";
       sum.innerHTML = renderMathMarkdown(node.summary);
       const hint = document.createElement("div");
       hint.className = "ann-summary-hint";
-      hint.textContent = "▶ 展开原对话";
+      const open = annExpandedSummaries.has(node.node_id);
+      hint.textContent = open ? "▼ 收起" : "▶ 展开原对话";
       const orig = document.createElement("div");
       orig.className = "ann-original";
-      orig.style.display = "none";
-      orig.appendChild(q);
-      orig.appendChild(a);
+      orig.style.display = open ? "block" : "none";
+      // 子树的根节点也是这个总结节点自己：它那条问答单独套一层普通节点样式（灰蓝底），
+      // 不套的话会沿用总结节点的黄色背景，和下面的子对话颜色不一致。
+      const rootOrig = document.createElement("div");
+      rootOrig.className = "ann-orig-root";
+      rootOrig.appendChild(q);
+      rootOrig.appendChild(a);
+      orig.appendChild(rootOrig);
       (node.children || []).forEach((c) => add(c, depth + 1, orig));
       div.appendChild(sum);
       div.appendChild(hint);
       div.appendChild(orig);
-      onAnnNodeClick(div, (e) => {
+      // 展开 / 收起只挂在总结文字和提示行上：点原对话里的节点不应触发，
+      // 否则会冒泡到这里把整段历史收起。
+      const toggleOrig = (e) => {
         e.stopPropagation();
-        const open = orig.style.display !== "none";
-        orig.style.display = open ? "none" : "block";
-        hint.textContent = open ? "▶ 展开原对话" : "▼ 收起";
-      });
+        const nowOpen = orig.style.display !== "none";
+        if (nowOpen) annExpandedSummaries.delete(node.node_id);
+        else annExpandedSummaries.add(node.node_id);
+        orig.style.display = nowOpen ? "none" : "block";
+        hint.textContent = nowOpen ? "▶ 展开原对话" : "▼ 收起";
+      };
+      onAnnNodeClick(sum, toggleOrig);
+      onAnnNodeClick(hint, toggleOrig);
       div.oncontextmenu = (e) => {
         if (e.target.closest && e.target.closest("mark.ann-mark")) return; // 回答高亮交给批注菜单
         e.preventDefault();
