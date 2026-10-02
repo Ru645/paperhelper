@@ -420,7 +420,8 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .style-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
 .style-row select { flex: 1; min-width: 0; }
 .style-row input { flex: 1; min-width: 0; }
-#cfg-sidebar-key { cursor: pointer; }
+#ui-shortcut-rows input { cursor: pointer; }
+#ui-shortcut-rows > label { display: block; margin-top: 10px; }
 .hint { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
 .modal-box textarea {
   width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px 10px;
@@ -533,7 +534,7 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .edit-tools button.danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 
 .ann-popup {
-  position: fixed; z-index: 65; width: 560px;
+  position: fixed; z-index: 45; width: 560px;
   background: #fff; border: 1px solid var(--line); border-radius: 10px;
   box-shadow: 0 10px 40px rgba(0,0,0,.22); display: flex; flex-direction: column;
 }
@@ -552,10 +553,11 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 }
 .ann-side-resizer:hover, .ann-side-resizer.dragging { background: var(--blue); }
 .ann-side-resizer.hidden { display: none; }
-/* 停靠为右侧栏：固定右缘、挤压页面布局（见 body.ann-docked），隐藏自由缩放把手 */
+/* 停靠为右侧栏：作为 .layout 的 flex 子元素随页面排布（真正的布局侧栏），隐藏自由缩放把手 */
 .ann-popup.docked {
-  left: auto !important; top: var(--ann-dock-top, 48px) !important;
-  right: 0 !important; bottom: 0 !important;
+  position: relative; left: auto !important; top: auto !important;
+  right: auto !important; bottom: auto !important; z-index: 1;
+  flex: 0 0 auto; align-self: stretch;
   width: var(--ann-dock-w, 420px) !important; height: auto !important;
   border-radius: 0; border-right: none; border-left: 1px solid var(--line); box-shadow: none;
 }
@@ -567,7 +569,6 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
   width: 6px; cursor: col-resize; touch-action: none; z-index: 6; background: transparent;
 }
 .ann-popup.docked .ann-dock-resizer:hover { background: var(--blue); }
-body.ann-docked .layout { padding-right: var(--ann-dock-w, 420px); }
 .ann-side-head { font-size: 12px; font-weight: 600; color: #444; margin-bottom: 6px; }
 .ann-main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .ann-head {

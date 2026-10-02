@@ -530,6 +530,7 @@ async function stopCurrent() {
   if (currentAbort) { try { currentAbort.abort(); } catch (e) { /* 忽略 */ } }
   if (annAbort) { try { annAbort.abort(); } catch (e) { /* 忽略 */ } }
   if (editRun) { try { editRun.ctrl.abort(); } catch (e) { /* 忽略 */ } }
+  if (cfgTestAbort) { try { cfgTestAbort.abort(); } catch (e) { /* 忽略 */ } }
 }
 
 async function runCommand(command, opts = {}) {
@@ -2161,7 +2162,7 @@ async function deleteEditBlock() {
 
 function positionPopup(x, y) {
   const el = $("ann-popup");
-  if (annDocked()) return; // 停靠态由 CSS 固定到右侧，不再自由定位
+  if (annDocked()) return; // 停靠态是布局侧栏，由 flex 排布，不再自由定位
   const r = el.getBoundingClientRect();
   const w = r.width || 380, h = r.height || 460;
   // 弹窗允许比视口大：这时只保证左/上边可见，不再往负方向推
@@ -2337,18 +2338,23 @@ function setupAnnSideResize() {
 const ANN_DOCK_KEY = "ph.ann.dock";
 const ANN_DOCK_W_KEY = "ph.ann.dockW";
 
-/// 弹窗是否停靠为右侧栏（停靠态下挤压页面布局，见 CSS `body.ann-docked`）。
+/// 弹窗是否停靠为右侧栏（停靠态下作为 .layout 的 flex 子元素随页面排布）。
 function annDocked() {
   return localStorage.getItem(ANN_DOCK_KEY) === "1";
 }
 
-/// 应用停靠状态：切换 body/弹窗 class、按钮文案、顶边与宽度变量。
+/// 应用停靠状态：停靠 = 真正的布局侧栏（作为 .layout 的 flex 子元素，与页面一起排布）；
+/// 浮动 = 回到 body 用 fixed 自由定位。只切 class / 位置，不重建内容，切换不改当前视图。
 function applyAnnDock() {
   const popup = $("ann-popup");
   if (!popup) return;
   const on = annDocked();
-  const visible = !popup.classList.contains("hidden");
-  document.body.classList.toggle("ann-docked", on && visible); // 只在弹窗可见时挤压页面
+  const layout = document.querySelector(".layout");
+  if (on && layout) {
+    if (popup.parentElement !== layout) layout.appendChild(popup);
+  } else if (popup.parentElement !== document.body) {
+    document.body.appendChild(popup);
+  }
   popup.classList.toggle("docked", on);
   const btn = $("ann-dock");
   if (btn) {
@@ -2358,19 +2364,24 @@ function applyAnnDock() {
   if (on) {
     const w = Number(localStorage.getItem(ANN_DOCK_W_KEY) || 0) || 420;
     document.documentElement.style.setProperty("--ann-dock-w", Math.round(w) + "px");
-    const tb = document.querySelector(".topbar");
-    const top = tb ? tb.getBoundingClientRect().bottom : 48;
-    document.documentElement.style.setProperty("--ann-dock-top", Math.round(top) + "px");
   }
 }
 
 function toggleAnnDock() {
-  try { localStorage.setItem(ANN_DOCK_KEY, annDocked() ? "0" : "1"); } catch (e) { /* 忽略 */ }
-  applyAnnDock();
   const popup = $("ann-popup");
-  if (!annDocked() && popup && !popup.classList.contains("hidden")) {
-    positionPopup(window.innerWidth - 480, 90); // 取消停靠：拉回视口内
+  const wasDocked = annDocked();
+  const r = popup ? popup.getBoundingClientRect() : null;
+  try { localStorage.setItem(ANN_DOCK_KEY, wasDocked ? "0" : "1"); } catch (e) { /* 忽略 */ }
+  // 停靠 → 浮动：把当前矩形固化成浮动窗口的位置与尺寸，避免切换时视觉跳动
+  if (wasDocked && popup && r) {
+    const w = Math.round(r.width);
+    const h = Math.min(Math.round(r.height), Math.round(window.innerHeight * 0.85));
+    popup.style.width = w + "px";
+    popup.style.height = h + "px";
+    popup.style.left = Math.round(Math.min(Math.max(12, r.left), Math.max(12, window.innerWidth - w - 12))) + "px";
+    popup.style.top = Math.round(Math.max(12, Math.min(r.top, window.innerHeight - h - 12))) + "px";
   }
+  applyAnnDock();
 }
 
 /// 停靠宽度：拖动左缘把手（仅停靠态可见）改变右侧栏宽度，尺寸存 localStorage（可伸缩）。
@@ -2531,15 +2542,20 @@ async function openAnnotationView(annId, opts = {}) {
     image: null,
   };
   const viewThreads = ann.threads || (ann.thread ? [ann.thread] : []);
+  const empty = !viewThreads.length && !ann.node_id;
   annSelectedNode = viewThreads.length ? viewThreads[0].node_id : null;
   annNavigated = false;
-  annNewRoot = false;
+  annNewRoot = empty;
   await loadMathLibs();
   clearAnnSubquote();
   clearAnnAttachments();
   $("ann-quote").textContent = cleanQuote(ann.quote);
-  setPopupThreads(viewThreads);
-  renderAnnThread(viewThreads);
+  if (empty) {
+    showEmptyAnnotation(); // 对话已被清空的笔记 / PDF 批注：直接进入未提问态
+  } else {
+    setPopupThreads(viewThreads);
+    renderAnnThread(viewThreads);
+  }
   $("ann-popup").classList.remove("hidden");
   applyAnnSide();
   applyAnnDock();
@@ -2739,6 +2755,18 @@ async function annSumNode(node) {
   await afterAnnotationChange();
 }
 
+/// 批注仍在（高亮锚点还在）但对话已被清空：回到「刚选中、还没提问」的状态，
+/// 下次提问会在同一条批注上新建对话根（森林）。
+function showEmptyAnnotation() {
+  annNewRoot = true;
+  annSelectedNode = null;
+  annNavigated = false;
+  currentAnnThreads = null;
+  renderPopupTree(null);
+  $("ann-thread").innerHTML = '<p class="muted">输入问题后回车发送；这会在该处创建一条批注。</p>';
+  if (currentAnnotation && currentAnnotation.quote) showAnnSubquote(currentAnnotation.quote);
+}
+
 async function afterAnnotationChange() {
   await refreshState();
   await refreshAnnotations();
@@ -2746,8 +2774,12 @@ async function afterAnnotationChange() {
     const ann = annotationsCache.find((a) => a.id === currentAnnotation.id);
     if (ann) {
       const roots = ann.threads || (ann.thread ? [ann.thread] : []);
-      setPopupThreads(roots);
-      renderAnnThread(roots);
+      if (!roots.length && !ann.node_id) {
+        showEmptyAnnotation(); // 笔记 / PDF 批注：删光对话根后保留高亮，回到未提问态
+      } else {
+        setPopupThreads(roots);
+        renderAnnThread(roots);
+      }
     } else {
       closeAnnPopup();
     }
@@ -2757,7 +2789,7 @@ async function afterAnnotationChange() {
 
 function closeAnnPopup() {
   $("ann-popup").classList.add("hidden");
-  applyAnnDock(); // 关闭后不再挤压页面布局
+  applyAnnDock(); // 同步停靠/浮动归属（隐藏时不占空间）
   $("ann-sel-btn").classList.add("hidden");
   clearAnnSubquote();
   clearAnnAttachments();
@@ -4081,8 +4113,11 @@ async function openConfig(tab = "model") {
     $("cfg-outprice").value = c.pricing.output_price_per_1m;
     $("cfg-budget").value = c.budget.token_budget;
     $("cfg-paper-relation").value = c.llm.paper_relation || "concept";
-    pendingShortcut = parseShortcut(c.ui && c.ui.toggle_sidebar);
-    reflectShortcutInput();
+    pendingShortcuts = {};
+    for (const a of SHORTCUT_ACTIONS) {
+      pendingShortcuts[a.key] = String((c.ui && c.ui[a.key]) || "").trim();
+    }
+    reflectShortcutRows();
     $("cfg-ui-status").textContent = "";
     $("cfg-ui-status").className = "status";
     $("cfg-status").textContent = "";
@@ -4136,65 +4171,107 @@ async function saveConfig() {
   }
 }
 
-let recordingShortcut = false;
-let pendingShortcut = null;
+let recordingKey = null;
+let pendingShortcuts = {};   // key → 序列化字符串（"" = 不启用）
+const shortcutRowEls = {};   // key → { input, clear, reset }
 
-/// 同步「清除 / 恢复默认」按钮可用态（无可做即置灰）。
-function syncShortcutButtons() {
-  const empty = !pendingShortcut;
-  const isDefault = !!pendingShortcut && serializeShortcut(pendingShortcut) === DEFAULT_SIDEBAR_SHORTCUT;
-  if ($("btn-config-shortcut-clear")) $("btn-config-shortcut-clear").disabled = empty;
-  if ($("btn-config-shortcut-reset")) $("btn-config-shortcut-reset").disabled = isDefault;
+/// 把当前 pending 快捷键反映到各行（空 → 未设置提示），并同步「清除 / 恢复默认」可用态。
+function reflectShortcutRows() {
+  for (const a of SHORTCUT_ACTIONS) {
+    const els = shortcutRowEls[a.key];
+    if (!els) continue;
+    const raw = (pendingShortcuts[a.key] || "").trim();
+    const sc = parseShortcut(raw);
+    els.input.value = sc ? formatShortcut(sc) : "";
+    els.input.placeholder = sc ? "" : "未设置（不启用快捷键）";
+    els.clear.disabled = !sc;
+    els.reset.disabled = raw === a.def;
+  }
 }
 
-/// 把当前 pending 快捷键反映到输入框（空 → 未设置提示）。
-function reflectShortcutInput() {
-  const input = $("cfg-sidebar-key");
-  if (!input) return;
-  input.value = pendingShortcut ? formatShortcut(pendingShortcut) : "";
-  input.placeholder = pendingShortcut ? "" : "未设置（不启用快捷键）";
-  syncShortcutButtons();
+/// 生成「设置 → 界面」里的快捷键录制行（用 data 属性绑定，避免动态 id）。
+function buildShortcutRows() {
+  const box = $("ui-shortcut-rows");
+  if (!box || box.dataset.built) return;
+  box.dataset.built = "1";
+  for (const a of SHORTCUT_ACTIONS) {
+    const label = document.createElement("label");
+    label.append(document.createTextNode(a.label + " "));
+    const row = document.createElement("span");
+    row.className = "style-row";
+    const input = document.createElement("input");
+    input.readOnly = true;
+    input.placeholder = "点击输入框后按下组合键…";
+    const clear = document.createElement("button");
+    clear.className = "mini ghost";
+    clear.textContent = "清除";
+    clear.title = "不启用该快捷键";
+    const reset = document.createElement("button");
+    reset.className = "mini ghost";
+    reset.textContent = "恢复默认";
+    reset.title = "恢复为 " + formatShortcut(parseShortcut(a.def));
+    row.append(input, clear, reset);
+    label.appendChild(row);
+    box.appendChild(label);
+    shortcutRowEls[a.key] = { input, clear, reset };
+  }
+  for (const a of SHORTCUT_ACTIONS) {
+    const { input, clear, reset } = shortcutRowEls[a.key];
+    input.addEventListener("focus", () => {
+      recordingKey = a.key;
+      input.value = "";
+      input.placeholder = "按下组合键…（Esc 取消，Backspace 清除）";
+    });
+    input.addEventListener("blur", () => {
+      if (recordingKey === a.key) recordingKey = null;
+      reflectShortcutRows();
+    });
+    input.addEventListener("keydown", (e) => {
+      if (recordingKey !== a.key) return;
+      if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return; // 放行 Tab 切焦点
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") { input.blur(); return; }
+      if (e.key === "Backspace" || e.key === "Delete") { pendingShortcuts[a.key] = ""; input.blur(); return; }
+      const sc = shortcutFromEvent(e);
+      // 仅按修饰键 / 只有 Shift：不提交，继续等待
+      if (!sc || !(sc.ctrl || sc.alt || sc.meta)) return;
+      pendingShortcuts[a.key] = serializeShortcut(sc);
+      input.blur();
+    });
+    clear.onclick = () => { pendingShortcuts[a.key] = ""; reflectShortcutRows(); };
+    reset.onclick = () => { pendingShortcuts[a.key] = a.def; reflectShortcutRows(); };
+  }
 }
 
-/// 快捷键录制：聚焦后按下组合键捕获；Esc 取消、Backspace / Delete 清除。
 function setupShortcutRecorder() {
-  const input = $("cfg-sidebar-key");
-  if (!input) return;
-  input.addEventListener("focus", () => {
-    recordingShortcut = true;
-    input.value = "";
-    input.placeholder = "按下组合键…（Esc 取消，Backspace 清除）";
-  });
-  input.addEventListener("blur", () => {
-    recordingShortcut = false;
-    reflectShortcutInput();
-  });
-  input.addEventListener("keydown", (e) => {
-    if (!recordingShortcut) return;
-    if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) return; // 放行 Tab 切焦点
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.key === "Escape") { input.blur(); return; }
-    if (e.key === "Backspace" || e.key === "Delete") { pendingShortcut = null; input.blur(); return; }
-    const sc = shortcutFromEvent(e);
-    // 仅按修饰键 / 只有 Shift：不提交，继续等待
-    if (!sc || !(sc.ctrl || sc.alt || sc.meta)) return;
-    pendingShortcut = sc;
-    input.blur();
-  });
-  $("btn-config-shortcut-clear").onclick = () => { pendingShortcut = null; reflectShortcutInput(); };
-  $("btn-config-shortcut-reset").onclick = () => { pendingShortcut = parseShortcut(DEFAULT_SIDEBAR_SHORTCUT); reflectShortcutInput(); };
+  buildShortcutRows();
 }
 
 /// 只保存快捷键设置（立即生效，不关闭弹窗）。
 async function saveUiConfig() {
   const status = $("cfg-ui-status");
+  // 同一组合键不能分配给两个操作
+  const seen = {};
+  for (const a of SHORTCUT_ACTIONS) {
+    const s = (pendingShortcuts[a.key] || "").trim();
+    if (!s) continue;
+    if (seen[s] !== undefined && seen[s] !== a.key) {
+      const other = SHORTCUT_ACTIONS.find((x) => x.key === seen[s]);
+      status.textContent = `❌ 快捷键冲突：「${other.label}」与「${a.label}」都是 ${formatShortcut(parseShortcut(s))}，请改掉其中一个`;
+      status.className = "status err";
+      return;
+    }
+    seen[s] = a.key;
+  }
   status.textContent = "保存中…";
   status.className = "status";
   try {
-    await setConfig("ui.toggle_sidebar", serializeShortcut(pendingShortcut));
-    sidebarShortcut = pendingShortcut;
-    status.textContent = pendingShortcut ? `✓ 已保存（${formatShortcut(pendingShortcut)}）` : "✓ 已保存（不启用快捷键）";
+    for (const a of SHORTCUT_ACTIONS) {
+      await setConfig("ui." + a.key, (pendingShortcuts[a.key] || "").trim());
+    }
+    applyUiShortcuts(pendingShortcuts);
+    status.textContent = "✓ 已保存，立即生效";
     status.className = "status ok";
   } catch (e) {
     status.textContent = "❌ " + e.message;
@@ -4836,9 +4913,18 @@ async function wizardNext() {
 const PANEL_KEY = "ph.panel";
 const WIDTH_KEY = "ph.sidebarWidth";
 const COLLAPSE_KEY = "ph.sidebarCollapsed";
-const DEFAULT_SIDEBAR_SHORTCUT = "ctrl+b";
-// 左侧栏开关快捷键（解析后的对象；null = 不启用）。启动时从 /api/config 覆盖。
-let sidebarShortcut = parseShortcut(DEFAULT_SIDEBAR_SHORTCUT);
+// 六项可配置快捷键（key 与后端 config `[ui]` 节字段一致）。空串 = 不启用。
+const SHORTCUT_ACTIONS = [
+  { key: "toggle_sidebar", label: "左侧栏开关", def: "ctrl+b" },
+  { key: "open_settings", label: "打开设置", def: "ctrl+," },
+  { key: "toggle_ask", label: "右侧提问栏开关", def: "ctrl+alt+b" },
+  { key: "toggle_tree", label: "对话树开关", def: "ctrl+alt+t" },
+  { key: "stop_task", label: "停止当前任务", def: "ctrl+." },
+  { key: "undo", label: "撤销", def: "ctrl+z" },
+];
+// 当前生效的快捷键（key → 解析对象；null = 不启用）。启动时从 /api/config 覆盖。
+const liveShortcuts = {};
+for (const a of SHORTCUT_ACTIONS) liveShortcuts[a.key] = parseShortcut(a.def);
 
 /// 把配置字符串解析成快捷键对象（空串 / 非法 → null）。
 function parseShortcut(str) {
@@ -4916,12 +5002,64 @@ function toggleLeftSidebar() {
   setLeftSidebarCollapsed(!sidebar.classList.contains("collapsed"));
 }
 
+/// 从配置对象（key → 字符串）覆盖当前生效的快捷键。
+function applyUiShortcuts(src) {
+  for (const a of SHORTCUT_ACTIONS) {
+    liveShortcuts[a.key] = parseShortcut(src && src[a.key]);
+  }
+}
+
 /// 启动时读一次界面配置（快捷键）。失败则沿用默认，不影响使用。
 async function loadUiConfig() {
   try {
     const c = await (await fetch("/api/config")).json();
-    sidebarShortcut = parseShortcut(c.ui && c.ui.toggle_sidebar);
+    applyUiShortcuts(c.ui);
   } catch (e) { /* 忽略 */ }
+}
+
+/// 焦点是否在可输入控件内（用于放行输入框自身的快捷键，如 Ctrl+Z）。
+function isEditableTarget(el) {
+  if (!el) return false;
+  const tag = (el.tagName || "").toLowerCase();
+  return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+}
+
+/// 是否有可中止的任务（决定「停止当前任务」快捷键是否生效）。
+function anyTaskActive() {
+  return running || !!llmBusyTask || !!annAbort || !!editRun || !!cfgTestAbort;
+}
+
+/// 开关右侧提问栏；未选中批注时给轻提示（不静默无响应）。
+function toggleAskPanel() {
+  const popup = $("ann-popup");
+  if (!popup) return;
+  if (!popup.classList.contains("hidden")) { closeAnnPopup(); return; }
+  if (currentAnnotation && currentAnnotation.id) { openAnnotationView(currentAnnotation.id); return; }
+  showBusyHint("先在笔记或原文里选中一段文字，点「提问」打开提问栏");
+}
+
+/// 开关提问栏内的对话树；提问栏关着则顺带打开。
+function toggleConversationTree() {
+  const popup = $("ann-popup");
+  if (popup && popup.classList.contains("hidden")) toggleAskPanel();
+  toggleAnnSide();
+}
+
+/// 执行一个快捷键动作。
+function dispatchShortcut(key) {
+  switch (key) {
+    case "toggle_sidebar": toggleLeftSidebar(); break;
+    case "open_settings": openConfig(); break;
+    case "toggle_ask": toggleAskPanel(); break;
+    case "toggle_tree": toggleConversationTree(); break;
+    case "stop_task":
+      if (anyTaskActive()) stopCurrent();
+      else showBusyHint("当前没有可停止的任务");
+      break;
+    case "undo":
+      if (!$("btn-undo").disabled) runCommand("undo");
+      break;
+  }
 }
 
 function setupSidebar() {
@@ -5086,7 +5224,15 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("mouseup", () => setTimeout(showAnnSelButton, 0));
   $("ann-thread").addEventListener("click", (e) => {
     const mark = e.target.closest ? e.target.closest("mark.ann-mark") : null;
-    if (!mark) return;
+    if (!mark) {
+      // 点正文空白处：下一次提问作为新的对话根（与左侧树空白一致），并清掉节点选中态
+      if (e.target.closest && e.target.closest(".ann-node")) return;
+      annNewRoot = true;
+      annSelectedNode = null;
+      if (renderedThreads) renderAnnThread(renderedThreads);
+      renderPopupTree(popupThreads());
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     const ann = annotationsCache.find((a) => a.id === mark.dataset.annId);
@@ -5105,6 +5251,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (e.target.closest && e.target.closest(".conv-row")) return;
       annNewRoot = true;
       annSelectedNode = null;
+      if (renderedThreads) renderAnnThread(renderedThreads);
       renderPopupTree(popupThreads());
     });
   }
@@ -5190,10 +5337,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.addEventListener("click", (e) => { if (!e.target.closest("#ctx-menu")) hideCtxMenu(); });
   document.addEventListener("keydown", (e) => {
-    if (recordingShortcut) return; // 录制中：交给录制输入框处理
-    if (!e.repeat && shortcutMatches(e, sidebarShortcut)) {
+    if (recordingKey) return; // 录制中：交给录制输入框处理
+    if (e.repeat) return;
+    for (const a of SHORTCUT_ACTIONS) {
+      const sc = liveShortcuts[a.key];
+      if (!sc || !shortcutMatches(e, sc)) continue;
+      if (a.key === "undo" && isEditableTarget(e.target)) return; // 输入框内让浏览器撤销文字
       e.preventDefault();
-      toggleLeftSidebar();
+      dispatchShortcut(a.key);
       return;
     }
     if (e.key === "Escape") { hideCtxMenu(); clearAllSelections(); }

@@ -103,6 +103,11 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
     ConfigKeyDef { key: "update.auto_check", is_bool: true, from_presets: None },
     ConfigKeyDef { key: "update.source_url", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "ui.toggle_sidebar", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.open_settings", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.toggle_ask", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.toggle_tree", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.stop_task", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "ui.undo", is_bool: false, from_presets: None },
 ];
 
 /// 命令补全器：
@@ -986,7 +991,7 @@ PaperHelper 命令：
                           编号见 blocks 或导出笔记的标题（如 3.2）；不填编号则关键词匹配
                           例: ask 3.2 BERTScore的公式里max_k是什么意思
   sum                      把当前节点子树的追问折叠并替换为「总结：…」（可点击展开）
-  del [--yes]              删除当前节点及其子树（需 --yes 确认；根节点不可删）
+  del [--yes]              删除当前节点及其子树（需 --yes 确认；根节点可删=清空该线程）
   undo                     撤销上一次编辑/删除（内存多级，最多 20 步）
   blocks                   列出笔记结构（带编号）
   note                     打印完整笔记(Markdown)
@@ -1183,12 +1188,25 @@ PaperHelper 命令：
             "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
             "update.auto_check" => self.config.update.auto_check = parse_bool(val),
             "update.source_url" => self.config.update.source_url = val.trim().into(),
-            "ui.toggle_sidebar" => {
+            "ui.toggle_sidebar"
+            | "ui.open_settings"
+            | "ui.toggle_ask"
+            | "ui.toggle_tree"
+            | "ui.stop_task"
+            | "ui.undo" => {
                 let v = val.trim();
                 if !crate::config::valid_shortcut(v) {
-                    bail!("ui.toggle_sidebar 需形如 ctrl+b（至少含一个 Ctrl/Alt/⌘ 修饰键），或留空表示不启用");
+                    bail!("{key} 需形如 ctrl+b（至少含一个 Ctrl/Alt/⌘ 修饰键），或留空表示不启用");
                 }
-                self.config.ui.toggle_sidebar = v.to_string();
+                let slot = match key {
+                    "ui.toggle_sidebar" => &mut self.config.ui.toggle_sidebar,
+                    "ui.open_settings" => &mut self.config.ui.open_settings,
+                    "ui.toggle_ask" => &mut self.config.ui.toggle_ask,
+                    "ui.toggle_tree" => &mut self.config.ui.toggle_tree,
+                    "ui.stop_task" => &mut self.config.ui.stop_task,
+                    _ => &mut self.config.ui.undo,
+                };
+                *slot = v.to_string();
             }
             _ => {
                 let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
@@ -2964,8 +2982,9 @@ PaperHelper 命令：
         );
     }
 
-    /// del [n] [--yes]：删除指定（默认当前）对话节点及其子树（根节点不可删）。
+    /// del [n] [--yes]：删除指定（默认当前）对话节点及其子树。
     /// 不带 `--yes` 只打印警告与将删除的内容；执行前把笔记+对话树入撤销栈。
+    /// 根节点也可删除（相当于清空该对话线程）；批注会保留高亮锚点，仅清空其对话。
     async fn cmd_del(&mut self, rest: &str) -> Result<()> {
         let mut target: Option<String> = None;
         let mut confirm = false;
@@ -3000,9 +3019,6 @@ PaperHelper 命令：
             .find(|n| n.id == cur)
             .ok_or_else(|| anyhow!("找不到当前节点"))?
             .clone();
-        if node.parent.is_none() {
-            bail!("根节点不可删除（如需清空请用 `new` 新建会话）");
-        }
         let subtree = self.collect_subtree(&cur);
         if !confirm {
             outln!(self, "⚠️  将删除节点「{}」及其 {} 个子节点：", node.label, subtree.len().saturating_sub(1));
@@ -3026,38 +3042,31 @@ PaperHelper 命令：
         }
         let removed = self.session.conversation.remove_subtree(&cur);
         self.bump_epoch();
-        // 批注线程的根若在被删子树里：只摘掉这些根，保留该批注的其它根（森林）；
-        // 一条批注的根被删光时才整体清理（否则会悬空）。
+        // 批注线程的根若在被删子树里：只摘掉这些根，保留该批注的其它根（森林）。
+        // 一条批注的根被删光时：笔记 / PDF 批注保留空批注（高亮锚点还在，
+        // 之后对这同一段文字提问会在同一条批注上新建根，相当于「重新提问」）；
+        // 回答批注没有可复用锚点，整体清理以免悬空。
         let removed_set: std::collections::HashSet<&str> = removed.iter().map(|s| s.as_str()).collect();
-        let mut ann_removed = 0;
-        let mut keep: Vec<Annotation> = Vec::with_capacity(self.session.annotations.len());
-        for mut a in self.session.annotations.drain(..) {
-            let gone: Vec<String> = a
-                .roots()
-                .into_iter()
-                .filter(|r| removed_set.contains(r))
-                .map(|s| s.to_string())
-                .collect();
-            if gone.is_empty() {
-                keep.push(a);
-                continue;
-            }
-            for g in &gone {
-                a.remove_root(g);
-            }
-            if a.roots().is_empty() {
-                ann_removed += 1;
-            } else {
-                keep.push(a);
-            }
-        }
+        let (keep, ann_removed, ann_cleared) =
+            prune_annotations(std::mem::take(&mut self.session.annotations), &removed_set);
         self.session.annotations = keep;
         self.update_completions();
         outln!(
             self,
-            "✓ 已删除 {} 个对话节点{}（可用 `undo` 撤销）",
+            "✓ 已删除 {} 个对话节点{}（可撤销）",
             removed.len(),
-            if ann_removed > 0 { format!("、{ann_removed} 条批注") } else { String::new() }
+            if ann_removed > 0 || ann_cleared > 0 {
+                let mut parts = Vec::new();
+                if ann_removed > 0 {
+                    parts.push(format!("、{ann_removed} 条批注"));
+                }
+                if ann_cleared > 0 {
+                    parts.push(format!("、清空 {ann_cleared} 条批注的对话"));
+                }
+                parts.concat()
+            } else {
+                String::new()
+            }
         );
         Ok(())
     }
@@ -3615,6 +3624,45 @@ pub fn mask_key(k: &str) -> String {
     }
 }
 
+/// 删除对话子树后清理批注：摘掉落在被删子树里的对话根。
+/// 根被摘光时：笔记 / PDF 批注（`node_id` 为空）保留空批注——高亮锚点仍在，
+/// 之后对同一段文字提问会在同一条批注上新建对话根；回答批注无可复用锚点，整体删除。
+/// 返回 `(保留的批注, 整体删除数, 清空对话数)`。
+fn prune_annotations(
+    annotations: Vec<Annotation>,
+    removed: &std::collections::HashSet<&str>,
+) -> (Vec<Annotation>, usize, usize) {
+    let mut ann_removed = 0;
+    let mut ann_cleared = 0;
+    let mut keep = Vec::with_capacity(annotations.len());
+    for mut a in annotations {
+        let gone: Vec<String> = a
+            .roots()
+            .into_iter()
+            .filter(|r| removed.contains(r))
+            .map(|s| s.to_string())
+            .collect();
+        if gone.is_empty() {
+            keep.push(a);
+            continue;
+        }
+        for g in &gone {
+            a.remove_root(g);
+        }
+        if a.roots().is_empty() {
+            if a.node_id.is_none() {
+                ann_cleared += 1;
+                keep.push(a);
+            } else {
+                ann_removed += 1;
+            }
+        } else {
+            keep.push(a);
+        }
+    }
+    (keep, ann_removed, ann_cleared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3891,6 +3939,62 @@ mod tests {
             app.paper_relation_messages("没有任何关联论文的问题").is_empty(),
             "无命中的关联论文时不注入"
         );
+    }
+
+    fn ann(id: &str, roots: &[&str], node_id: Option<&str>) -> crate::session::Annotation {
+        crate::session::Annotation {
+            id: id.into(),
+            block_id: "b1".into(),
+            quote: "引用".into(),
+            node_id: node_id.map(String::from),
+            root_node_id: roots.first().map(|s| s.to_string()).unwrap_or_default(),
+            root_node_ids: roots.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// 删根后：笔记批注保留空批注（高亮锚点还在，可复用），对话根被摘掉。
+    #[test]
+    fn prune_annotations_keeps_empty_note_annotation() {
+        let removed: std::collections::HashSet<&str> = ["r1"].into_iter().collect();
+        let (keep, dropped, cleared) =
+            super::prune_annotations(vec![ann("a1", &["r1"], None)], &removed);
+        assert_eq!((dropped, cleared), (0, 1));
+        assert_eq!(keep.len(), 1, "笔记批注应保留");
+        assert!(keep[0].roots().is_empty(), "对话根应被摘掉");
+        assert!(keep[0].root_node_id.is_empty(), "首根字段应同步清空");
+    }
+
+    /// 多根批注只删掉被删的根，其它根与批注都保留。
+    #[test]
+    fn prune_annotations_keeps_other_roots() {
+        let removed: std::collections::HashSet<&str> = ["r1"].into_iter().collect();
+        let (keep, dropped, cleared) =
+            super::prune_annotations(vec![ann("a1", &["r1", "r2"], None)], &removed);
+        assert_eq!((dropped, cleared), (0, 0));
+        assert_eq!(keep.len(), 1);
+        assert_eq!(keep[0].roots(), vec!["r2"]);
+        assert_eq!(keep[0].root_node_id, "r2");
+    }
+
+    /// 回答批注无锚点可复用：其根被删光时整条删除。
+    #[test]
+    fn prune_annotations_drops_empty_answer_annotation() {
+        let removed: std::collections::HashSet<&str> = ["r1"].into_iter().collect();
+        let (keep, dropped, cleared) =
+            super::prune_annotations(vec![ann("a1", &["r1"], Some("host"))], &removed);
+        assert_eq!((dropped, cleared), (1, 0));
+        assert!(keep.is_empty(), "回答批注应整体删除");
+    }
+
+    /// 未命中被删子树的批注原样保留。
+    #[test]
+    fn prune_annotations_leaves_unrelated_untouched() {
+        let removed: std::collections::HashSet<&str> = ["gone"].into_iter().collect();
+        let (keep, dropped, cleared) =
+            super::prune_annotations(vec![ann("a1", &["r1"], None)], &removed);
+        assert_eq!((dropped, cleared), (0, 0));
+        assert_eq!(keep[0].roots(), vec!["r1"]);
     }
 }
 

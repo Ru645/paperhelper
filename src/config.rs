@@ -36,18 +36,58 @@ pub struct UiConfig {
     /// 需至少包含一个 Ctrl / Alt / ⌘ 修饰键，末位为普通按键。
     #[serde(default = "default_sidebar_shortcut")]
     pub toggle_sidebar: String,
+    /// 打开设置快捷键。
+    #[serde(default = "default_settings_shortcut")]
+    pub open_settings: String,
+    /// 右侧提问栏开关快捷键。
+    #[serde(default = "default_ask_shortcut")]
+    pub toggle_ask: String,
+    /// 对话树面板开关快捷键。
+    #[serde(default = "default_tree_shortcut")]
+    pub toggle_tree: String,
+    /// 停止当前任务快捷键。
+    #[serde(default = "default_stop_shortcut")]
+    pub stop_task: String,
+    /// 撤销快捷键。
+    #[serde(default = "default_undo_shortcut")]
+    pub undo: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
             toggle_sidebar: default_sidebar_shortcut(),
+            open_settings: default_settings_shortcut(),
+            toggle_ask: default_ask_shortcut(),
+            toggle_tree: default_tree_shortcut(),
+            stop_task: default_stop_shortcut(),
+            undo: default_undo_shortcut(),
         }
     }
 }
 
 fn default_sidebar_shortcut() -> String {
     "ctrl+b".into()
+}
+
+fn default_settings_shortcut() -> String {
+    "ctrl+,".into()
+}
+
+fn default_ask_shortcut() -> String {
+    "ctrl+alt+b".into()
+}
+
+fn default_tree_shortcut() -> String {
+    "ctrl+alt+t".into()
+}
+
+fn default_stop_shortcut() -> String {
+    "ctrl+.".into()
+}
+
+fn default_undo_shortcut() -> String {
+    "ctrl+z".into()
 }
 
 /// 校验快捷键字符串：空串合法（表示不启用）；否则须为 `修饰键(+修饰键)*+按键`。
@@ -230,8 +270,19 @@ impl Config {
             cfg.llm.paper_relation = default_paper_relation();
         }
         // 手改 toml 写坏的快捷键回落默认（空串合法 = 不启用，保留）
-        if !valid_shortcut(&cfg.ui.toggle_sidebar) {
-            cfg.ui.toggle_sidebar = default_sidebar_shortcut();
+        let ui_defaults = UiConfig::default();
+        let ui = &mut cfg.ui;
+        for (val, def) in [
+            (&mut ui.toggle_sidebar, ui_defaults.toggle_sidebar),
+            (&mut ui.open_settings, ui_defaults.open_settings),
+            (&mut ui.toggle_ask, ui_defaults.toggle_ask),
+            (&mut ui.toggle_tree, ui_defaults.toggle_tree),
+            (&mut ui.stop_task, ui_defaults.stop_task),
+            (&mut ui.undo, ui_defaults.undo),
+        ] {
+            if !valid_shortcut(val) {
+                *val = def;
+            }
         }
 
         if let Ok(v) = std::env::var("PAPERHELPER_API_KEY") {
@@ -284,10 +335,19 @@ impl Config {
         if let Ok(v) = std::env::var("PAPERHELPER_AUTO_UPDATE") {
             cfg.update.auto_check = matches!(v.as_str(), "1" | "true" | "TRUE");
         }
-        if let Ok(v) = std::env::var("PAPERHELPER_UI_TOGGLE_SIDEBAR") {
-            let v = v.trim();
-            if valid_shortcut(v) {
-                cfg.ui.toggle_sidebar = v.to_string();
+        for (env_key, val) in [
+            ("PAPERHELPER_UI_TOGGLE_SIDEBAR", &mut cfg.ui.toggle_sidebar),
+            ("PAPERHELPER_UI_OPEN_SETTINGS", &mut cfg.ui.open_settings),
+            ("PAPERHELPER_UI_TOGGLE_ASK", &mut cfg.ui.toggle_ask),
+            ("PAPERHELPER_UI_TOGGLE_TREE", &mut cfg.ui.toggle_tree),
+            ("PAPERHELPER_UI_STOP_TASK", &mut cfg.ui.stop_task),
+            ("PAPERHELPER_UI_UNDO", &mut cfg.ui.undo),
+        ] {
+            if let Ok(v) = std::env::var(env_key) {
+                let v = v.trim();
+                if valid_shortcut(v) {
+                    *val = v.to_string();
+                }
             }
         }
 
@@ -333,6 +393,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.ui.toggle_sidebar, "ctrl+b");
+        assert_eq!(cfg.ui.open_settings, "ctrl+,");
+        assert_eq!(cfg.ui.toggle_ask, "ctrl+alt+b");
+        assert_eq!(cfg.ui.toggle_tree, "ctrl+alt+t");
+        assert_eq!(cfg.ui.stop_task, "ctrl+.");
+        assert_eq!(cfg.ui.undo, "ctrl+z");
+    }
+
+    /// 旧 [ui] 节只写了部分键：缺失的键取默认；非法值此处不校验（由 Config::load 回落）。
+    #[test]
+    fn partial_ui_config_fills_missing_defaults() {
+        let ui: UiConfig = toml::from_str("toggle_sidebar = \"ctrl+j\"\nundo = \"乱写\"\n").unwrap();
+        assert_eq!(ui.toggle_sidebar, "ctrl+j");
+        assert_eq!(ui.toggle_ask, "ctrl+alt+b");
+        // 反序列化不校验，校验发生在 Config::load；此处仅确认缺失项有默认
+        assert_eq!(ui.undo, "乱写");
     }
 
     #[test]

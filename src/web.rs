@@ -1640,6 +1640,11 @@ async fn api_config_get(State(app): State<SharedApp>) -> Json<serde_json::Value>
         "budget": { "token_budget": a.config.budget.token_budget },
         "ui": {
             "toggle_sidebar": a.config.ui.toggle_sidebar,
+            "open_settings": a.config.ui.open_settings,
+            "toggle_ask": a.config.ui.toggle_ask,
+            "toggle_tree": a.config.ui.toggle_tree,
+            "stop_task": a.config.ui.stop_task,
+            "undo": a.config.ui.undo,
         },
         "presets": {
             "models": a.config.presets.models,
@@ -3103,6 +3108,23 @@ mod tests {
         assert_eq!(payload["root_node_ids"].as_array().unwrap().len(), 2);
         assert_eq!(payload["thread"]["node_id"], "r1");
         assert_eq!(payload["root_node_id"], "r1");
+    }
+
+    /// 对话被清空的批注（如删掉唯一对话根）：thread 为 null、threads 为空，不 panic。
+    #[test]
+    fn annotation_payload_handles_empty_roots() {
+        let conv = crate::conversation::Conversation::default();
+        let ann = crate::session::Annotation {
+            id: "a1".into(),
+            block_id: "b1".into(),
+            quote: "x".into(),
+            ..Default::default()
+        };
+        let map = std::collections::HashMap::new();
+        let payload = annotation_payload(&conv, &ann, &map);
+        assert!(payload["thread"].is_null());
+        assert!(payload["threads"].as_array().unwrap().is_empty());
+        assert!(payload["root_node_ids"].as_array().unwrap().is_empty());
     }
 
     /// 本地服务端点识别（Ollama 等无需 Key，不应被向导门禁拦住）。
