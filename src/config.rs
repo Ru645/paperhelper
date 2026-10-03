@@ -161,6 +161,11 @@ pub struct LlmConfig {
     /// `full`=再额外注入该论文原文全文。后两档会显著增大每次提问的 token 消耗。
     #[serde(default = "default_paper_relation")]
     pub paper_relation: String,
+    /// 提问时向 LLM 传递的笔记上下文档位：
+    /// `block`=仅选中文字所在段落（右键小标题则为其整节）；`note`=整篇笔记（默认）；
+    /// `full`=整篇笔记 + 论文原文。档位越高，每次提问的 token 消耗越大。
+    #[serde(default = "default_context_scope")]
+    pub context_scope: String,
 }
 
 /// 论文关联增强的合法取值。
@@ -172,6 +177,17 @@ pub fn valid_paper_relation(v: &str) -> bool {
 
 fn default_paper_relation() -> String {
     "concept".into()
+}
+
+/// 提问上下文档位的合法取值。
+pub const CONTEXT_SCOPE_MODES: [&str; 3] = ["block", "note", "full"];
+
+pub fn valid_context_scope(v: &str) -> bool {
+    CONTEXT_SCOPE_MODES.contains(&v)
+}
+
+fn default_context_scope() -> String {
+    "note".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +252,7 @@ impl Default for Config {
                 thinking_mode: false,
                 pdf_input: false,
                 paper_relation: "concept".into(),
+                context_scope: "note".into(),
             },
             pricing: PricingConfig {
                 input_price_per_1m: 0.15,
@@ -268,6 +285,9 @@ impl Config {
         // 手改 toml 写坏的值回落默认，避免后续匹配落空
         if !valid_paper_relation(&cfg.llm.paper_relation) {
             cfg.llm.paper_relation = default_paper_relation();
+        }
+        if !valid_context_scope(&cfg.llm.context_scope) {
+            cfg.llm.context_scope = default_context_scope();
         }
         // 手改 toml 写坏的快捷键回落默认（空串合法 = 不启用，保留）
         let ui_defaults = UiConfig::default();
@@ -309,6 +329,12 @@ impl Config {
             let v = v.trim();
             if valid_paper_relation(v) {
                 cfg.llm.paper_relation = v.to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("PAPERHELPER_CONTEXT_SCOPE") {
+            let v = v.trim();
+            if valid_context_scope(v) {
+                cfg.llm.context_scope = v.to_string();
             }
         }
         if let Ok(v) = std::env::var("PAPERHELPER_INPUT_PRICE") {
@@ -383,6 +409,25 @@ mod tests {
         assert!(valid_paper_relation("full"));
         assert!(!valid_paper_relation("everything"));
         assert!(!valid_paper_relation(""));
+    }
+
+    /// 旧 config.toml 没有 context_scope 字段时应回落到默认 note。
+    #[test]
+    fn legacy_llm_config_defaults_context_scope() {
+        let llm: LlmConfig = toml::from_str(
+            "api_endpoint = \"e\"\napi_key = \"\"\nmodel = \"m\"\ncontext_length = 8192\nthinking_mode = false\n",
+        )
+        .unwrap();
+        assert_eq!(llm.context_scope, "note", "默认应为中档（整篇笔记）");
+    }
+
+    #[test]
+    fn context_scope_validates_modes() {
+        assert!(valid_context_scope("block"));
+        assert!(valid_context_scope("note"));
+        assert!(valid_context_scope("full"));
+        assert!(!valid_context_scope("all"));
+        assert!(!valid_context_scope(""));
     }
 
     /// 旧 config.toml 没有 [ui] 节时应回落到默认快捷键。

@@ -328,6 +328,14 @@
         </select>
       </label>
       <p class="muted">开启后，提问提到你学过的另一篇论文时，会把它的内容一并发给模型。选 note / full 会明显增加每次提问的 token 消耗与费用。</p>
+      <label>提问上下文
+        <select id="cfg-context-scope">
+          <option value="block">仅选中段落（最省 token）</option>
+          <option value="note">整篇笔记（默认）</option>
+          <option value="full">整篇笔记 + 论文原文（最全，最费 token）</option>
+        </select>
+      </label>
+      <p class="muted">提问时给模型的笔记范围：最低只发选中文字所在的段落（右键小标题则发其整节），中档发整篇笔记，最高档再附上论文原文。档位越高，回答依据越全但 token 消耗越大。</p>
       <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
       <div id="cfg-test-result" class="test-result hidden"></div>
       <p id="cfg-status" class="status"></p>

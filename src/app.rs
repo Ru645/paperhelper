@@ -97,6 +97,7 @@ const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
     ConfigKeyDef { key: "llm.thinking_mode", is_bool: true, from_presets: None },
     ConfigKeyDef { key: "llm.pdf_input", is_bool: true, from_presets: None },
     ConfigKeyDef { key: "llm.paper_relation", is_bool: false, from_presets: None },
+    ConfigKeyDef { key: "llm.context_scope", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "pricing.input_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "pricing.output_price_per_1m", is_bool: false, from_presets: None },
     ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
@@ -1040,6 +1041,7 @@ PaperHelper 命令：
                 outln!(self, "llm.thinking_mode   = {}", k.thinking_mode);
                 outln!(self, "llm.pdf_input       = {} (file模式未实现,均走text)", k.pdf_input);
                 outln!(self, "llm.paper_relation  = {} (论文关联增强: concept=仅概念 / note=加笔记 / full=加原文+笔记)", k.paper_relation);
+                outln!(self, "llm.context_scope   = {} (提问上下文: block=仅选中段落 / note=整篇笔记 / full=笔记+原文)", k.context_scope);
                 outln!(self, "pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
                 outln!(self, "pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
                 outln!(self, "budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
@@ -1070,6 +1072,19 @@ PaperHelper 命令：
                         "⚠️ ".yellow(),
                         val,
                         if val == "full" { "原文全文与笔记" } else { "笔记" }
+                    );
+                }
+                if key == "llm.context_scope" {
+                    outerr!(
+                        self,
+                        "{} 提问上下文已设为 {}：{}",
+                        "ℹ️ ".cyan(),
+                        val,
+                        match val.as_str() {
+                            "block" => "每次提问只发送选中文字所在的段落/小节，最省 token。",
+                            "full" => "每次提问都会发送整篇笔记 + 论文原文，token 消耗最大。",
+                            _ => "每次提问发送整篇笔记（默认）。",
+                        }
                     );
                 }
             }
@@ -1182,6 +1197,13 @@ PaperHelper 命令：
                     bail!("llm.paper_relation 只能是 concept / note / full");
                 }
                 self.config.llm.paper_relation = v.to_string();
+            }
+            "llm.context_scope" => {
+                let v = val.trim();
+                if !crate::config::valid_context_scope(v) {
+                    bail!("llm.context_scope 只能是 block / note / full");
+                }
+                self.config.llm.context_scope = v.to_string();
             }
             "pricing.input_price_per_1m" => self.config.pricing.input_price_per_1m = val.parse().context("需要数字")?,
             "pricing.output_price_per_1m" => self.config.pricing.output_price_per_1m = val.parse().context("需要数字")?,
@@ -3178,20 +3200,24 @@ PaperHelper 命令：
         *self.node_numbers.lock().unwrap() = nodes;
     }
 
-    /// 构建 ask 共用的上下文消息序列（论文全文+笔记+对话路径+概念注入）。
-    /// 消息编排：system=ask 提示词；user=论文全文；assistant=已生成笔记
-    /// （把它们放进多轮对话让 LLM"看过"长文，再以多轮 Q&A 追加历史）；
+    /// 构建 ask 共用的上下文消息序列（笔记材料 + 对话路径 + 概念注入）。
+    /// 材料部分按 `llm.context_scope` 档位组装（见 `doc_context_messages`）：
+    /// `block`=仅选中段落/小节；`note`=整篇笔记（默认）；`full`=笔记+原文。
+    /// 消息编排：system=ask 提示词；随后是材料（原文/笔记），再以多轮 Q&A 追加历史；
     /// user=问题（追加检索到的知识库相关概念提示语）。`block_id` 由调用方
-    /// 预先定位（章节编号/关键词/批注引用的块），仅用于返回定位信息。
-    /// 上下文长度控制：先估算 论文+笔记+问题 的 token 基数，在
+    /// 预先定位（章节编号/关键词/批注引用的块），既用于选材也用于返回定位信息。
+    /// 上下文长度控制：先估算 材料+问题 的 token 基数，在
     /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
     fn build_context_messages(&self, question: &str, block_id: Option<&str>, quote: Option<&str>) -> (Vec<Message>, Option<String>) {
-        let (raw_text, notes_md) = match self.session.notes.as_ref() {
-            Some(note) => (note.raw_text.clone(), note.to_markdown()),
-            None => (String::new(), String::new()),
-        };
         let block_id = block_id.map(|s| s.to_string());
+        // 按「提问上下文」档位组装论文/笔记材料（block=仅选中段落 / note=整篇笔记 / full=笔记+原文）
+        let doc_msgs = self
+            .session
+            .notes
+            .as_ref()
+            .map(|note| doc_context_messages(note, self.config.llm.context_scope.as_str(), block_id.as_deref()))
+            .unwrap_or_default();
 
         let path: Vec<(String, String)> = self
             .session
@@ -3205,9 +3231,10 @@ PaperHelper 命令：
         // 论文关联增强：先取被提及论文的笔记/全文（按配置档位），纳入 base 预算后再裁剪历史
         let ref_msgs = self.paper_relation_messages(question);
         let ref_tokens: usize = ref_msgs.iter().map(|m| m.content.chars().count() / 4).sum();
-        let base_tokens = (raw_text.chars().count() + notes_md.chars().count()) / 4 + ref_tokens;
+        let doc_tokens: usize = doc_msgs.iter().map(|m| m.content.chars().count() / 4).sum();
+        let base_tokens = doc_tokens + ref_tokens;
         if base_tokens > ctx {
-            outerr!(self, "{} 论文+笔记约 {} token，超过模型上下文 {}，可能报错。", "⚠️ ".yellow(), base_tokens, ctx);
+            outerr!(self, "{} 上下文材料约 {} token，超过模型上下文 {}，可能报错。可在设置里调低「提问上下文」。", "⚠️ ".yellow(), base_tokens, ctx);
         }
         let avail = ctx.saturating_sub(base_tokens + question.chars().count() / 4 + 200);
         let mut used = 0usize;
@@ -3227,12 +3254,8 @@ PaperHelper 命令：
             outerr!(self, "{}（上下文偏长，已省略最早 {} 轮对话）", "".dimmed(), dropped);
         }
 
-        // 论文/资料原文；直接导入的笔记 raw_text 为空 → 省略该段（只发笔记本身）
         let mut msgs = vec![Message::text("system", sys_ask())];
-        if !raw_text.trim().is_empty() {
-            msgs.push(Message::text("user", format!("【原文材料】\n{raw_text}")));
-        }
-        msgs.push(Message::text("assistant", format!("【已生成笔记】\n{notes_md}")));
+        msgs.extend(doc_msgs);
         msgs.extend(ref_msgs);
         for (q, a) in &kept_pairs {
             msgs.push(Message::text("user", q.clone()));
@@ -3309,6 +3332,45 @@ PaperHelper 命令：
 }
 
 // ===== 辅助函数 =====
+
+/// 按「提问上下文」档位组装论文/笔记材料消息（放在对话历史之前，让模型先"看过"材料）。
+/// - `block`：仅选中文字所在段落（右键小标题则为其整节）；定位不到块时回落整篇笔记。
+/// - `note`（默认）：整篇笔记；无笔记结构（仅阅读会话）时回落原文。
+/// - `full`：论文原文 + 整篇笔记。
+/// 返回的 `Message` 顺序与角色即可直接无缝插入 ask 上下文。
+pub(crate) fn doc_context_messages(
+    note: &notes::Note,
+    scope: &str,
+    block_id: Option<&str>,
+) -> Vec<Message> {
+    let note_md = note.to_markdown();
+    let has_blocks = !note.blocks.is_empty();
+    let raw = note.raw_text.trim();
+    let mut msgs = Vec::new();
+
+    if scope == "block" {
+        let block_md = block_id
+            .filter(|id| *id != notes::TITLE_ID)
+            .and_then(|id| note.block_markdown(id))
+            .filter(|m| !m.trim().is_empty());
+        if let Some(md) = block_md {
+            msgs.push(Message::text("assistant", format!("【已生成笔记（节选）】\n{md}")));
+            return msgs;
+        }
+    }
+    if scope == "full" && !raw.is_empty() {
+        msgs.push(Message::text("user", format!("【原文材料】\n{}", note.raw_text)));
+        msgs.push(Message::text("assistant", format!("【已生成笔记】\n{note_md}")));
+        return msgs;
+    }
+    if has_blocks && !note_md.trim().is_empty() {
+        msgs.push(Message::text("assistant", format!("【已生成笔记】\n{note_md}")));
+    } else if !raw.is_empty() {
+        // 仅阅读会话 / 无笔记结构：退回原文（否则将无任何材料可依据）
+        msgs.push(Message::text("user", format!("【原文材料】\n{}", note.raw_text)));
+    }
+    msgs
+}
 
 /// 解析用户输入的文件路径/值参数（shell 风格）：
 /// - 整体被 "..." 包裹 → 剥掉双引号（内部反斜杠转义一并还原）
@@ -3939,6 +4001,66 @@ mod tests {
             app.paper_relation_messages("没有任何关联论文的问题").is_empty(),
             "无命中的关联论文时不注入"
         );
+    }
+
+    /// 提问上下文档位：note（默认）只发整篇笔记不带原文；full 带原文；block 只发选中段落/小节。
+    #[test]
+    fn doc_context_scope_selects_material() {
+        use crate::notes;
+        let md = "# 标题\n## 1 引言\n引言正文内容。\n## 2 方法\n方法正文内容。\n";
+        let note = notes::parse_markdown_note(md, "这是论文原文全文");
+        let texts = |msgs: &[crate::llm::Message]| -> String {
+            msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n")
+        };
+
+        // note（默认）：整篇笔记，不含原文
+        let msgs = super::doc_context_messages(&note, "note", None);
+        assert_eq!(msgs.len(), 1, "note 档只有一条材料消息");
+        let t = texts(&msgs);
+        assert!(t.contains("【已生成笔记】") && t.contains("方法正文内容"), "{t}");
+        assert!(!t.contains("【原文材料】"), "note 档不应发原文: {t}");
+
+        // full：原文 + 整篇笔记
+        let msgs = super::doc_context_messages(&note, "full", None);
+        let t = texts(&msgs);
+        assert!(t.contains("【原文材料】") && t.contains("这是论文原文全文"), "{t}");
+        assert!(t.contains("【已生成笔记】") && t.contains("方法正文内容"), "{t}");
+
+        // block：只发选中的段落（不带其它小节正文/原文）
+        let para = note
+            .flatten()
+            .iter()
+            .find(|(b, _)| b.text.contains("方法正文内容"))
+            .map(|(b, _)| b.id.clone())
+            .unwrap();
+        let t = texts(&super::doc_context_messages(&note, "block", Some(&para)));
+        assert!(t.contains("（节选）") && t.contains("方法正文内容"), "{t}");
+        assert!(!t.contains("引言正文内容"), "block 档不应带其它段落: {t}");
+        assert!(!t.contains("这是论文原文全文"), "block 档不应带原文: {t}");
+
+        // block：右键小标题 → 整节（含其下正文）
+        let sec = note.find_section_by_number("2").unwrap().id.clone();
+        let t = texts(&super::doc_context_messages(&note, "block", Some(&sec)));
+        assert!(t.contains("方法") && t.contains("方法正文内容"), "小标题应带整节: {t}");
+        assert!(!t.contains("引言正文内容"), "不应混入其它小节: {t}");
+
+        // block 定位不到（标题哨兵 / PDF 选区）→ 回落整篇笔记
+        let t = texts(&super::doc_context_messages(&note, "block", None));
+        assert!(t.contains("【已生成笔记】") && !t.contains("（节选）"), "定位失败应回落整篇: {t}");
+        let t = texts(&super::doc_context_messages(&note, "block", Some(notes::TITLE_ID)));
+        assert!(t.contains("【已生成笔记】") && !t.contains("（节选）"), "标题哨兵应回落整篇: {t}");
+    }
+
+    /// 仅阅读会话（无结构块，只有原文）：block/note 档都应退回原文，不能空手提问。
+    #[test]
+    fn doc_context_scope_readonly_falls_back_to_raw() {
+        use crate::notes;
+        let note = notes::readonly_note("论文A", "仅阅读原文内容");
+        for scope in ["block", "note"] {
+            let msgs = super::doc_context_messages(&note, scope, None);
+            let t: String = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+            assert!(t.contains("【原文材料】") && t.contains("仅阅读原文内容"), "{scope} 档应退回原文: {t}");
+        }
     }
 
     fn ann(id: &str, roots: &[&str], node_id: Option<&str>) -> crate::session::Annotation {

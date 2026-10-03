@@ -4136,6 +4136,7 @@ async function openConfig(tab = "model") {
     $("cfg-outprice").value = c.pricing.output_price_per_1m;
     $("cfg-budget").value = c.budget.token_budget;
     $("cfg-paper-relation").value = c.llm.paper_relation || "concept";
+    $("cfg-context-scope").value = c.llm.context_scope || "note";
     pendingShortcuts = {};
     for (const a of SHORTCUT_ACTIONS) {
       pendingShortcuts[a.key] = String((c.ui && c.ui[a.key]) || "").trim();
@@ -4182,6 +4183,7 @@ async function saveConfig() {
     await setConfig("pricing.output_price_per_1m", String(parseFloat($("cfg-outprice").value) || 0));
     await setConfig("budget.token_budget", String(parseInt($("cfg-budget").value, 10) || 0));
     await setConfig("llm.paper_relation", $("cfg-paper-relation").value);
+    await setConfig("llm.context_scope", $("cfg-context-scope").value);
     const key = $("cfg-key").value.trim();
     if (key) await setConfig("llm.api_key", key);
     status.textContent = "✓ 已保存";
