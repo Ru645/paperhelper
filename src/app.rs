@@ -22,12 +22,13 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::MatchingBracketValidator;
 use rustyline::{Cmd, Editor, KeyEvent, Helper};
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::config::Config;
+use crate::config::{Config, FieldKind, PresetKind, CONFIG_FIELDS};
 use crate::conversation::{Conversation, ConvNode};
 use crate::export;
 use crate::interrupt;
@@ -72,44 +73,6 @@ struct UndoSnapshot {
     conversation: Conversation,
     annotations: Vec<Annotation>,
 }
-
-/// 配置键定义表：补全与用法提示的单一来源。
-/// set_config 的 match 分支与此表保持键名一致。
-struct ConfigKeyDef {
-    key: &'static str,
-    /// bool 型键（补全候选 true/false）；其余按 presets 或不补全
-    is_bool: bool,
-    /// 模型/端点类键（候选来自 config 的 presets）
-    from_presets: Option<PresetKind>,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum PresetKind {
-    Models,
-    Endpoints,
-}
-
-const CONFIG_KEY_DEFS: &[ConfigKeyDef] = &[
-    ConfigKeyDef { key: "llm.api_key", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "llm.api_endpoint", is_bool: false, from_presets: Some(PresetKind::Endpoints) },
-    ConfigKeyDef { key: "llm.model", is_bool: false, from_presets: Some(PresetKind::Models) },
-    ConfigKeyDef { key: "llm.context_length", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "llm.thinking_mode", is_bool: true, from_presets: None },
-    ConfigKeyDef { key: "llm.pdf_input", is_bool: true, from_presets: None },
-    ConfigKeyDef { key: "llm.paper_relation", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "llm.context_scope", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "pricing.input_price_per_1m", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "pricing.output_price_per_1m", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "budget.token_budget", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "update.auto_check", is_bool: true, from_presets: None },
-    ConfigKeyDef { key: "update.source_url", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.toggle_sidebar", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.open_settings", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.toggle_ask", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.toggle_tree", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.stop_task", is_bool: false, from_presets: None },
-    ConfigKeyDef { key: "ui.undo", is_bool: false, from_presets: None },
-];
 
 /// 命令补全器：
 /// - 第一个词：补全命令名
@@ -159,27 +122,25 @@ impl Completer for CommandCompleter {
                         .collect();
                     return Ok((start, matches));
                 }
-                // set 后的键名（从 CONFIG_KEY_DEFS 表派生）
+                // set 后的键名（从 CONFIG_FIELDS 表派生）
                 2 if line[..start].split_whitespace().nth(1) == Some("set") => {
-                    let matches: Vec<String> = CONFIG_KEY_DEFS
+                    let matches: Vec<String> = CONFIG_FIELDS
                         .iter()
                         .filter(|d| d.key.starts_with(word))
                         .map(|d| d.key.to_string())
                         .collect();
                     return Ok((start, matches));
                 }
-                // set 后的值：bool 键从表派生；模型/端点从 presets 读
+                // set 后的值：bool 键派生 true/false；枚举列出候选；模型/端点从 presets 读
                 3 if line[..start].split_whitespace().nth(1) == Some("set") => {
                     let key = line[..start].split_whitespace().nth(2).unwrap_or("");
-                    let def = CONFIG_KEY_DEFS.iter().find(|d| d.key == key);
-                    let candidates: Vec<String> = match def {
-                        Some(d) if d.is_bool => vec!["true".into(), "false".into()],
-                        Some(d) => match d.from_presets {
-                            Some(PresetKind::Models) => self.preset_models.clone(),
-                            Some(PresetKind::Endpoints) => self.preset_endpoints.clone(),
-                            None => vec![],
-                        },
-                        None => vec![],
+                    let def = CONFIG_FIELDS.iter().find(|d| d.key == key);
+                    let candidates: Vec<String> = match def.map(|d| d.kind) {
+                        Some(FieldKind::Bool) => vec!["true".into(), "false".into()],
+                        Some(FieldKind::Enum(opts)) => opts.iter().map(|s| s.to_string()).collect(),
+                        Some(FieldKind::Presets(PresetKind::Models)) => self.preset_models.clone(),
+                        Some(FieldKind::Presets(PresetKind::Endpoints)) => self.preset_endpoints.clone(),
+                        _ => vec![],
                     };
                     let matches: Vec<String> = candidates
                         .iter()
@@ -338,6 +299,12 @@ pub struct AskJob {
     /// 是否把解释写进笔记树（普通 ask 为 true；PDF 页面提问为 false，
     /// 只建独立对话线程 + 批注，不改动生成的笔记）。
     attach_note: bool,
+    /// 概念检索代理：run 内先检索/规划相关概念再回答（锁外可访问的概念快照）。
+    kb_agent: bool,
+    /// prepare 时抓取的知识库概念快照（仅 kb_agent 时非空）——避免 run 访问 App。
+    kb_concepts: Vec<Concept>,
+    /// prepare 时的 token 用量与预算快照 `(used, limit)`（仅 kb_agent 时有值）。
+    budget: Option<(u64, u64)>,
 }
 
 /// 提问附件（在途发送，**不写入会话历史**）：文本注入 prompt，图片作为多模态输入。
@@ -381,14 +348,48 @@ impl ExtraInput {
 
 impl AskJob {
     /// 锁外执行 LLM 流式调用（进度/思考/正文都经 emitter 输出）。
+    ///
+    /// 开启「概念检索代理」时，先做一次检索/规划调用选出相关概念（token 不展示），
+    /// 拼进末条 user 消息后再流式作答；两段 token 合并后在 commit 时统一记账。
     pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
         interrupt::reset();
         emitter.progress(&format!(
             "思考中…（上下文约 {} token）",
             self.approx_tokens
         ));
+        let mut msgs = self.msgs.clone();
+        let mut plan_in = 0u64;
+        let mut plan_out = 0u64;
+        let mut plan_estimated = false;
+        if self.kb_agent && !self.kb_concepts.is_empty() {
+            emitter.progress("检索相关概念…");
+            let selected = self
+                .select_concepts(emitter, &mut plan_in, &mut plan_out, &mut plan_estimated)
+                .await?;
+            crate::logging::info(format!(
+                "概念检索代理：选中 {} 个概念（{}）",
+                selected.len(),
+                selected
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ));
+            if !selected.is_empty() {
+                let hint = concept_hint(&selected);
+                if let Some(last) = msgs.last_mut() {
+                    last.content.push_str(&hint);
+                }
+            }
+        }
+        // 预算自查：规划也要花钱，超过上限就不进入正式回答（避免继续超支）。
+        if let Some((used, limit)) = self.budget {
+            if limit > 0 && used + plan_in + plan_out >= limit {
+                bail!("已达 token 预算，本次提问在检索阶段中止（可用 `budget <n>` 调整）。");
+            }
+        }
         let mut first = true;
-        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |t| {
+        let res = llm::chat(&self.client, &self.cfg, &msgs, false, self.cfg.thinking_mode, &mut |t| {
             if first {
                 emitter.progress_done();
                 first = false;
@@ -399,7 +400,115 @@ impl AskJob {
         if first {
             emitter.progress_done();
         }
-        res
+        res.map(|mut r| {
+            r.input_tokens += plan_in;
+            r.output_tokens += plan_out;
+            r.estimated = r.estimated || plan_estimated;
+            r
+        })
+    }
+
+    /// 概念检索代理的「选概念」段：优先工具调用（Phase 3），不支持则一次规划调用，
+    /// 再失败则回落本地关键词检索。规划调用的 token 累加到 `pin`/`pout`。
+    async fn select_concepts<'a>(
+        &'a self,
+        emitter: &Emitter,
+        pin: &mut u64,
+        pout: &mut u64,
+        pest: &mut bool,
+    ) -> Result<Vec<&'a Concept>> {
+        // Phase 3：真工具调用（模型自行决定检索几次/查什么）。网关不支持（400/422）时
+        // `chat_with_tools` 返回 `Ok(None)`，这里静默降级到规划调用。
+        let sys = "你可以调用 search_concepts 工具检索用户学习笔记里的相关概念（可按需多次调用）。\
+最终只输出 JSON：{\"concepts\":[\"概念名\", ...]}，最多 3 个；没有相关概念则输出 {\"concepts\":[]}。\
+概念名必须与检索结果里的名称完全一致；不要解释、不要杜撰。";
+        let plan_msgs = vec![
+            Message::text("system", sys),
+            Message::text("user", self.question.clone()),
+        ];
+        let mut execute = |args: &str| {
+            let query = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| v.get("query").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                .unwrap_or_else(|| args.to_string());
+            let hits = crate::knowledge::search_concepts(&self.kb_concepts, &query);
+            if hits.is_empty() {
+                return "（知识库里没有相关概念）".to_string();
+            }
+            hits.iter()
+                .map(|c| {
+                    let d: String = c.definition.chars().take(80).collect();
+                    format!("- {}（《{}》）: {}", c.name, c.paper_title, d)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        match crate::llm::chat_with_tools(
+            &self.client,
+            &self.cfg,
+            &plan_msgs,
+            &concept_search_tool(),
+            self.cfg.thinking_mode,
+            &mut |_| {},
+            None,
+            &mut execute,
+        )
+        .await
+        {
+            Ok(Some(res)) => {
+                *pin += res.input_tokens;
+                *pout += res.output_tokens;
+                *pest |= res.estimated;
+                return Ok(self.concepts_by_name(&res.content));
+            }
+            Ok(None) => {} // 不支持工具调用 → 降级
+            Err(e) if crate::llm::is_interrupted_error(&e) => return Err(e),
+            Err(e) => {
+                crate::logging::warn(format!("概念检索代理：工具调用失败，降级规划调用：{e:#}"));
+            }
+        }
+        self.plan_and_select(emitter, pin, pout, pest).await
+    }
+
+    /// 一次规划调用（JSON）选出相关概念；失败回落本地检索。
+    async fn plan_and_select<'a>(
+        &'a self,
+        emitter: &Emitter,
+        pin: &mut u64,
+        pout: &mut u64,
+        pest: &mut bool,
+    ) -> Result<Vec<&'a Concept>> {
+        match plan_relevant_concepts(&self.client, &self.cfg, &self.kb_concepts, &self.question).await
+        {
+            Ok((names, i, o, e)) => {
+                *pin += i;
+                *pout += o;
+                *pest |= e;
+                Ok(self
+                    .kb_concepts
+                    .iter()
+                    .filter(|c| names.contains(&c.name))
+                    .collect())
+            }
+            Err(e) if crate::llm::is_interrupted_error(&e) => Err(e),
+            Err(e) => {
+                crate::logging::warn(format!("概念检索代理：规划调用失败，回落本地检索：{e:#}"));
+                emitter.stderr("相关概念检索失败，已改用本地关键词匹配（本次回答不受影响）");
+                Ok(crate::knowledge::search_concepts(
+                    &self.kb_concepts,
+                    &self.question,
+                ))
+            }
+        }
+    }
+
+    /// 工具调用结果（模型返回的概念名列表）→ 库中概念引用。
+    fn concepts_by_name<'a>(&'a self, content: &str) -> Vec<&'a Concept> {
+        let names = parse_plan_names(content, &self.kb_concepts);
+        self.kb_concepts
+            .iter()
+            .filter(|c| names.contains(&c.name))
+            .collect()
     }
 }
 
@@ -1032,26 +1141,26 @@ PaperHelper 命令：
         let (sub, args) = split_cmd(rest);
         match sub {
             "" | "show" => {
-                let k = &self.config.llm;
                 outln!(self, "=== 配置 ===");
-                outln!(self, "llm.api_endpoint   = {}", k.api_endpoint);
-                outln!(self, "llm.api_key        = {}", mask_key(&k.api_key));
-                outln!(self, "llm.model           = {}", k.model);
-                outln!(self, "llm.context_length  = {}", k.context_length);
-                outln!(self, "llm.thinking_mode   = {}", k.thinking_mode);
-                outln!(self, "llm.pdf_input       = {} (file模式未实现,均走text)", k.pdf_input);
-                outln!(self, "llm.paper_relation  = {} (论文关联增强: concept=仅概念 / note=加笔记 / full=加原文+笔记)", k.paper_relation);
-                outln!(self, "llm.context_scope   = {} (提问上下文: block=仅选中段落 / note=整篇笔记 / full=笔记+原文)", k.context_scope);
-                outln!(self, "pricing.input_price_per_1m  = {}", self.config.pricing.input_price_per_1m);
-                outln!(self, "pricing.output_price_per_1m = {}", self.config.pricing.output_price_per_1m);
-                outln!(self, "budget.token_budget = {} (0=不限)", self.config.budget.token_budget);
+                for f in CONFIG_FIELDS {
+                    let raw = self.config.get_field(f.key).unwrap_or_default();
+                    let val = match f.kind {
+                        FieldKind::Secret => mask_key(&raw),
+                        _ => raw,
+                    };
+                    if f.help.is_empty() {
+                        outln!(self, "{:<32} = {}", f.key, val);
+                    } else {
+                        outln!(self, "{:<32} = {} （{}）", f.key, val, f.help);
+                    }
+                }
                 outln!(self, "提示：api_endpoint 需是完整 URL（含 /chat/completions），如 https://api.deepseek.com/v1/chat/completions");
             }
             "set" => {
                 let (key, val) = split_cmd(args);
                 if key.is_empty() {
                     outln!(self, "用法: config set <key> <value>");
-                    let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
+                    let keys: Vec<&str> = CONFIG_FIELDS.iter().map(|d| d.key).collect();
                     outln!(self, "可设: {}", keys.join(" "));
                     outln!(self, "常见端点：");
                     outln!(self, "  DeepSeek : https://api.deepseek.com/v1/chat/completions  model=deepseek-v4-pro");
@@ -1184,58 +1293,7 @@ PaperHelper 命令：
     }
 
     pub fn set_config(&mut self, key: &str, val: &str) -> Result<()> {
-        match key {
-            "llm.api_key" => self.config.llm.api_key = val.into(),
-            "llm.api_endpoint" => self.config.llm.api_endpoint = val.into(),
-            "llm.model" => self.config.llm.model = val.into(),
-            "llm.context_length" => self.config.llm.context_length = val.parse().context("需要整数")?,
-            "llm.thinking_mode" => self.config.llm.thinking_mode = parse_bool(val),
-            "llm.pdf_input" => self.config.llm.pdf_input = parse_bool(val),
-            "llm.paper_relation" => {
-                let v = val.trim();
-                if !crate::config::valid_paper_relation(v) {
-                    bail!("llm.paper_relation 只能是 concept / note / full");
-                }
-                self.config.llm.paper_relation = v.to_string();
-            }
-            "llm.context_scope" => {
-                let v = val.trim();
-                if !crate::config::valid_context_scope(v) {
-                    bail!("llm.context_scope 只能是 block / note / full");
-                }
-                self.config.llm.context_scope = v.to_string();
-            }
-            "pricing.input_price_per_1m" => self.config.pricing.input_price_per_1m = val.parse().context("需要数字")?,
-            "pricing.output_price_per_1m" => self.config.pricing.output_price_per_1m = val.parse().context("需要数字")?,
-            "budget.token_budget" => self.config.budget.token_budget = val.parse().context("需要整数")?,
-            "update.auto_check" => self.config.update.auto_check = parse_bool(val),
-            "update.source_url" => self.config.update.source_url = val.trim().into(),
-            "ui.toggle_sidebar"
-            | "ui.open_settings"
-            | "ui.toggle_ask"
-            | "ui.toggle_tree"
-            | "ui.stop_task"
-            | "ui.undo" => {
-                let v = val.trim();
-                if !crate::config::valid_shortcut(v) {
-                    bail!("{key} 需形如 ctrl+b（至少含一个 Ctrl/Alt/⌘ 修饰键），或留空表示不启用");
-                }
-                let slot = match key {
-                    "ui.toggle_sidebar" => &mut self.config.ui.toggle_sidebar,
-                    "ui.open_settings" => &mut self.config.ui.open_settings,
-                    "ui.toggle_ask" => &mut self.config.ui.toggle_ask,
-                    "ui.toggle_tree" => &mut self.config.ui.toggle_tree,
-                    "ui.stop_task" => &mut self.config.ui.stop_task,
-                    _ => &mut self.config.ui.undo,
-                };
-                *slot = v.to_string();
-            }
-            _ => {
-                let keys: Vec<&str> = CONFIG_KEY_DEFS.iter().map(|d| d.key).collect();
-                bail!("未知配置项: {key}。可设: {}", keys.join(" "));
-            }
-        }
-        Ok(())
+        self.config.set_field(key, val)
     }
 
     async fn cmd_budget(&mut self, rest: &str) -> Result<()> {
@@ -1901,7 +1959,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.prepare_ask(question, block_id, None, record_concept)
+        self.prepare_ask(question, block_id, None, record_concept, true)
     }
 
     /// 按编号/关键词定位笔记块（ask 用）。
@@ -1924,14 +1982,24 @@ PaperHelper 命令：
         block_id: Option<String>,
         quote: Option<&str>,
         record_concept: bool,
+        use_concept: bool,
     ) -> Result<AskJob> {
         if !self.check_budget()? {
             bail!("已达 token 预算，自动中断。用 `budget <n>` 调整。");
         }
         self.ensure_session_id();
         let session = self.session_key();
-        let (msgs, block_id) = self.build_context_messages(question, block_id.as_deref(), quote);
+        // use_concept=false：本次提问不注入任何知识库关联（概念 + 关联论文 + 概念检索代理）
+        let kb_agent = self.config.llm.kb_agent && use_concept;
+        let (msgs, block_id) =
+            self.build_context_messages(question, block_id.as_deref(), quote, use_concept, kb_agent);
         let approx_tokens = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
+        let budget = if kb_agent {
+            let used = self.kb.stats.total_tokens() + self.session.stats.total_tokens();
+            Some((used, self.config.budget.token_budget))
+        } else {
+            None
+        };
         Ok(AskJob {
             msgs,
             cfg: self.config.llm.clone(),
@@ -1946,6 +2014,13 @@ PaperHelper 命令：
             record_concept,
             approx_tokens,
             attach_note: true,
+            kb_agent,
+            kb_concepts: if kb_agent {
+                self.kb.concepts.clone()
+            } else {
+                Vec::new()
+            },
+            budget,
         })
     }
 
@@ -1996,7 +2071,10 @@ PaperHelper 命令：
         self.record_usage(res.input_tokens, res.output_tokens);
         let (clean_answer, concept) = extract_concept(&res.content);
         // 节点标题：模型给出了概念就用它，否则用问题前若干字（仅作显示）
-        let concept_label = concept.clone().unwrap_or_else(|| derive_concept(&job.question));
+        let concept_label = concept
+            .as_ref()
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| derive_concept(&job.question));
         let now = Utc::now().to_rfc3339();
 
         let mut explanation_id: Option<String> = None;
@@ -2055,7 +2133,7 @@ PaperHelper 命令：
             explanation_id = Some(expl_id);
 
             // 加入知识库概念：只在用户允许、且模型明确标注了知识点时记录
-            if let (true, Some(concept_name)) = (job.record_concept, concept.as_ref()) {
+            if let (true, Some(mark)) = (job.record_concept, concept.as_ref()) {
                 let (pid, ptitle) = self
                     .session
                     .current_paper_id
@@ -2063,7 +2141,8 @@ PaperHelper 命令：
                     .and_then(|id| self.kb.papers.iter().find(|p| p.id == id).map(|p| (id, p.title.clone())))
                     .unwrap_or_default();
                 self.kb.add_concept(Concept {
-                    name: concept_name.clone(),
+                    name: mark.name.clone(),
+                    aliases: mark.aliases.clone(),
                     definition: clean_answer.chars().take(200).collect(),
                     paper_id: pid,
                     paper_title: ptitle,
@@ -2189,7 +2268,8 @@ PaperHelper 命令：
     /// 整节重写：段落 → 直接替换文本；章节 → 用 Markdown 解析出的新块替换其 children。
     /// 若内容以小节标题开头（编辑弹窗会带上原标题），则同时更新该节标题。
     pub fn rewrite_block(&mut self, block_id: &str, text: &str) -> Result<()> {
-        let text = text.trim();
+        let stripped = notes::strip_reasoning(text);
+        let text = stripped.trim();
         if text.is_empty() {
             bail!("内容不能为空");
         }
@@ -2462,6 +2542,7 @@ PaperHelper 命令：
         quote_tex: Option<&str>,
         question: &str,
         record_concept: bool,
+        use_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         // 全文提问：block_id 用哨兵 __title__，解释挂到首个块（保证追问嵌套），
@@ -2490,7 +2571,7 @@ PaperHelper 命令：
         self.session.conversation.current = None; // 独立线程：新根
         // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
         let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
-        let mut job = match self.prepare_ask(question, insert_block, Some(ctx), record_concept) {
+        let mut job = match self.prepare_ask(question, insert_block, Some(ctx), record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2518,12 +2599,13 @@ PaperHelper 命令：
         quote: &str,
         question: &str,
         record_concept: bool,
+        use_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
         let ctx = if quote.trim().is_empty() { None } else { Some(quote) };
-        let mut job = match self.prepare_ask(question, None, ctx, record_concept) {
+        let mut job = match self.prepare_ask(question, None, ctx, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2669,6 +2751,7 @@ PaperHelper 命令：
         node_id: &str,
         question: &str,
         record_concept: bool,
+        use_concept: bool,
         extra: &ExtraInput,
     ) -> Result<AskJob> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
@@ -2677,7 +2760,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, None, record_concept) {
+        let mut job = match self.prepare_ask(question, fallback_block, None, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2697,6 +2780,7 @@ PaperHelper 命令：
         quote_tex: Option<&str>,
         question: &str,
         record_concept: bool,
+        use_concept: bool,
         extra: &ExtraInput,
     ) -> Result<(AskJob, AnnAnchor)> {
         if !self.session.conversation.nodes.iter().any(|n| n.id == node_id) {
@@ -2707,7 +2791,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, Some(ctx), record_concept) {
+        let mut job = match self.prepare_ask(question, fallback_block, Some(ctx), record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -3200,7 +3284,9 @@ PaperHelper 命令：
         *self.node_numbers.lock().unwrap() = nodes;
     }
 
-    /// 构建 ask 共用的上下文消息序列（笔记材料 + 对话路径 + 概念注入）。
+    /// 构建 ask 共用的上下文消息序列（笔记材料 + 对话路径 + 知识库关联）。
+    /// `use_concept=false` 时不注入任何知识库关联（相关概念与关联论文都不带）；
+    /// `kb_agent=true` 时概念改由 `AskJob` 在锁外挑选，此处不本地注入。
     /// 材料部分按 `llm.context_scope` 档位组装（见 `doc_context_messages`）：
     /// `block`=仅选中段落/小节；`note`=整篇笔记（默认）；`full`=笔记+原文。
     /// 消息编排：system=ask 提示词；随后是材料（原文/笔记），再以多轮 Q&A 追加历史；
@@ -3209,7 +3295,14 @@ PaperHelper 命令：
     /// 上下文长度控制：先估算 材料+问题 的 token 基数，在
     /// context_length 内从后往前保留尽量多的对话历史，溢出则提示并截断最早轮。
     /// 返回 (messages, block_id)。
-    fn build_context_messages(&self, question: &str, block_id: Option<&str>, quote: Option<&str>) -> (Vec<Message>, Option<String>) {
+    fn build_context_messages(
+        &self,
+        question: &str,
+        block_id: Option<&str>,
+        quote: Option<&str>,
+        use_concept: bool,
+        kb_agent: bool,
+    ) -> (Vec<Message>, Option<String>) {
         let block_id = block_id.map(|s| s.to_string());
         // 按「提问上下文」档位组装论文/笔记材料（block=仅选中段落 / note=整篇笔记 / full=笔记+原文）
         let doc_msgs = self
@@ -3228,8 +3321,13 @@ PaperHelper 命令：
             .collect();
 
         let ctx = self.config.llm.context_length;
-        // 论文关联增强：先取被提及论文的笔记/全文（按配置档位），纳入 base 预算后再裁剪历史
-        let ref_msgs = self.paper_relation_messages(question);
+        // 论文关联增强：先取被提及论文的笔记/全文（按配置档位），纳入 base 预算后再裁剪历史；
+        // use_concept=false 时完全不关联（与概念注入一并关闭）
+        let ref_msgs = if use_concept {
+            self.paper_relation_messages(question)
+        } else {
+            Vec::new()
+        };
         let ref_tokens: usize = ref_msgs.iter().map(|m| m.content.chars().count() / 4).sum();
         let doc_tokens: usize = doc_msgs.iter().map(|m| m.content.chars().count() / 4).sum();
         let base_tokens = doc_tokens + ref_tokens;
@@ -3262,7 +3360,6 @@ PaperHelper 命令：
             msgs.push(Message::text("assistant", a.clone()));
         }
 
-        let related = self.kb.search(question);
         // 批注提问时，把用户选中的原文一并作为上下文（普通 ask 无 quote）
         let mut q_final = String::new();
         if let Some(qt) = quote {
@@ -3273,12 +3370,10 @@ PaperHelper 命令：
             }
         }
         q_final.push_str(question);
-        if !related.is_empty() {
-            q_final.push_str("\n\n【你之前学过的相关概念，可参考并建立联系】");
-            for c in &related {
-                let d: String = c.definition.chars().take(80).collect();
-                q_final.push_str(&format!("\n- {}（来自《{}》）: {}", c.name, c.paper_title, d));
-            }
+        // 概念检索代理开启时由 AskJob 在锁外挑选概念，这里不再本地注入，避免重复。
+        if use_concept && !kb_agent {
+            let related = self.kb.search(question);
+            q_final.push_str(&concept_hint(&related));
         }
         msgs.push(Message::text("user", q_final));
         (msgs, block_id)
@@ -3536,10 +3631,6 @@ fn short(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// 用问题前若干字作为概念名 / 节点标签（免 token）。
 /// 解析 ask 参数：若第一个 token 形如 "3.2"（数字.数字...）则视为编号，
 /// 返回 (编号, 剩余问题)；否则返回 (None, 整个 args)。
@@ -3588,19 +3679,138 @@ fn derive_concept(q: &str) -> String {
     q.chars().take(20).collect()
 }
 
-/// 从 LLM 回答末尾解析 [[概念: XXX]] 行，返回 (去掉该行的正文, 概念名)。
+/// 概念检索代理的工具定义：让模型按需检索知识库里的相关概念。
+fn concept_search_tool() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "search_concepts",
+            "description": "在当前学习笔记的知识库里检索与查询相关的已学概念（名称/别名/定义）。\
+需要跨论文联系或确认某个术语是否学过时调用；返回概念名与定义。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "要检索的关键词或问题" }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+/// 从 `{"concepts":[...]}`（允许外面包着 markdown 代码块）解析概念名，
+/// 只保留候选库里真实存在的名称、去重、最多 3 个。
+fn parse_plan_names(content: &str, concepts: &[Concept]) -> Vec<String> {
+    let Some(v) = json_object(content) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("concepts").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in arr {
+        let Some(n) = item.as_str() else { continue };
+        let n = n.trim();
+        if n.is_empty() || out.iter().any(|x| x == n) {
+            continue;
+        }
+        if concepts.iter().any(|c| c.name == n) {
+            out.push(n.to_string());
+        }
+    }
+    out.truncate(3);
+    out
+}
+
+/// 从可能带 markdown 代码块/前后缀的文本里取出第一个 JSON 对象。
+fn json_object(content: &str) -> Option<serde_json::Value> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(content[start..=end].trim()).ok()
+}
+
+/// 概念检索代理的「规划」调用：让模型从候选概念里挑出与问题真正相关的。
+/// 返回 (选中概念名, 输入 token, 输出 token, 是否估算)；token 不展示给用户，仅供记账。
+async fn plan_relevant_concepts(
+    client: &reqwest::Client,
+    cfg: &crate::config::LlmConfig,
+    concepts: &[Concept],
+    question: &str,
+) -> Result<(Vec<String>, u64, u64, bool)> {
+    let list: Vec<String> = concepts
+        .iter()
+        .map(|c| {
+            let d: String = c.definition.chars().take(60).collect();
+            format!("- {}（《{}》）: {}", c.name, c.paper_title, d)
+        })
+        .collect();
+    let sys = "你在帮用户的学习笔记挑选「与本次提问真正相关」的跨论文概念。\
+只输出 JSON：{\"concepts\":[\"概念名\", ...]}，最多 3 个；没有相关概念则输出 {\"concepts\":[]}。\
+只能从候选概念里选，概念名必须与候选完全一致；不要解释、不要杜撰。";
+    let user = format!("候选概念：\n{}\n\n本次提问：{}", list.join("\n"), question);
+    let msgs = vec![
+        Message::text("system", sys),
+        Message::text("user", user),
+    ];
+    let res = crate::llm::chat(client, cfg, &msgs, true, false, &mut |_| {}, None).await?;
+    let names = parse_plan_names(&res.content, concepts);
+    Ok((names, res.input_tokens, res.output_tokens, res.estimated))
+}
+
+/// 相关概念提示块（普通 ask 与概念检索代理共用），无命中时返回空串。
+fn concept_hint(related: &[&Concept]) -> String {
+    if related.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n\n【你之前学过的相关概念，可参考并建立联系】");
+    for c in related {
+        let d: String = c.definition.chars().take(80).collect();
+        if c.aliases.is_empty() {
+            s.push_str(&format!("\n- {}（来自《{}》）: {}", c.name, c.paper_title, d));
+        } else {
+            s.push_str(&format!(
+                "\n- {}（别名 {}；来自《{}》）: {}",
+                c.name,
+                c.aliases.join("、"),
+                c.paper_title,
+                d
+            ));
+        }
+    }
+    s
+}
+
+/// 模型在回答末尾标注的概念：`[[概念: 名称 | 别名1、别名2]]`。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConceptMark {
+    pub name: String,
+    pub aliases: Vec<String>,
+}
+
+/// 从 LLM 回答末尾解析 `[[概念: 名称 | 别名1、别名2]]` 行，返回 (去掉该行的正文, 概念)。
+/// 名称与别名用 `|`（全角 `｜` 亦可）分隔，别名之间用 `、`/`,`/`，`/`;` 分隔；别名可省略。
 /// 模型没标注（或标注为空）时返回 `None`：**不再用问题文本兜底**，
 /// 避免把“这段什么意思”这类非知识点提问也记成“已学概念”。
-fn extract_concept(content: &str) -> (String, Option<String>) {
-    // 找最后一行含 [[概念: ...]] 的
-    let mut concept: Option<String> = None;
+fn extract_concept(content: &str) -> (String, Option<ConceptMark>) {
+    let mut concept: Option<ConceptMark> = None;
     let mut clean_lines = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("[[概念:").and_then(|s| s.strip_suffix("]]")) {
-            let name = rest.trim().to_string();
+            let mut parts = rest.split(['|', '｜']);
+            let name = parts.next().unwrap_or("").trim().to_string();
             if !name.is_empty() {
-                concept = Some(name);
+                let mut aliases: Vec<String> = Vec::new();
+                for seg in parts.flat_map(|s| s.split(['、', ',', '，', ';', '；'])) {
+                    let a = seg.trim();
+                    if !a.is_empty() && a != name && !aliases.iter().any(|x| x == a) {
+                        aliases.push(a.to_string());
+                    }
+                }
+                concept = Some(ConceptMark { name, aliases });
                 continue; // 跳过这行，不加入 clean
             }
         }
@@ -3825,7 +4035,23 @@ mod tests {
         let content = "BERTScore是相似度指标。\n\n[[概念: BERTScore]]";
         let (clean, concept) = extract_concept(content);
         assert!(!clean.contains("[[概念"), "clean 应去掉概念行: {clean}");
-        assert_eq!(concept.as_deref(), Some("BERTScore"));
+        let mark = concept.expect("应解析出概念");
+        assert_eq!(mark.name, "BERTScore");
+        assert!(mark.aliases.is_empty());
+    }
+
+    #[test]
+    fn extract_concept_parses_aliases() {
+        let content = "思维链能提升推理。\n\n[[概念: 思维链 | CoT、Chain of Thought]]";
+        let (clean, concept) = extract_concept(content);
+        assert!(!clean.contains("[[概念"));
+        let mark = concept.expect("应解析出概念");
+        assert_eq!(mark.name, "思维链");
+        assert_eq!(mark.aliases, vec!["CoT", "Chain of Thought"]);
+        // 别名与概念名重复、空别名应被丢弃
+        let (_, c2) = extract_concept("[[概念: 注意力 | 注意力、 、Self-Attention]]");
+        let m2 = c2.unwrap();
+        assert_eq!(m2.aliases, vec!["Self-Attention"]);
     }
 
     #[test]
@@ -4003,6 +4229,41 @@ mod tests {
         );
     }
 
+    /// 「关联概念」关闭时：即便命中了已学概念也不注入（本次提问完全不关联知识库）。
+    #[test]
+    fn use_concept_off_skips_knowledge_hint() {
+        use crate::config::Config;
+        use crate::knowledge::{Concept, KnowledgeBase};
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(Concept {
+            name: "语义熵".into(),
+            aliases: vec![],
+            definition: "衡量语义不确定性的量。".into(),
+            paper_id: "p1".into(),
+            paper_title: "论文A".into(),
+            block_id: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            pinned: false,
+            graph_seen: false,
+        });
+        let app = super::App::new(Config::default(), kb, reqwest::Client::new());
+        let last = |msgs: &[crate::llm::Message]| msgs.last().unwrap().content.clone();
+
+        let (on, _) = app.build_context_messages("什么是语义熵", None, None, true, false);
+        assert!(
+            last(&on).contains("【你之前学过的相关概念"),
+            "开启时应注入相关概念提示: {}",
+            last(&on)
+        );
+
+        let (off, _) = app.build_context_messages("什么是语义熵", None, None, false, false);
+        assert!(
+            !last(&off).contains("【你之前学过的相关概念"),
+            "关闭时不应注入概念提示: {}",
+            last(&off)
+        );
+    }
+
     /// 提问上下文档位：note（默认）只发整篇笔记不带原文；full 带原文；block 只发选中段落/小节。
     #[test]
     fn doc_context_scope_selects_material() {
@@ -4061,6 +4322,26 @@ mod tests {
             let t: String = msgs.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
             assert!(t.contains("【原文材料】") && t.contains("仅阅读原文内容"), "{scope} 档应退回原文: {t}");
         }
+    }
+
+    /// AI 重写段落：模型把思考过程混进正文时，落地前必须剥离（与 ingest 同一处理）。
+    #[test]
+    fn rewrite_block_strips_reasoning_leak() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        use crate::notes;
+        let mut app =
+            super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        let note = notes::parse_markdown_note("# 标题\n\n原始段落。\n", "raw");
+        let para_id = note.blocks[0].id.clone();
+        app.session.notes = Some(note);
+
+        let leaked = "`? Let's rewrite the paragraph.\n\n</think>重写后的段落。\n";
+        app.rewrite_block(&para_id, leaked).unwrap();
+        let saved = app.session.notes.as_ref().unwrap().find_block(&para_id).unwrap();
+        assert_eq!(saved.text, "重写后的段落。", "思考过程不应写入段落");
+
+        let _ = std::fs::remove_file(crate::paths::session_path(&app.session.session_id));
     }
 
     fn ann(id: &str, roots: &[&str], node_id: Option<&str>) -> crate::session::Annotation {

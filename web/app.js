@@ -2869,6 +2869,13 @@ function recordConceptOn() {
   return el ? !!el.checked : true;
 }
 
+/// 「关联概念」开关：本次提问是否关联已学知识（相关概念 / 关联论文 / 概念检索代理）。
+const ANN_CONCEPT_KEY = "ph.ann.useConcept";
+function useConceptOn() {
+  const el = $("ann-concept");
+  return el ? !!el.checked : true;
+}
+
 // ===== 提问附件（图片 / txt / md / PDF 抽文本）：仅随本次提问发送，不入会话历史 =====
 let annAttachments = []; // [{ name, kind: "text"|"image", data, pending? }]
 const MAX_ANN_ATTACH = 8;
@@ -3066,7 +3073,7 @@ async function sendAnnotation() {
   if (currentAnnotation.id && annSelectedNode && !annNewRoot) {
     mode = "reply";
     url = "/api/annotate/reply";
-    body = { node_id: annSelectedNode, question: q, record_concept: recordConceptOn(), attachments: currentAnnAttachments() };
+    body = { node_id: annSelectedNode, question: q, record_concept: recordConceptOn(), use_concept: useConceptOn(), attachments: currentAnnAttachments() };
   } else if (answerAnchorNode) {
     mode = "answer";
     url = "/api/annotate/answer";
@@ -3075,7 +3082,7 @@ async function sendAnnotation() {
       quote: currentAnnotation.quote,
       quote_tex: currentAnnotation.quote_tex || null,
       question: q,
-      record_concept: recordConceptOn(),
+      record_concept: recordConceptOn(), use_concept: useConceptOn(),
       attachments: currentAnnAttachments(),
     };
   } else {
@@ -3086,7 +3093,7 @@ async function sendAnnotation() {
       quote: currentAnnotation.quote,
       quote_tex: currentAnnotation.quote_tex || null,
       question: q,
-      record_concept: recordConceptOn(),
+      record_concept: recordConceptOn(), use_concept: useConceptOn(),
       attachments: currentAnnAttachments(),
     };
     if (currentAnnotation.pdf) {
@@ -4123,20 +4130,131 @@ async function loadStylesPane() {
   if (editingStyleId) selectStyleForEdit(editingStyleId);
 }
 
+let cfgFields = [];        // 最近一次 /api/config 的字段 schema
+const cfgFieldEls = {};    // key → { input }（模型设置页动态控件）
+let presetsCache = { models: [], endpoints: [] };
+
+const ENUM_LABELS = {
+  "llm.paper_relation": {
+    concept: "仅相关概念（默认，最省 token）",
+    note: "相关概念 + 关联论文笔记",
+    full: "相关概念 + 关联论文原文与笔记",
+  },
+  "llm.context_scope": {
+    block: "仅选中段落（最省 token）",
+    note: "整篇笔记（默认）",
+    full: "整篇笔记 + 论文原文（最全，最费 token）",
+  },
+};
+
+/// 按 schema 渲染「模型设置」页控件（分组：llm / pricing / budget）。
+function renderConfigFields(fields) {
+  const box = $("cfg-fields");
+  box.innerHTML = "";
+  for (const k in cfgFieldEls) delete cfgFieldEls[k];
+  const titles = { llm: "模型与端点", pricing: "计费单价", budget: "token 预算" };
+  const groups = {};
+  for (const f of fields) {
+    if (f.group === "ui") continue;
+    (groups[f.group] = groups[f.group] || []).push(f);
+  }
+  for (const g of ["llm", "pricing", "budget"]) {
+    if (!groups[g] || !groups[g].length) continue;
+    const h = document.createElement("p");
+    h.className = "settings-group-title";
+    h.textContent = titles[g] || g;
+    box.appendChild(h);
+    for (const f of groups[g]) box.appendChild(configFieldRow(f));
+  }
+}
+
+function configFieldRow(f) {
+  const frag = document.createDocumentFragment();
+  const help = makeHelp(f);
+  let input;
+  if (f.kind === "bool") {
+    const label = document.createElement("label");
+    label.className = "check";
+    input = document.createElement("input");
+    input.type = "checkbox";
+    label.append(input, document.createTextNode(" " + f.label));
+    if (help) label.appendChild(help);
+    frag.appendChild(label);
+  } else {
+    const label = document.createElement("label");
+    label.append(document.createTextNode(f.label + " "));
+    if (help) label.appendChild(help);
+    if (f.kind === "enum") {
+      input = document.createElement("select");
+      for (const opt of f.options) {
+        const o = document.createElement("option");
+        o.value = opt;
+        o.textContent = (ENUM_LABELS[f.key] && ENUM_LABELS[f.key][opt]) || opt;
+        input.appendChild(o);
+      }
+    } else {
+      input = document.createElement("input");
+      if (f.kind === "int" || f.kind === "float") input.type = "number";
+      if (f.kind === "float") input.step = "0.01";
+      if (f.kind === "secret") { input.type = "password"; input.autocomplete = "off"; }
+      if (f.kind === "presets") {
+        const dl = document.createElement("datalist");
+        dl.id = "cfg-dl-" + f.key.replace(/\./g, "-");
+        input.setAttribute("list", dl.id);
+        for (const v of presetsCache[f.preset] || []) {
+          const o = document.createElement("option");
+          o.value = v;
+          dl.appendChild(o);
+        }
+        label.appendChild(input);
+        label.appendChild(dl);
+        frag.appendChild(label);
+        cfgFieldEls[f.key] = { input };
+        return frag;
+      }
+    }
+    label.appendChild(input);
+    frag.appendChild(label);
+  }
+  cfgFieldEls[f.key] = { input };
+  return frag;
+}
+
+/// 字段说明：一个小「?」圆点，悬停/聚焦时气泡显示 help，避免说明文字占满整屏。
+function makeHelp(f) {
+  if (!f.help) return null;
+  const wrap = document.createElement("span");
+  wrap.className = "help-wrap";
+  const dot = document.createElement("span");
+  dot.className = "help-dot";
+  dot.tabIndex = 0;
+  dot.setAttribute("aria-label", "说明");
+  dot.textContent = "?";
+  const tip = document.createElement("span");
+  tip.className = "help-tip";
+  tip.setAttribute("role", "tooltip");
+  tip.textContent = f.help;
+  wrap.append(dot, tip);
+  return wrap;
+}
+
 async function openConfig(tab = "model") {
   try {
     const c = await (await fetch("/api/config")).json();
-    $("cfg-endpoint").value = c.llm.api_endpoint || "";
-    $("cfg-key").value = "";
-    $("cfg-key").placeholder = "留空则不修改（当前：" + (c.llm.api_key_masked || "未设置") + "）";
-    $("cfg-model").value = c.llm.model || "";
-    $("cfg-context").value = c.llm.context_length || 0;
-    $("cfg-thinking").checked = !!c.llm.thinking_mode;
-    $("cfg-inprice").value = c.pricing.input_price_per_1m;
-    $("cfg-outprice").value = c.pricing.output_price_per_1m;
-    $("cfg-budget").value = c.budget.token_budget;
-    $("cfg-paper-relation").value = c.llm.paper_relation || "concept";
-    $("cfg-context-scope").value = c.llm.context_scope || "note";
+    cfgFields = c.fields || [];
+    presetsCache = c.presets || { models: [], endpoints: [] };
+    renderConfigFields(cfgFields);
+    for (const f of cfgFields) {
+      const e = cfgFieldEls[f.key];
+      if (!e) continue;
+      if (f.kind === "bool") e.input.checked = f.value === "true";
+      else if (f.kind === "secret") {
+        e.input.value = "";
+        e.input.placeholder = f.is_set
+          ? `留空则不修改（当前：${f.masked || "已设置"}）`
+          : "未设置";
+      } else e.input.value = f.value;
+    }
     pendingShortcuts = {};
     for (const a of SHORTCUT_ACTIONS) {
       pendingShortcuts[a.key] = String((c.ui && c.ui[a.key]) || "").trim();
@@ -4175,17 +4293,21 @@ async function saveConfig() {
   status.textContent = "保存中…";
   status.className = "status";
   try {
-    await setConfig("llm.api_endpoint", $("cfg-endpoint").value.trim());
-    await setConfig("llm.model", $("cfg-model").value.trim());
-    await setConfig("llm.context_length", String(parseInt($("cfg-context").value, 10) || 0));
-    await setConfig("llm.thinking_mode", $("cfg-thinking").checked ? "true" : "false");
-    await setConfig("pricing.input_price_per_1m", String(parseFloat($("cfg-inprice").value) || 0));
-    await setConfig("pricing.output_price_per_1m", String(parseFloat($("cfg-outprice").value) || 0));
-    await setConfig("budget.token_budget", String(parseInt($("cfg-budget").value, 10) || 0));
-    await setConfig("llm.paper_relation", $("cfg-paper-relation").value);
-    await setConfig("llm.context_scope", $("cfg-context-scope").value);
-    const key = $("cfg-key").value.trim();
-    if (key) await setConfig("llm.api_key", key);
+    for (const f of cfgFields) {
+      if (f.group === "ui") continue;
+      const e = cfgFieldEls[f.key];
+      if (!e) continue;
+      let val;
+      if (f.kind === "bool") {
+        val = e.input.checked ? "true" : "false";
+      } else {
+        val = String(e.input.value).trim();
+        if (f.kind === "secret" && !val) continue; // 密钥留空 = 不修改
+        if (f.kind === "int") val = String(parseInt(val, 10) || 0);
+        if (f.kind === "float") val = String(parseFloat(val) || 0);
+      }
+      await setConfig(f.key, val);
+    }
     status.textContent = "✓ 已保存";
     status.className = "status ok";
     await refreshState();
@@ -4322,9 +4444,9 @@ async function testConfig() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        endpoint: $("cfg-endpoint").value.trim(),
-        model: $("cfg-model").value.trim(),
-        api_key: $("cfg-key").value.trim(),
+        endpoint: (cfgFieldEls["llm.api_endpoint"] ? cfgFieldEls["llm.api_endpoint"].input.value : "").trim(),
+        model: (cfgFieldEls["llm.model"] ? cfgFieldEls["llm.model"].input.value : "").trim(),
+        api_key: (cfgFieldEls["llm.api_key"] ? cfgFieldEls["llm.api_key"].input.value : "").trim(),
       }),
       signal: ctrl.signal,
     });
@@ -4374,228 +4496,6 @@ function stopConfigTest() {
   fetch("/api/interrupt", { method: "POST" }).catch(() => {});
   if (cfgTestAbort) {
     try { cfgTestAbort.abort(); } catch (e) { /* 忽略 */ }
-  }
-}
-
-// ===== 版本更新（启动自动检查；Windows 安装版支持一键更新）=====
-
-let updateInfo = null;   // 最近一次 /api/update/check 结果
-let updateSeq = 0;       // 丢弃过期的异步检查结果
-
-/// 检查更新：force=true 为手动检查（跳过 24h 节流）。
-async function checkUpdate(force) {
-  const seq = ++updateSeq;
-  try {
-    const r = await (await fetch("/api/update/check" + (force ? "?force=1" : ""))).json();
-    if (seq !== updateSeq) return null;
-    updateInfo = r;
-    renderUpdatePill(r);
-    if (force) showUpdateModal(r);
-    return r;
-  } catch (e) {
-    if (force) updateStatus("❌ 检查更新失败：" + e.message, "err");
-    return null;
-  }
-}
-
-/// 顶栏提示：有新版本且未跳过时才出现。
-function renderUpdatePill(r) {
-  const btn = $("btn-update");
-  const show = !!(r && r.ok && r.newer && !r.skipped);
-  btn.classList.toggle("hidden", !show);
-  if (show) {
-    btn.textContent = "发现新版本 v" + r.latest;
-    btn.title = `当前 v${r.current}，点击查看 v${r.latest} 的更新说明`;
-  }
-}
-
-function updateStatus(msg, cls = "") {
-  const el = $("update-status");
-  el.textContent = msg || "";
-  el.className = "status" + (cls ? " " + cls : "");
-}
-
-/// 打开更新弹窗：展示版本对比、说明链接与可用操作。
-function showUpdateModal(r) {
-  if (r) updateInfo = r;
-  const info = updateInfo;
-  if (!info) return;
-  const body = $("update-body");
-  body.innerHTML = "";
-  $("btn-update-apply").classList.add("hidden");
-  $("btn-update-skip").classList.add("hidden");
-  if (!updateDownloading && !updateBusy) {
-    setUpdateButtonsDisabled(false);
-    $("btn-update-cancel").classList.add("hidden");
-  }
-  updateStatus("");
-
-  if (!info.ok) {
-    $("update-title").textContent = "检查更新失败";
-    body.innerHTML = `<p>${esc(info.error || "无法连接更新服务器")}</p>` +
-      `<p class="muted">不影响正常使用；可稍后重试，或点「手动下载」到发布页查看最新版本。</p>`;
-  } else if (!info.newer) {
-    $("update-title").textContent = "已是最新版本";
-    body.innerHTML = `<p>当前版本 v${esc(info.current)}，没有发现新版本。</p>`;
-  } else {
-    $("update-title").textContent = "发现新版本 v" + esc(info.latest);
-    body.innerHTML =
-      `<p>当前 v${esc(info.current)} → 新版本 <b>v${esc(info.latest)}</b>${info.skipped ? "（此版本已被跳过，仍可更新）" : ""}</p>` +
-      (info.released_at ? `<p class="muted">发布时间：${esc(info.released_at)}</p>` : "") +
-      `<p><a href="${esc(info.notes_url)}" target="_blank" rel="noopener">查看这个版本改了什么 ↗</a></p>` +
-      (info.auto_install
-        ? `<p class="muted">点「立即更新」会自动下载并安装，完成后软件自动重启；笔记与会话都在本机，不会丢失。</p>`
-        : `<p class="muted">点「手动下载」打开下载页，下载新版安装包后直接安装即可；笔记与会话都在本机，不会丢失。</p>`);
-    $("btn-update-skip").classList.remove("hidden");
-    if (info.auto_install) $("btn-update-apply").classList.remove("hidden");
-  }
-  $("update-modal").classList.remove("hidden");
-}
-
-/// 跳过此版本：不再主动提示（设置里手动检查仍能看到）。
-async function skipUpdate() {
-  const info = updateInfo || {};
-  if (info.latest) {
-    try {
-      await fetch("/api/update/skip", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ version: info.latest }),
-      });
-    } catch (e) { /* 忽略：仅影响提示，不影响使用 */ }
-    info.skipped = true;
-  }
-  $("update-modal").classList.add("hidden");
-  renderUpdatePill(updateInfo);
-}
-
-function openUpdateDownload() {
-  const info = updateInfo || {};
-  const url = info.manual_url || info.notes_url;
-  if (url) window.open(url, "_blank", "noopener");
-}
-
-// ----- 一键更新（Windows 安装版）：下载 → 校验 → 静默安装并重启 -----
-
-let updateDownloading = false;  // 下载进度轮询进行中
-let updateBusy = false;         // 安装请求已发出（界面进入只读）
-
-function setUpdateButtonsDisabled(disabled) {
-  ["btn-update-apply", "btn-update-skip", "btn-update-manual"].forEach((id) => {
-    $(id).disabled = disabled;
-  });
-}
-
-/// 在弹窗里创建/更新下载进度条。
-function renderDownloadProgress(st, text) {
-  const body = $("update-body");
-  let box = body.querySelector(".dl-progress");
-  if (!box) {
-    box = document.createElement("div");
-    box.className = "dl-progress";
-    box.innerHTML = '<div class="dl-bar"><div class="dl-fill"></div></div><p class="muted dl-text"></p>';
-    body.appendChild(box);
-  }
-  const pct = st.total > 0 ? Math.min(100, Math.round((st.downloaded / st.total) * 100)) : 0;
-  box.querySelector(".dl-fill").style.width = pct + "%";
-  const mb = (n) => (n > 0 ? (n / 1048576).toFixed(1) + " MB" : "—");
-  box.querySelector(".dl-text").textContent =
-    text || `已下载 ${mb(st.downloaded)} / ${mb(st.total)}（${pct}%）`;
-}
-
-/// 点「立即更新」：启动后台下载并轮询进度，就绪后请求安装。
-async function startUpdateDownload() {
-  if (updateDownloading || updateBusy) return;
-  if (!(updateInfo && updateInfo.auto_install)) {
-    updateStatus("当前版本不支持自动安装，请点「手动下载」", "err");
-    return;
-  }
-  updateDownloading = true;
-  setUpdateButtonsDisabled(true);
-  $("btn-update-cancel").classList.remove("hidden");
-  updateStatus("正在连接下载服务器…", "ok");
-  try {
-    await fetch("/api/update/download", { method: "POST" });
-  } catch (e) {
-    updateDownloading = false;
-    $("btn-update-cancel").classList.add("hidden");
-    setUpdateButtonsDisabled(false);
-    updateStatus("❌ 无法开始下载：" + e.message, "err");
-    return;
-  }
-  while (updateDownloading) {
-    let st;
-    try {
-      st = await (await fetch("/api/update/status")).json();
-    } catch (e) {
-      updateDownloading = false;
-      $("btn-update-cancel").classList.add("hidden");
-      setUpdateButtonsDisabled(false);
-      updateStatus("❌ 读取下载进度失败：" + e.message + "，可重试", "err");
-      return;
-    }
-    if (st.phase === "downloading") {
-      renderDownloadProgress(st);
-      updateStatus("正在下载安装包…", "ok");
-    } else if (st.phase === "verifying") {
-      renderDownloadProgress(st, "下载完成，正在校验安装包…");
-      updateStatus("正在校验安装包…", "ok");
-    } else if (st.phase === "ready") {
-      renderDownloadProgress(st, "安装包已就绪");
-      updateDownloading = false;
-      $("btn-update-cancel").classList.add("hidden");
-      await applyUpdateNow();
-      return;
-    } else if (st.phase === "error") {
-      updateDownloading = false;
-      $("btn-update-cancel").classList.add("hidden");
-      setUpdateButtonsDisabled(false);
-      updateStatus("❌ " + (st.error || "下载失败，请重试"), "err");
-      return;
-    } else {
-      updateStatus("正在准备下载…", "ok");
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-}
-
-/// 请求桌面壳退出并静默安装（成功后窗口会自动关闭并在新版本重启）。
-async function applyUpdateNow() {
-  updateBusy = true;
-  setUpdateButtonsDisabled(true);
-  updateStatus("正在安装更新，软件将自动重启，请稍候…", "ok");
-  try {
-    const r = await (await fetch("/api/update/apply", { method: "POST" })).json();
-    if (!r.ok) throw new Error(r.error || "无法开始安装");
-    $("update-title").textContent = "正在安装更新";
-  } catch (e) {
-    updateBusy = false;
-    setUpdateButtonsDisabled(false);
-    updateStatus("❌ " + e.message + "；可点「手动下载」更新", "err");
-  }
-}
-
-/// 取消下载：服务端收到打断信号后停止（已下载的部分会作废）。
-function cancelUpdateDownload() {
-  if (!updateDownloading) return;
-  updateStatus("正在取消下载…", "");
-  fetch("/api/interrupt", { method: "POST" }).catch(() => {});
-}
-
-/// 设置页「检查更新」：结果显示在版本行。
-async function checkUpdateFromSettings() {
-  const el = $("cfg-version");
-  const old = el.textContent;
-  el.textContent = "正在检查更新…";
-  const r = await checkUpdate(true);
-  if (!r) {
-    el.textContent = old;
-  } else if (!r.ok) {
-    el.textContent = `当前 v${r.current} · 检查失败（可稍后重试）`;
-  } else if (r.newer) {
-    el.textContent = `当前 v${r.current} · 发现新版本 v${r.latest}`;
-  } else {
-    el.textContent = `当前 v${r.current} · 已是最新版本`;
   }
 }
 
@@ -5091,7 +4991,6 @@ function dispatchShortcut(key) {
 function closeTopModal() {
   const closers = [
     ["wizard-modal", closeWizard],
-    ["update-modal", () => $("update-modal").classList.add("hidden")],
     ["help-modal", () => $("help-modal").classList.add("hidden")],
     ["config-modal", () => $("config-modal").classList.add("hidden")],
     ["edit-modal", closeEditModal],
@@ -5293,6 +5192,13 @@ document.addEventListener("DOMContentLoaded", () => {
       try { localStorage.setItem(ANN_RECORD_KEY, rec.checked ? "1" : "0"); } catch (e) { /* 忽略 */ }
     };
   }
+  {
+    const con = $("ann-concept");
+    con.checked = localStorage.getItem(ANN_CONCEPT_KEY) !== "0";
+    con.onchange = () => {
+      try { localStorage.setItem(ANN_CONCEPT_KEY, con.checked ? "1" : "0"); } catch (e) { /* 忽略 */ }
+    };
+  }
   $("ann-subquote-clear").onclick = () => clearAnnSubquote();
   $("ann-tree").onclick = toggleAnnSide;
   $("ann-send").onclick = sendAnnotation;
@@ -5425,15 +5331,6 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-config-ui-save").onclick = saveUiConfig;
   setupShortcutRecorder();
 
-  // 版本更新：顶栏提示 / 更新弹窗 / 设置页手动检查
-  $("btn-update").onclick = () => showUpdateModal(null);
-  $("btn-update-close").onclick = () => $("update-modal").classList.add("hidden");
-  $("btn-update-manual").onclick = openUpdateDownload;
-  $("btn-update-skip").onclick = skipUpdate;
-  $("btn-update-apply").onclick = startUpdateDownload;
-  $("btn-update-cancel").onclick = cancelUpdateDownload;
-  $("btn-update-check").onclick = checkUpdateFromSettings;
-
   // 导入弹窗：模式 + 动态风格 + 临时额外要求 + 风格管理
   $("btn-import-cancel").onclick = () => closeImportModal(null);
   $("btn-import-ok").onclick = () =>
@@ -5475,6 +5372,4 @@ document.addEventListener("DOMContentLoaded", () => {
   loadUiConfig();
   refreshState();
   setInterval(refreshState, 15000);
-  // 启动自动检查更新（24h 节流；失败静默，不影响使用）
-  checkUpdate(false);
 });

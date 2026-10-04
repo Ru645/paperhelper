@@ -686,7 +686,7 @@ fn split_into_paragraphs(md: &str) -> Vec<Block> {
 /// 解析一段 Markdown 为块序列（供「插入内容 / 整节重写」使用）。
 /// 与 `parse_markdown_note` 不同：`#` 也视为顶层 Section，而非被当成标题吞掉。
 pub fn parse_markdown_blocks(md: &str) -> Vec<Block> {
-    let (_title, roots) = parse_blocks_core(md, false);
+    let (_title, roots) = parse_blocks_core(&strip_reasoning(md), false);
     roots
 }
 
@@ -1041,6 +1041,16 @@ mod tests {
         let out = strip_reasoning(md);
         assert!(out.starts_with("# 真标题"), "紧跟标题的标记应被识别: {out:?}");
         assert!(!out.contains("草稿"), "草稿不应保留: {out:?}");
+    }
+
+    #[test]
+    fn parse_markdown_blocks_strips_reasoning_leak() {
+        // AI 重写/插入的文本同样经过此入口，混入的思考过程也要剥掉
+        let leaked = "`? Let's draft the rewrite.\n</think>重写后的段落。\n";
+        let blocks = parse_markdown_blocks(leaked);
+        assert_eq!(blocks.len(), 1, "应只剩正文块: {blocks:?}");
+        assert_eq!(blocks[0].text, "重写后的段落。");
+        assert!(!blocks[0].text.contains("draft"), "思考不应保留");
     }
 
     #[test]

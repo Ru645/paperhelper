@@ -7,7 +7,7 @@
 //!   避免用户手改 toml 导致解析崩溃
 //! - `Config::save()` 全量写回 toml（`config set` / `budget` 命令后调用）
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -21,9 +21,6 @@ pub struct Config {
     /// 补全用的预设（模型名/端点候选），用户可在 config.toml 里增删。
     #[serde(default)]
     pub presets: PresetsConfig,
-    /// 更新检查（旧配置缺 `[update]` 节时用默认：自动检查开、官方源）。
-    #[serde(default)]
-    pub update: UpdateConfig,
     /// 界面偏好（旧配置缺 `[ui]` 节时用默认）。
     #[serde(default)]
     pub ui: UiConfig,
@@ -121,30 +118,6 @@ pub fn valid_shortcut(s: &str) -> bool {
     true
 }
 
-/// 版本更新检查配置（`[update]` 节）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateConfig {
-    /// 启动时自动检查新版本（24h 节流；失败静默，不影响使用）。
-    #[serde(default = "default_true")]
-    pub auto_check: bool,
-    /// 更新源地址（update.json）；留空用官方 GitHub Releases，可指向镜像。
-    #[serde(default)]
-    pub source_url: String,
-}
-
-impl Default for UpdateConfig {
-    fn default() -> Self {
-        UpdateConfig {
-            auto_check: true,
-            source_url: String::new(),
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub api_endpoint: String,
@@ -166,25 +139,22 @@ pub struct LlmConfig {
     /// `full`=整篇笔记 + 论文原文。档位越高，每次提问的 token 消耗越大。
     #[serde(default = "default_context_scope")]
     pub context_scope: String,
+    /// 概念检索代理：回答前先让模型检索/规划「相关概念」再作答。
+    /// 优先尝试工具调用（模型自行按需检索）；网关不支持时自动降级为一次规划调用；
+    /// 规划再失败则回落本地关键词检索。默认关闭（多一次调用、更耗 token）。
+    #[serde(default)]
+    pub kb_agent: bool,
 }
 
 /// 论文关联增强的合法取值。
-pub const PAPER_RELATION_MODES: [&str; 3] = ["concept", "note", "full"];
-
-pub fn valid_paper_relation(v: &str) -> bool {
-    PAPER_RELATION_MODES.contains(&v)
-}
+pub const PAPER_RELATION_MODES: &[&str] = &["concept", "note", "full"];
 
 fn default_paper_relation() -> String {
     "concept".into()
 }
 
 /// 提问上下文档位的合法取值。
-pub const CONTEXT_SCOPE_MODES: [&str; 3] = ["block", "note", "full"];
-
-pub fn valid_context_scope(v: &str) -> bool {
-    CONTEXT_SCOPE_MODES.contains(&v)
-}
+pub const CONTEXT_SCOPE_MODES: &[&str] = &["block", "note", "full"];
 
 fn default_context_scope() -> String {
     "note".into()
@@ -241,6 +211,168 @@ impl PresetsConfig {
     }
 }
 
+/// 字段的呈现/校验类型（供前端渲染与 CLI 补全派生）。
+#[derive(Clone, Copy)]
+pub enum FieldKind {
+    Secret,
+    Bool,
+    Int,
+    Float,
+    Enum(&'static [&'static str]),
+    Shortcut,
+    Presets(PresetKind),
+}
+
+/// presets 候选来源。
+#[derive(Clone, Copy, PartialEq)]
+pub enum PresetKind {
+    Models,
+    Endpoints,
+}
+
+/// 单个配置项的单一来源定义：键名、类型、环境变量、默认值、展示与读写。
+pub struct FieldDef {
+    pub key: &'static str,
+    pub kind: FieldKind,
+    pub env: Option<&'static str>,
+    pub default: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    pub help: &'static str,
+    pub get: fn(&Config) -> String,
+    pub set: fn(&mut Config, &str) -> Result<()>,
+}
+
+macro_rules! field_plain {
+    ($kind:expr, $key:literal, $env:expr, $def:literal, $label:literal, $group:literal, $help:literal, $($f:ident).+) => {
+        FieldDef {
+            key: $key,
+            kind: $kind,
+            env: $env,
+            default: $def,
+            label: $label,
+            group: $group,
+            help: $help,
+            get: |c: &Config| c.$($f).+.clone(),
+            set: |c: &mut Config, v: &str| -> Result<()> {
+                c.$($f).+ = v.to_string();
+                Ok(())
+            },
+        }
+    };
+}
+
+macro_rules! field_bool {
+    ($key:literal, $env:expr, $def:literal, $label:literal, $group:literal, $help:literal, $($f:ident).+) => {
+        FieldDef {
+            key: $key,
+            kind: FieldKind::Bool,
+            env: $env,
+            default: $def,
+            label: $label,
+            group: $group,
+            help: $help,
+            get: |c: &Config| c.$($f).+.to_string(),
+            set: |c: &mut Config, v: &str| -> Result<()> {
+                c.$($f).+ = parse_bool(v);
+                Ok(())
+            },
+        }
+    };
+}
+
+macro_rules! field_num {
+    ($kind:expr, $key:literal, $env:expr, $def:literal, $label:literal, $group:literal, $help:literal, $ty:ty, $err:literal, $($f:ident).+) => {
+        FieldDef {
+            key: $key,
+            kind: $kind,
+            env: $env,
+            default: $def,
+            label: $label,
+            group: $group,
+            help: $help,
+            get: |c: &Config| c.$($f).+.to_string(),
+            set: |c: &mut Config, v: &str| -> Result<()> {
+                c.$($f).+ = v.trim().parse::<$ty>().context($err)?;
+                Ok(())
+            },
+        }
+    };
+}
+
+macro_rules! field_enum {
+    ($key:literal, $env:expr, $def:literal, $opts:expr, $label:literal, $group:literal, $help:literal, $($f:ident).+) => {
+        FieldDef {
+            key: $key,
+            kind: FieldKind::Enum($opts),
+            env: $env,
+            default: $def,
+            label: $label,
+            group: $group,
+            help: $help,
+            get: |c: &Config| c.$($f).+.clone(),
+            set: |c: &mut Config, v: &str| -> Result<()> {
+                let v = v.trim();
+                if !$opts.contains(&v) {
+                    bail!("{} 只能是 {}", $key, $opts.join(" / "));
+                }
+                c.$($f).+ = v.to_string();
+                Ok(())
+            },
+        }
+    };
+}
+
+macro_rules! field_shortcut {
+    ($key:literal, $env:expr, $def:literal, $label:literal, $help:literal, $($f:ident).+) => {
+        FieldDef {
+            key: $key,
+            kind: FieldKind::Shortcut,
+            env: $env,
+            default: $def,
+            label: $label,
+            group: "ui",
+            help: $help,
+            get: |c: &Config| c.$($f).+.clone(),
+            set: |c: &mut Config, v: &str| -> Result<()> {
+                let v = v.trim();
+                if !valid_shortcut(v) {
+                    bail!("{} 需形如 ctrl+b（至少含一个 Ctrl/Alt/⌘ 修饰键），或留空表示不启用", $key);
+                }
+                c.$($f).+ = v.to_string();
+                Ok(())
+            },
+        }
+    };
+}
+
+/// 全部配置项的单一来源：CLI / Web API / 设置界面 / 环境变量 / 校验均由此派生。
+/// 新增配置项只需：加结构体字段 + Default + 此表一行（需要时再加 1 处行为消费）。
+pub const CONFIG_FIELDS: &[FieldDef] = &[
+    field_plain!(FieldKind::Secret, "llm.api_key", Some("PAPERHELPER_API_KEY"), "", "API 密钥", "llm", "服务商控制台创建的密钥；只存本机，不会上传。", llm.api_key),
+    field_plain!(FieldKind::Presets(PresetKind::Endpoints), "llm.api_endpoint", Some("PAPERHELPER_API_ENDPOINT"), "https://api.openai.com/v1/chat/completions", "API 端点", "llm", "服务商提供的接口地址，通常以 /chat/completions 结尾。", llm.api_endpoint),
+    field_plain!(FieldKind::Presets(PresetKind::Models), "llm.model", Some("PAPERHELPER_MODEL"), "gpt-4o-mini", "模型名", "llm", "", llm.model),
+    field_num!(FieldKind::Int, "llm.context_length", Some("PAPERHELPER_CONTEXT_LENGTH"), "8192", "上下文长度（token）", "llm", "", usize, "需要整数", llm.context_length),
+    field_bool!("llm.thinking_mode", Some("PAPERHELPER_THINKING"), "false", "思考模式", "llm", "让推理模型在回答前先思考，通常更准，但更慢也更耗 token。", llm.thinking_mode),
+    field_bool!("llm.pdf_input", Some("PAPERHELPER_PDF_INPUT"), "false", "PDF 直传", "llm", "让模型直接读取 PDF 原件（暂未启用，目前都按提取的文本处理）。", llm.pdf_input),
+    field_enum!("llm.paper_relation", Some("PAPERHELPER_PAPER_RELATION"), "concept", PAPER_RELATION_MODES, "论文关联增强", "llm", "回答时是否参考其它相关论文：默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token。", llm.paper_relation),
+    field_enum!("llm.context_scope", Some("PAPERHELPER_CONTEXT_SCOPE"), "note", CONTEXT_SCOPE_MODES, "提问上下文", "llm", "提问时发给模型的资料多少：只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token。", llm.context_scope),
+    field_bool!("llm.kb_agent", Some("PAPERHELPER_KB_AGENT"), "false", "概念检索代理", "llm", "回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token。", llm.kb_agent),
+    field_num!(FieldKind::Float, "pricing.input_price_per_1m", Some("PAPERHELPER_INPUT_PRICE"), "0.15", "输入单价（/1M token）", "pricing", "", f64, "需要数字", pricing.input_price_per_1m),
+    field_num!(FieldKind::Float, "pricing.output_price_per_1m", Some("PAPERHELPER_OUTPUT_PRICE"), "0.60", "输出单价（/1M token）", "pricing", "", f64, "需要数字", pricing.output_price_per_1m),
+    field_num!(FieldKind::Int, "budget.token_budget", Some("PAPERHELPER_TOKEN_BUDGET"), "0", "token 预算", "budget", "0 = 不限。", u64, "需要整数", budget.token_budget),
+    field_shortcut!("ui.toggle_sidebar", Some("PAPERHELPER_UI_TOGGLE_SIDEBAR"), "ctrl+b", "左侧栏开关", "留空 = 不启用。", ui.toggle_sidebar),
+    field_shortcut!("ui.open_settings", Some("PAPERHELPER_UI_OPEN_SETTINGS"), "ctrl+,", "打开设置", "留空 = 不启用。", ui.open_settings),
+    field_shortcut!("ui.toggle_ask", Some("PAPERHELPER_UI_TOGGLE_ASK"), "ctrl+alt+b", "提问栏开关", "留空 = 不启用。", ui.toggle_ask),
+    field_shortcut!("ui.toggle_tree", Some("PAPERHELPER_UI_TOGGLE_TREE"), "ctrl+alt+t", "对话树开关", "留空 = 不启用。", ui.toggle_tree),
+    field_shortcut!("ui.stop_task", Some("PAPERHELPER_UI_STOP_TASK"), "ctrl+.", "停止任务", "留空 = 不启用。", ui.stop_task),
+    field_shortcut!("ui.undo", Some("PAPERHELPER_UI_UNDO"), "ctrl+z", "撤销", "留空 = 不启用。", ui.undo),
+];
+
+fn parse_bool(s: &str) -> bool {
+    matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -253,6 +385,7 @@ impl Default for Config {
                 pdf_input: false,
                 paper_relation: "concept".into(),
                 context_scope: "note".into(),
+                kb_agent: false,
             },
             pricing: PricingConfig {
                 input_price_per_1m: 0.15,
@@ -262,7 +395,6 @@ impl Default for Config {
                 token_budget: 0,
             },
             presets: PresetsConfig::default(),
-            update: UpdateConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -282,100 +414,10 @@ impl Config {
         };
         // presets 字段缺失/为空时回落默认
         cfg.presets.fill_missing_defaults();
-        // 手改 toml 写坏的值回落默认，避免后续匹配落空
-        if !valid_paper_relation(&cfg.llm.paper_relation) {
-            cfg.llm.paper_relation = default_paper_relation();
-        }
-        if !valid_context_scope(&cfg.llm.context_scope) {
-            cfg.llm.context_scope = default_context_scope();
-        }
-        // 手改 toml 写坏的快捷键回落默认（空串合法 = 不启用，保留）
-        let ui_defaults = UiConfig::default();
-        let ui = &mut cfg.ui;
-        for (val, def) in [
-            (&mut ui.toggle_sidebar, ui_defaults.toggle_sidebar),
-            (&mut ui.open_settings, ui_defaults.open_settings),
-            (&mut ui.toggle_ask, ui_defaults.toggle_ask),
-            (&mut ui.toggle_tree, ui_defaults.toggle_tree),
-            (&mut ui.stop_task, ui_defaults.stop_task),
-            (&mut ui.undo, ui_defaults.undo),
-        ] {
-            if !valid_shortcut(val) {
-                *val = def;
-            }
-        }
-
-        if let Ok(v) = std::env::var("PAPERHELPER_API_KEY") {
-            cfg.llm.api_key = v;
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_API_ENDPOINT") {
-            cfg.llm.api_endpoint = v;
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_MODEL") {
-            cfg.llm.model = v;
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_CONTEXT_LENGTH") {
-            if let Ok(n) = v.parse() {
-                cfg.llm.context_length = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_THINKING") {
-            cfg.llm.thinking_mode = matches!(v.as_str(), "1" | "true" | "TRUE");
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_PDF_INPUT") {
-            cfg.llm.pdf_input = matches!(v.as_str(), "1" | "true" | "TRUE");
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_PAPER_RELATION") {
-            let v = v.trim();
-            if valid_paper_relation(v) {
-                cfg.llm.paper_relation = v.to_string();
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_CONTEXT_SCOPE") {
-            let v = v.trim();
-            if valid_context_scope(v) {
-                cfg.llm.context_scope = v.to_string();
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_INPUT_PRICE") {
-            if let Ok(n) = v.parse() {
-                cfg.pricing.input_price_per_1m = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_OUTPUT_PRICE") {
-            if let Ok(n) = v.parse() {
-                cfg.pricing.output_price_per_1m = n;
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_TOKEN_BUDGET") {
-            if let Ok(n) = v.parse() {
-                cfg.budget.token_budget = n;
-            }
-        }
-        // 更新源可用环境变量覆盖（镜像/内网/测试用）
-        if let Ok(v) = std::env::var("PAPERHELPER_UPDATE_SOURCE") {
-            if !v.trim().is_empty() {
-                cfg.update.source_url = v.trim().to_string();
-            }
-        }
-        if let Ok(v) = std::env::var("PAPERHELPER_AUTO_UPDATE") {
-            cfg.update.auto_check = matches!(v.as_str(), "1" | "true" | "TRUE");
-        }
-        for (env_key, val) in [
-            ("PAPERHELPER_UI_TOGGLE_SIDEBAR", &mut cfg.ui.toggle_sidebar),
-            ("PAPERHELPER_UI_OPEN_SETTINGS", &mut cfg.ui.open_settings),
-            ("PAPERHELPER_UI_TOGGLE_ASK", &mut cfg.ui.toggle_ask),
-            ("PAPERHELPER_UI_TOGGLE_TREE", &mut cfg.ui.toggle_tree),
-            ("PAPERHELPER_UI_STOP_TASK", &mut cfg.ui.stop_task),
-            ("PAPERHELPER_UI_UNDO", &mut cfg.ui.undo),
-        ] {
-            if let Ok(v) = std::env::var(env_key) {
-                let v = v.trim();
-                if valid_shortcut(v) {
-                    *val = v.to_string();
-                }
-            }
-        }
+        // 手改 toml 写坏的值（非法枚举/快捷键）回落默认，避免后续匹配落空
+        cfg.normalize();
+        // 环境变量覆盖（优先级最高）
+        cfg.apply_env();
 
         Ok(cfg)
     }
@@ -385,6 +427,48 @@ impl Config {
         let s = toml::to_string_pretty(self).context("序列化 config")?;
         fs::write(paths::config_path(), s).context("写入 config.toml")?;
         Ok(())
+    }
+
+    /// 读取单个配置项（未知键返回 None）。
+    pub fn get_field(&self, key: &str) -> Option<String> {
+        CONFIG_FIELDS.iter().find(|f| f.key == key).map(|f| (f.get)(self))
+    }
+
+    /// 写入单个配置项（未知键报错，含可设键清单）。
+    pub fn set_field(&mut self, key: &str, val: &str) -> Result<()> {
+        match CONFIG_FIELDS.iter().find(|f| f.key == key) {
+            Some(f) => (f.set)(self, val),
+            None => {
+                let keys: Vec<&str> = CONFIG_FIELDS.iter().map(|f| f.key).collect();
+                bail!("未知配置项: {key}。可设: {}", keys.join(" "))
+            }
+        }
+    }
+
+    /// 逐项用环境变量覆盖（非法值静默跳过，保留原值）。
+    fn apply_env(&mut self) {
+        for f in CONFIG_FIELDS {
+            if let Some(env) = f.env {
+                if let Ok(v) = std::env::var(env) {
+                    let _ = (f.set)(self, &v);
+                }
+            }
+        }
+    }
+
+    /// 非法枚举/快捷键回落各自默认（空快捷键合法 = 不启用，保留）。
+    fn normalize(&mut self) {
+        for f in CONFIG_FIELDS {
+            let cur = (f.get)(self);
+            let bad = match f.kind {
+                FieldKind::Enum(opts) => !opts.contains(&cur.as_str()),
+                FieldKind::Shortcut => !valid_shortcut(&cur),
+                _ => false,
+            };
+            if bad {
+                let _ = (f.set)(self, f.default);
+            }
+        }
     }
 }
 
@@ -404,11 +488,12 @@ mod tests {
 
     #[test]
     fn paper_relation_validates_modes() {
-        assert!(valid_paper_relation("concept"));
-        assert!(valid_paper_relation("note"));
-        assert!(valid_paper_relation("full"));
-        assert!(!valid_paper_relation("everything"));
-        assert!(!valid_paper_relation(""));
+        let mut c = Config::default();
+        assert!(c.set_field("llm.paper_relation", "concept").is_ok());
+        assert!(c.set_field("llm.paper_relation", "note").is_ok());
+        assert!(c.set_field("llm.paper_relation", "full").is_ok());
+        assert!(c.set_field("llm.paper_relation", "everything").is_err());
+        assert!(c.set_field("llm.paper_relation", "").is_err());
     }
 
     /// 旧 config.toml 没有 context_scope 字段时应回落到默认 note。
@@ -423,11 +508,58 @@ mod tests {
 
     #[test]
     fn context_scope_validates_modes() {
-        assert!(valid_context_scope("block"));
-        assert!(valid_context_scope("note"));
-        assert!(valid_context_scope("full"));
-        assert!(!valid_context_scope("all"));
-        assert!(!valid_context_scope(""));
+        let mut c = Config::default();
+        assert!(c.set_field("llm.context_scope", "block").is_ok());
+        assert!(c.set_field("llm.context_scope", "note").is_ok());
+        assert!(c.set_field("llm.context_scope", "full").is_ok());
+        assert!(c.set_field("llm.context_scope", "all").is_err());
+        assert!(c.set_field("llm.context_scope", "").is_err());
+    }
+
+    #[test]
+    fn config_field_keys_unique_and_defaults_valid() {
+        let mut seen = std::collections::HashSet::new();
+        for f in CONFIG_FIELDS {
+            assert!(seen.insert(f.key), "重复键: {}", f.key);
+            // 默认值必须能被 set 接受
+            let mut c = Config::default();
+            assert!((f.set)(&mut c, f.default).is_ok(), "默认值非法: {} = {}", f.key, f.default);
+        }
+    }
+
+    #[test]
+    fn config_field_set_get_roundtrip() {
+        let mut c = Config::default();
+        c.set_field("llm.context_length", "12345").unwrap();
+        assert_eq!(c.get_field("llm.context_length").as_deref(), Some("12345"));
+        c.set_field("llm.thinking_mode", "true").unwrap();
+        assert_eq!(c.get_field("llm.thinking_mode").as_deref(), Some("true"));
+        c.set_field("budget.token_budget", "999").unwrap();
+        assert_eq!(c.get_field("budget.token_budget").as_deref(), Some("999"));
+        c.set_field("ui.undo", "").unwrap();
+        assert_eq!(c.get_field("ui.undo").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn config_field_unknown_key_errors() {
+        let mut c = Config::default();
+        assert!(c.set_field("llm.nope", "x").is_err());
+        assert!(c.get_field("llm.nope").is_none());
+    }
+
+    #[test]
+    fn normalize_resets_bad_enum_and_shortcut() {
+        let mut c = Config::default();
+        c.llm.paper_relation = "坏值".into();
+        c.ui.undo = "没有修饰键".into();
+        c.normalize();
+        assert_eq!(c.llm.paper_relation, "concept");
+        assert_eq!(c.ui.undo, "ctrl+z");
+        // 合法值不动
+        let mut c2 = Config::default();
+        c2.llm.context_scope = "full".into();
+        c2.normalize();
+        assert_eq!(c2.llm.context_scope, "full");
     }
 
     /// 旧 config.toml 没有 [ui] 节时应回落到默认快捷键。

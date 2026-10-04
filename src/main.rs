@@ -1,8 +1,10 @@
 //! 程序入口与命令行参数处理。
 //!
 //! 职责：
-//! - 组装依赖（配置、知识库、HTTP 客户端）并启动 REPL（`app::App`）
-//! - 解析三类命令行参数：
+//! - 组装依赖（配置、知识库、HTTP 客户端）并启动服务（`app::App`）
+//! - 无参数时默认启动 Web 界面（等价 `paperhelper web`，浏览器访问）
+//! - `web` 子命令：启动 Web 界面（`--port` / `--open` / `--port-file`）
+//! - 解析其余命令行参数（保留给脚本化调用）：
 //!   - `--completions`：输出 bash 补全脚本（`-s` 后补全会话编号）
 //!   - `-s <编号>`：按会话文件名精确/唯一前缀匹配，恢复会话后进入 REPL
 //!   - `-l`：列出所有会话（编号+标题）
@@ -25,7 +27,6 @@ mod presets;
 mod prompts;
 mod session;
 mod transfer;
-mod update;
 mod web;
 
 use anyhow::{anyhow, Result};
@@ -115,14 +116,19 @@ async fn main() -> Result<()> {
         return web::serve(app, port, open, port_file).await;
     }
 
+    // 无参数：默认启动 Web 界面（等价 `paperhelper web`，端口 8080）
+    if args.is_empty() {
+        return web::serve(app, 8080, false, None).await;
+    }
+
     // --version / -V：打印版本号后退出（供脚本与排查使用）
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("PaperHelper v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    // 仅 CLI 路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。
-    // 放在这里是为了让 web 模式不注册该 SIGINT 处理器，从而保留 Ctrl-C 终止进程的能力。
+    // 仅显式 CLI 参数路径安装 REPL 打断器（web 模式自行处理 Ctrl-C 退出，见 web::serve）。
+    // 无参数与 `web` 子命令都已在上方提前返回，故这里不会给 web 模式注册 SIGINT。
     interrupt::install();
 
     if !args.is_empty() {
@@ -194,7 +200,9 @@ async fn main() -> Result<()> {
         app.run_command(&args.join(" ")).await?;
         return Ok(());
     }
-    app.repl().await
+
+    // 空参数已在上方转为启动 Web，此处正常不可达。
+    Ok(())
 }
 
 /// 读取会话文件里的 session_name 字段。

@@ -426,6 +426,7 @@ mod tests {
         });
         remote_kb.concepts.push(Concept {
             name: "概念X".into(),
+            aliases: Vec::new(),
             definition: "定义".into(),
             paper_id: "p2".into(),
             paper_title: "论文2".into(),

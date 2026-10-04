@@ -34,6 +34,9 @@ pub struct Paper {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Concept {
     pub name: String,
+    /// 常见别名 / 英文缩写（模型可标注，如「语义熵 | Semantic Entropy」）；参与检索匹配。
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub definition: String,
     pub paper_id: String,
     pub paper_title: String,
@@ -125,13 +128,22 @@ impl KnowledgeBase {
             }
         }
         for c in &other.concepts {
-            if !self
+            match self
                 .concepts
-                .iter()
-                .any(|x| x.name == c.name && x.paper_id == c.paper_id)
+                .iter_mut()
+                .find(|x| x.name == c.name && x.paper_id == c.paper_id)
             {
-                self.concepts.push(c.clone());
-                counts.concepts_added += 1;
+                Some(existing) => {
+                    for a in &c.aliases {
+                        if !a.is_empty() && a != &existing.name && !existing.aliases.contains(a) {
+                            existing.aliases.push(a.clone());
+                        }
+                    }
+                }
+                None => {
+                    self.concepts.push(c.clone());
+                    counts.concepts_added += 1;
+                }
             }
         }
         for r in &other.relations {
@@ -158,14 +170,24 @@ impl KnowledgeBase {
     }
 
     /// 登记一个概念（按 name+paper_id 判重：不同论文可分别记录同名概念）。
-    pub fn add_concept(&mut self, c: Concept) {
-        if !self
+    /// 已存在同名同篇概念时，并集其别名（模型每次可能给出不同的别名）。
+    pub fn add_concept(&mut self, mut c: Concept) {
+        let mut seen = std::collections::HashSet::new();
+        c.aliases
+            .retain(|a| !a.is_empty() && a != &c.name && seen.insert(a.clone()));
+        if let Some(existing) = self
             .concepts
-            .iter()
-            .any(|x| x.name == c.name && x.paper_id == c.paper_id)
+            .iter_mut()
+            .find(|x| x.name == c.name && x.paper_id == c.paper_id)
         {
-            self.concepts.push(c);
+            for a in c.aliases {
+                if !existing.aliases.contains(&a) {
+                    existing.aliases.push(a);
+                }
+            }
+            return;
         }
+        self.concepts.push(c);
     }
 
     /// 概念名去重后的列表（保持首次出现顺序），作为知识图谱的节点集合。
@@ -231,27 +253,16 @@ impl KnowledgeBase {
         }
     }
 
-    /// 检索与查询相关的已学概念（关键词重叠打分，跨论文关联）。
+    /// 检索与查询相关的已学概念（字段加权 + IDF 打分，跨论文关联）。
     ///
-    /// 分词规则：英文/数字按非字母数字切分（保留 ≥2 字符的词）；连续汉字切成
-    /// 2-gram（单个汉字单独保留）——这样中文整句也能命中中文概念名/定义。
-    /// 匹配范围是「概念名 + 定义 + 来源论文标题」，因此提到某篇论文标题也能带出它的概念。
-    /// 取分最高的 5 条，返回带定义供 prompt 拼上下文。
+    /// 打分要点（避免「通用词命中定义」导致的误关联）：
+    /// - 停用词（中英文高频虚词/2-gram）先丢弃；
+    /// - 字段加权：概念名/别名 ×5、来源论文标题 ×2、定义 ×1；
+    /// - **必须命中名称/别名/标题**才入选（只命中定义不算，防止无关概念被带出）；
+    /// - IDF：命中超过半数概念的词权重归零（跨库通用词无区分度）；概念太少时跳过；
+    /// - 置顶概念轻微加权；最多取 3 条。
     pub fn search(&self, query: &str) -> Vec<&Concept> {
-        let terms = query_terms(query);
-        if terms.is_empty() {
-            return Vec::new();
-        }
-        let mut scored: Vec<(usize, &Concept)> = Vec::new();
-        for c in &self.concepts {
-            let hay = format!("{} {} {}", c.name, c.definition, c.paper_title).to_lowercase();
-            let score = terms.iter().map(|t| hay.matches(t.as_str()).count()).sum::<usize>();
-            if score > 0 {
-                scored.push((score, c));
-            }
-        }
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().take(5).map(|(_, c)| c).collect()
+        search_concepts(&self.concepts, query)
     }
 
     /// 提问中「被提及的已学论文」（论文关联增强用）：
@@ -294,7 +305,123 @@ fn normalize_for_match(s: &str) -> String {
         .collect()
 }
 
-/// 查询分词：英文/数字词（≥2 字符）+ 中文 2-gram（单汉字保留），去重。
+/// 检索通用停用词（中英文高频虚词/疑问词/指代 2-gram）。
+/// 命中这些词不参与打分——它们是「通用 2-gram 误关联」的主要来源。
+const STOPWORDS: &[&str] = &[
+    // 英文
+    "the", "and", "for", "are", "was", "were", "with", "that", "this", "from", "have", "has",
+    "had", "not", "but", "you", "your", "our", "their", "they", "them", "then", "than", "what",
+    "which", "who", "whom", "why", "how", "when", "where", "will", "would", "can", "could",
+    "should", "shall", "does", "did", "been", "being", "into", "about", "over", "under", "again",
+    "more", "most", "some", "such", "only", "also", "very", "much", "many", "any", "all", "each",
+    "both", "other", "its", "here", "there", "these", "those", "of", "to", "in", "is", "it", "on",
+    "at", "as", "be", "by", "or", "an", "if", "so", "no", "up", "we", "us", "my", "me", "he",
+    "she", "his", "her", "him",
+    // 中文 2-gram（疑问 / 指代 / 虚词）
+    "什么", "怎么", "怎样", "如何", "为何", "为什", "哪里", "哪个", "哪些", "这里", "这个",
+    "那个", "这些", "那些", "一下", "一个", "意思", "指的", "的是", "是否", "可以", "以及",
+    "还有", "并且", "所以", "因为", "但是", "如果", "就是", "我们", "你们", "他们", "它们",
+    "自己", "一般", "通常", "例如", "比如", "关于", "对于", "中的", "了的", "请问", "解释",
+    "说明", "知道", "觉得", "认为", "能够", "应该", "需要", "不用", "没有", "不是", "不能",
+    "不会", "有点", "一点",
+    // 中文单字（虚词/连接词：仅当被空格或英文隔成孤立单字时产生，按停用词丢弃，
+    // 避免「jal 和 jalr 有什么区别」里的「和」误命中含「和」的概念名）
+    "的", "了", "着", "过", "是", "在", "和", "与", "或", "及", "对", "把", "被", "给", "让",
+    "等", "就", "也", "都", "很", "更", "最", "会", "能", "要", "可", "之", "其", "而", "则",
+    "于", "以", "为", "从", "向", "到", "按", "这", "那", "我", "你", "他", "她", "它", "们",
+    "吗", "呢", "吧", "啊", "请",
+];
+
+fn is_stopword(t: &str) -> bool {
+    STOPWORDS.contains(&t)
+}
+
+/// 检索打分权重：名称/别名 ×5、来源论文标题 ×2、定义 ×1。
+const W_NAME: f64 = 5.0;
+const W_TITLE: f64 = 2.0;
+const W_DEF: f64 = 1.0;
+/// 单字段命中次数上限（同一词在定义里反复出现不应无限加分）。
+const MAX_FIELD_HITS: f64 = 3.0;
+/// 当选概念数 ≥ 此值时才启用 IDF（小库跳过，避免把唯一命中压没）。
+const IDF_MIN_DOCS: usize = 4;
+/// 入选的最低分（名称/标题必须命中，故有效命中通常 ≥2）。
+const MIN_SCORE: f64 = 1.0;
+/// 最多返回的概念条数。
+const MAX_RESULTS: usize = 3;
+/// 中文 n-gram 的最长长度（2-gram 太弱，3/4-gram 更具体、更能区分）。
+const MAX_GRAM: usize = 4;
+
+/// 单个检索词的权重：中文 n-gram 按其字符数（越长越具体）；英文整词按 4 计。
+fn term_weight(t: &str) -> f64 {
+    if t.chars().any(is_cjk) {
+        t.chars().count() as f64
+    } else {
+        4.0
+    }
+}
+
+/// 概念是否在任一字段包含检索词（判断文档频率 df 用）。
+fn concept_contains(c: &Concept, t: &str) -> bool {
+    c.name.to_lowercase().contains(t)
+        || c.aliases.iter().any(|a| a.to_lowercase().contains(t))
+        || c.paper_title.to_lowercase().contains(t)
+        || c.definition.to_lowercase().contains(t)
+}
+
+/// 在给定概念集合上做字段加权检索（知识库与「锁外快照」共用同一实现）。
+pub fn search_concepts<'a>(concepts: &'a [Concept], query: &str) -> Vec<&'a Concept> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let n = concepts.len();
+    // IDF：统计每个词的文档频率；命中超过半数概念的通用词权重归零。
+    let common: Vec<bool> = terms
+        .iter()
+        .map(|t| {
+            if n < IDF_MIN_DOCS {
+                return false;
+            }
+            let df = concepts.iter().filter(|c| concept_contains(c, t)).count();
+            df * 2 > n
+        })
+        .collect();
+
+    let mut scored: Vec<(f64, &Concept)> = Vec::new();
+    for c in concepts {
+        let name = c.name.to_lowercase();
+        let aliases = c.aliases.join(" ").to_lowercase();
+        let title = c.paper_title.to_lowercase();
+        let def = c.definition.to_lowercase();
+        let mut score = 0.0f64;
+        let mut strong = 0.0f64;
+        for (i, t) in terms.iter().enumerate() {
+            if common[i] {
+                continue;
+            }
+            let w = term_weight(t);
+            let na = (name.matches(t.as_str()).count() + aliases.matches(t.as_str()).count())
+                .min(MAX_FIELD_HITS as usize) as f64;
+            let ti = title.matches(t.as_str()).count().min(MAX_FIELD_HITS as usize) as f64;
+            let de = def.matches(t.as_str()).count().min(MAX_FIELD_HITS as usize) as f64;
+            score += w * (W_NAME * na + W_TITLE * ti + W_DEF * de);
+            // 名称/别名/标题命中才算「强命中」（只命中定义不足以入选）
+            strong += w * (W_NAME * na + W_TITLE * ti);
+        }
+        if strong <= 0.0 || score < MIN_SCORE {
+            continue;
+        }
+        if c.pinned {
+            score *= 1.1;
+        }
+        scored.push((score, c));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(MAX_RESULTS).map(|(_, c)| c).collect()
+}
+
+/// 查询分词：英文/数字词（≥2 字符，整词保留）+ 中文 2-4-gram（单汉字保留），
+/// 去停用词、去重。用更长的 n-gram 是因为 2-gram 区分度太低、易误关联。
 fn query_terms(query: &str) -> Vec<String> {
     fn flush_ascii(ascii: &mut String, terms: &mut Vec<String>) {
         if ascii.chars().count() >= 2 {
@@ -303,11 +430,14 @@ fn query_terms(query: &str) -> Vec<String> {
         ascii.clear();
     }
     fn flush_cjk(cjk: &mut Vec<char>, terms: &mut Vec<String>) {
-        if cjk.len() == 1 {
+        let len = cjk.len();
+        if len == 1 {
             terms.push(cjk[0].to_string());
         } else {
-            for w in cjk.windows(2) {
-                terms.push(format!("{}{}", w[0], w[1]));
+            for n in 2..=MAX_GRAM.min(len) {
+                for w in cjk.windows(n) {
+                    terms.push(w.iter().collect());
+                }
             }
         }
         cjk.clear();
@@ -341,6 +471,7 @@ fn query_terms(query: &str) -> Vec<String> {
     if !cjk.is_empty() {
         flush_cjk(&mut cjk, &mut terms);
     }
+    terms.retain(|t| !is_stopword(t));
     terms.sort();
     terms.dedup();
     terms
@@ -353,6 +484,7 @@ mod tests {
     fn concept(name: &str, paper: &str) -> Concept {
         Concept {
             name: name.to_string(),
+            aliases: Vec::new(),
             definition: format!("{name} 的定义"),
             paper_id: paper.to_string(),
             paper_title: paper.to_string(),
@@ -407,9 +539,14 @@ mod tests {
         }
     }
 
+    fn names(hits: &[&Concept]) -> Vec<String> {
+        hits.iter().map(|c| c.name.clone()).collect()
+    }
+
     fn concept_of(name: &str, def: &str, paper_id: &str, paper_title: &str) -> Concept {
         Concept {
             name: name.to_string(),
+            aliases: Vec::new(),
             definition: def.to_string(),
             paper_id: paper_id.to_string(),
             paper_title: paper_title.to_string(),
@@ -420,15 +557,102 @@ mod tests {
         }
     }
 
-    /// 中文整句也能切出 2-gram，英文词按 ≥2 字符保留。
+    /// 中文整句能切出 2-4-gram，英文词按 ≥2 字符整词保留，停用词被丢弃。
     #[test]
     fn query_terms_splits_cjk_and_ascii() {
         let terms = query_terms("Transformer 的注意力机制");
         assert!(terms.contains(&"transformer".to_string()), "{terms:?}");
-        assert!(terms.contains(&"注意".to_string()), "{terms:?}");
+        assert!(terms.contains(&"注意".to_string()), "应含 2-gram: {terms:?}");
         assert!(terms.contains(&"意力".to_string()), "{terms:?}");
         assert!(terms.contains(&"机制".to_string()), "{terms:?}");
+        assert!(
+            terms.contains(&"注意力机".to_string()),
+            "应含 4-gram（2-gram 区分度太低）: {terms:?}"
+        );
         assert!(!terms.contains(&"a".to_string()), "单字母英文词应丢弃");
+        let stop = query_terms("这是什么东西");
+        assert!(!stop.contains(&"什么".to_string()), "停用词应丢弃: {stop:?}");
+    }
+
+    /// 孤立单字虚词（如「和」）不应把含该字的概念误带出来。
+    #[test]
+    fn isolated_function_char_does_not_match() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept("生成问题的模型只会根据r_i和R生成问题", "p1"));
+        let hits = kb.search("jal 和 jalr 有什么区别");
+        assert!(hits.is_empty(), "单字虚词不应命中: {:?}", names(&hits));
+    }
+
+    /// 只命中「定义」的概念不入选（防止通用词把无关概念带出来）。
+    #[test]
+    fn search_ignores_definition_only_match() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept_of("自洽性检查", "用可靠性判断输出是否可信", "p1", "论文甲"));
+        let hits = kb.search("可靠性怎么保证");
+        assert!(hits.is_empty(), "仅定义命中不应入选: {:?}", names(&hits));
+    }
+
+    /// 别名参与「强命中」：问题里出现缩写也能命中概念。
+    #[test]
+    fn search_matches_alias() {
+        let mut kb = KnowledgeBase::default();
+        let mut c = concept_of("思维链", "让模型逐步推理的方法", "p1", "论文甲");
+        c.aliases = vec!["CoT".into(), "Chain of Thought".into()];
+        kb.add_concept(c);
+        let hits = kb.search("CoT 和普通提示有什么区别");
+        assert_eq!(hits.len(), 1, "别名命中应带出概念: {:?}", names(&hits));
+        assert_eq!(hits[0].name, "思维链");
+    }
+
+    /// 复现误关联场景：纯指代性提问不应带出无关概念。
+    #[test]
+    fn search_generic_question_no_false_positive() {
+        let mut kb = KnowledgeBase::default();
+        kb.add_concept(concept_of("自检生成", "检测模型是否编造事实的框架", "p1", "论文甲"));
+        kb.add_concept(concept_of("语义熵", "衡量语言模型输出不确定性的指标", "p2", "论文乙"));
+        let hits = kb.search("这里的 CoT 指的是什么");
+        assert!(hits.is_empty(), "不应误关联: {:?}", names(&hits));
+    }
+
+    /// 命中超过半数概念的通用词被 IDF 压掉（概念足够多时）。
+    #[test]
+    fn search_idf_downs_common_terms() {
+        let mut kb = KnowledgeBase::default();
+        for i in 0..5 {
+            kb.add_concept(concept_of(&format!("模型{i}"), "一种模型的定义", "p1", "论文甲"));
+        }
+        let hits = kb.search("模型");
+        assert!(hits.is_empty(), "通用词应被 IDF 压掉: {:?}", names(&hits));
+        // 概念太少（<4）时不启用 IDF，仍可正常命中
+        let mut tiny = KnowledgeBase::default();
+        tiny.add_concept(concept_of("模型", "一种模型的定义", "p1", "论文甲"));
+        assert_eq!(tiny.search("模型").len(), 1);
+    }
+
+    /// 最多返回 3 条。
+    #[test]
+    fn search_caps_results_at_three() {
+        let mut kb = KnowledgeBase::default();
+        for i in 0..5 {
+            kb.add_concept(concept_of(&format!("注意力机制{i}"), "定义", "p1", "论文甲"));
+        }
+        let hits = kb.search("注意力机制");
+        assert!(hits.len() <= 3, "最多 3 条，实得 {}", hits.len());
+    }
+
+    /// 同名同篇概念重复入库时并集别名（去重、剔除空值与名称本身）。
+    #[test]
+    fn add_concept_merges_aliases() {
+        let mut kb = KnowledgeBase::default();
+        let mk = |aliases: Vec<&str>| {
+            let mut c = concept_of("思维链", "定义", "p1", "论文甲");
+            c.aliases = aliases.into_iter().map(String::from).collect();
+            c
+        };
+        kb.add_concept(mk(vec!["CoT", "思维链"]));
+        kb.add_concept(mk(vec!["CoT", "", "Chain of Thought"]));
+        assert_eq!(kb.concepts.len(), 1, "同名同篇应合并");
+        assert_eq!(kb.concepts[0].aliases, vec!["CoT", "Chain of Thought"]);
     }
 
     /// 中文整句提问能命中中文概念名/定义（旧版按空格分词时命中不了）。

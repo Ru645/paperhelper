@@ -441,6 +441,24 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 }
 .settings-tab.active { background: var(--blue-light); color: var(--blue); border-color: var(--blue); font-weight: 600; }
 .settings-pane.hidden { display: none; }
+.settings-group-title { font-weight: 600; font-size: 13px; color: #333; margin: 16px 0 8px; }
+.settings-group-title:first-child { margin-top: 0; }
+.help-wrap { position: relative; display: inline-flex; vertical-align: middle; margin-left: 4px; }
+.help-dot {
+  width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--line);
+  background: #f2f3f5; color: #666; font-size: 11px; line-height: 13px;
+  text-align: center; cursor: help; user-select: none;
+}
+.help-dot:hover, .help-dot:focus { background: var(--blue-light); color: var(--blue); border-color: var(--blue); outline: none; }
+.help-tip {
+  position: absolute; left: calc(100% + 6px); top: 50%; transform: translateY(-50%);
+  width: max-content; max-width: 280px; background: #fff; color: #444;
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+  font-size: 12px; line-height: 1.5; font-weight: 400; white-space: normal;
+  box-shadow: 0 4px 16px rgba(0,0,0,.12); opacity: 0; visibility: hidden;
+  transition: opacity .12s ease; z-index: 80; pointer-events: none;
+}
+.help-wrap:hover .help-tip, .help-dot:focus + .help-tip { opacity: 1; visibility: visible; }
 
 /* 风格管理：左列表 + 右编辑 */
 .styles-layout { display: flex; gap: 14px; align-items: stretch; }
@@ -640,7 +658,8 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 }
 .ann-input textarea:focus { outline: none; border-color: var(--blue); }
 /* 按钮都放底边：ask 靠左，发送靠右，宽度全让给输入框 */
-.ann-input-row { display: flex; align-items: center; gap: 6px; }
+/* 放不下时换行，避免新增开关挤压按钮/输入区 */
+.ann-input-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ann-opt {
   display: flex; align-items: center; gap: 4px; font-size: 12px;
   color: #666; cursor: pointer; user-select: none; white-space: nowrap;
@@ -902,17 +921,8 @@ ul.outline li.para { color: #888; font-size: 12px; }
   vertical-align: 1px; cursor: pointer;
 }
 
-/* 顶栏「发现新版本」提示 + 更新弹窗 */
-.update-pill { color: var(--ok); border-color: var(--ok); font-weight: 600; }
-.update-pill.hidden { display: none; }
-.update-body { font-size: 13.5px; color: #333; line-height: 1.8; margin-bottom: 4px; }
-.update-body a { color: var(--blue); }
-.update-body .muted { font-size: 12.5px; }
-.dl-progress { margin: 12px 0 2px; }
-.dl-bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
-.dl-fill { height: 100%; width: 0; border-radius: 4px; background: var(--blue); transition: width .3s; }
-.dl-text { margin: 6px 0 0; font-size: 12px; }
-.update-row {
+/* 设置页底部版本行 */
+.settings-version-row {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   margin-top: 14px; padding-top: 10px; border-top: 1px solid #eee;
 }

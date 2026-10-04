@@ -12,7 +12,6 @@
   <div class="model" id="model"></div>
   <div class="actions">
     <input type="file" id="file-input" accept=".pdf,.txt,.md,.markdown,.html,.htm" hidden>
-    <button id="btn-update" class="ghost update-pill hidden" title="发现新版本，点击查看">发现新版本</button>
     <div class="dropdown">
       <button id="btn-export" class="ghost">导出 ▾</button>
       <div id="export-menu" class="dropdown-menu hidden">
@@ -206,6 +205,9 @@
           <label class="ann-opt" title="把模型标注的知识点写入「已学概念」；纯操作性问题可取消勾选">
             <input type="checkbox" id="ann-record" checked> 记概念
           </label>
+          <label class="ann-opt" title="本次提问是否关联已学知识（相关概念 / 关联论文 / 概念检索代理）；觉得关联内容干扰回答时取消勾选">
+            <input type="checkbox" id="ann-concept" checked> 关联概念
+          </label>
           <button id="ann-attach" class="mini ghost" title="添加附件（图片 / txt / md / PDF）：点击选择，也可直接粘贴或拖进输入框；随本次提问发送，不写入历史">📎 附件</button>
           <input type="file" id="ann-file" class="hidden" multiple accept="image/*,.txt,.md,.markdown,.pdf" />
           <span class="ann-input-spacer"></span>
@@ -312,30 +314,7 @@
     </div>
 
     <div id="settings-model" class="settings-pane">
-      <label>API Endpoint<input id="cfg-endpoint" placeholder="https://api.deepseek.com/v1/chat/completions"></label>
-      <label>API Key<input id="cfg-key" placeholder="留空则不修改（当前：—）"></label>
-      <label>模型<input id="cfg-model" placeholder="deepseek-v4-pro"></label>
-      <label>上下文长度（token）<input id="cfg-context" type="number"></label>
-      <label class="check"><input id="cfg-thinking" type="checkbox"> 思考模式</label>
-      <label>输入单价 / 1M token<input id="cfg-inprice" type="number" step="0.01"></label>
-      <label>输出单价 / 1M token<input id="cfg-outprice" type="number" step="0.01"></label>
-      <label>Token 预算（0=不限）<input id="cfg-budget" type="number"></label>
-      <label>论文关联增强
-        <select id="cfg-paper-relation">
-          <option value="concept">仅相关概念（默认，最省 token）</option>
-          <option value="note">相关概念 + 关联论文笔记</option>
-          <option value="full">相关概念 + 关联论文原文与笔记</option>
-        </select>
-      </label>
-      <p class="muted">开启后，提问提到你学过的另一篇论文时，会把它的内容一并发给模型。选 note / full 会明显增加每次提问的 token 消耗与费用。</p>
-      <label>提问上下文
-        <select id="cfg-context-scope">
-          <option value="block">仅选中段落（最省 token）</option>
-          <option value="note">整篇笔记（默认）</option>
-          <option value="full">整篇笔记 + 论文原文（最全，最费 token）</option>
-        </select>
-      </label>
-      <p class="muted">提问时给模型的笔记范围：最低只发选中文字所在的段落（右键小标题则发其整节），中档发整篇笔记，最高档再附上论文原文。档位越高，回答依据越全但 token 消耗越大。</p>
+      <div id="cfg-fields"></div>
       <div id="cfg-test-bar" class="mini-bar hidden"><div class="mini-bar-fill"></div></div>
       <div id="cfg-test-result" class="test-result hidden"></div>
       <p id="cfg-status" class="status"></p>
@@ -344,9 +323,8 @@
         <button id="btn-config-test-stop" class="ghost hidden">停止</button>
         <button id="btn-config-save" class="primary">保存</button>
       </div>
-      <div class="update-row">
+      <div class="settings-version-row">
         <span class="muted" id="cfg-version">当前版本 —</span>
-        <button id="btn-update-check" class="mini ghost">检查更新</button>
       </div>
     </div>
 
@@ -407,7 +385,7 @@
       <li><b>编辑笔记</b>：悬停标题/段落 → 点「✎ 编辑」。编辑**章节**时会带出该节标题与全部内容；可手动改、或让 AI 重写 / 补充，也可插入内容、删除整块。编辑**主标题**时多一个「按风格重写全文」：选一种笔记风格（可加额外要求）让 AI 重写整篇（会重建块 id、清空批注，可用「撤销」恢复）。</li>
       <li><b>选中提问</b>：在笔记里选中一段文字 → 点浮出的「提问」→ 小窗口内输入问题（回答写进笔记对应位置）。选中公式会把它在 KaTeX 里的原始 LaTeX 交给模型；多行输入用 Shift+回车换行、回车发送。</li>
       <li><b>章节提问</b>：右键笔记里的标题（h1=全文，h2/h3=小节）→「对本章节提问」。</li>
-      <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。选区不会被清掉，输入框上方还有「引用」附件条显示这次问的是哪一段；「记概念」勾选框可决定是否把知识点写进「已学概念」。</li>
+      <li><b>回答里追问</b>：在批注小窗口的回答里选中文字 → 浮出「提问」→ 新问答挂在该回答下，选中文字持久高亮，点高亮可回看。选区不会被清掉，输入框上方还有「引用」附件条显示这次问的是哪一段；「记概念」勾选框可决定是否把知识点写进「已学概念」；「关联概念」可决定本次是否关联已学知识（相关概念 / 关联论文），觉得关联内容干扰回答时可取消。</li>
       <li><b>打开批注</b>：点击黄色高亮文字（或标题）重新打开小窗口。</li>
       <li><b>批注操作</b>：小窗口内节点左键跳转、右键删除/总结；右键高亮文字可删除整条批注。小窗口可拖动标题栏移动，<b>四条边 + 四个角</b>都能拖拽缩放（尺寸记忆、无上限；双击把手恢复默认），输入栏在底部、可拖上缘调整高度，「思考过程」区也可拖下缘调高度。</li>
       <li><b>进度与思考</b>：等待模型时显示上下文规模与计时；推理模型的思考过程会流式显示在「思考过程」折叠区。</li>
@@ -420,22 +398,6 @@
       <li><b>快捷键</b>：<b>Ctrl+B</b> 左侧栏 / <b>Ctrl+,</b> 设置 / <b>Ctrl+Alt+B</b> 右侧提问栏 / <b>Ctrl+Alt+T</b> 对话树 / <b>Ctrl+.</b> 停止任务 / <b>Ctrl+Z</b> 撤销。都可在「设置 → 界面」里改键、清除（不启用）或恢复默认；Esc（关闭弹窗 / 取消选择）固定不可改。</li>
     </ul>
     <div class="modal-actions"><button id="btn-help-close" class="primary">知道了</button></div>
-  </div>
-</div>
-
-<!-- 软件更新：发现新版本后从顶栏提示打开；桌面安装版可一键更新 -->
-<div id="update-modal" class="modal hidden">
-  <div class="modal-box">
-    <h2 id="update-title">软件更新</h2>
-    <div id="update-body" class="update-body"></div>
-    <p id="update-status" class="status"></p>
-    <div class="modal-actions">
-      <button id="btn-update-skip" class="ghost">跳过此版本</button>
-      <button id="btn-update-manual" class="ghost">手动下载</button>
-      <button id="btn-update-apply" class="primary hidden">立即更新</button>
-      <button id="btn-update-cancel" class="ghost hidden">取消下载</button>
-      <button id="btn-update-close" class="ghost">关闭</button>
-    </div>
   </div>
 </div>
 

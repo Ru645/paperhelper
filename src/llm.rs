@@ -36,7 +36,19 @@ pub fn is_interrupted_error(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<Interrupted>().is_some())
 }
 
-/// 一次对话消息（OpenAI roles: system / user / assistant）。
+/// 模型请求调用的一次工具（OpenAI function tool）。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// 工具参数（JSON 字符串，流式分片累积而来）。
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// 一次对话消息（OpenAI roles: system / user / assistant / tool）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: String,
@@ -45,6 +57,12 @@ pub struct Message {
     /// 仅用于「PDF 页面提问」等在途请求，**不写入会话历史**；为空时按纯文本发送。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// assistant 消息里的工具调用（工具调用链路用；普通对话为空）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// role=tool 消息对应的调用 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -54,6 +72,8 @@ impl Message {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -109,6 +129,27 @@ struct Delta {
     /// 部分推理模型（如 DeepSeek/paratera）在流里单独回传思考过程。
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// 工具调用分片（OpenAI 流式：id/name 只在首帧，arguments 逐帧累积）。
+    #[serde(default)]
+    tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Deserialize)]
+struct DeltaToolCall {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaFunction>,
+}
+
+#[derive(Deserialize)]
+struct DeltaFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +160,23 @@ struct Usage {
 
 /// 单条消息 → OpenAI JSON。带图片时 `content` 用多模态数组（text + image_url）。
 fn message_json(m: &Message) -> serde_json::Value {
+    if let Some(id) = &m.tool_call_id {
+        return json!({ "role": m.role, "content": m.content, "tool_call_id": id });
+    }
+    if !m.tool_calls.is_empty() {
+        let calls: Vec<serde_json::Value> = m
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments },
+                })
+            })
+            .collect();
+        return json!({ "role": m.role, "content": m.content, "tool_calls": calls });
+    }
     if m.images.is_empty() {
         json!({ "role": m.role, "content": m.content })
     } else {
@@ -136,6 +194,7 @@ fn build_body(
     json_mode: bool,
     thinking: bool,
     extras: bool,
+    tools: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let msgs: Vec<serde_json::Value> = messages.iter().map(message_json).collect();
     let mut body = json!({
@@ -150,6 +209,10 @@ fn build_body(
         }
         if thinking {
             body["reasoning_effort"] = json!("medium");
+        }
+        if let Some(t) = tools {
+            body["tools"] = json!([t.clone()]);
+            body["tool_choice"] = json!("auto");
         }
     }
     body
@@ -356,6 +419,7 @@ fn handle_stream_line<F: FnMut(&str)>(
     content: &mut String,
     on_token: &mut F,
     on_reasoning: &mut Option<&mut (dyn FnMut(&str) + Send)>,
+    tool_calls: &mut Vec<ToolCall>,
 ) {
     if line.is_empty() {
         return;
@@ -391,8 +455,103 @@ fn handle_stream_line<F: FnMut(&str)>(
                     content.push_str(&t);
                 }
             }
+            for tc in d.tool_calls {
+                while tool_calls.len() <= tc.index {
+                    tool_calls.push(ToolCall::default());
+                }
+                let slot = &mut tool_calls[tc.index];
+                if let Some(id) = tc.id {
+                    if !id.is_empty() {
+                        slot.id = id;
+                    }
+                }
+                if let Some(f) = tc.function {
+                    if let Some(n) = f.name {
+                        if !n.is_empty() {
+                            slot.name = n;
+                        }
+                    }
+                    if let Some(a) = f.arguments {
+                        slot.arguments.push_str(&a);
+                    }
+                }
+            }
         }
     }
+}
+
+/// 读取一次流式响应：回调 token/思考分片，累积正文与工具调用，解析 usage。
+async fn read_stream(
+    resp: reqwest::Response,
+    messages: &[Message],
+    on_token: &mut impl FnMut(&str),
+    on_reasoning: &mut Option<&mut (dyn FnMut(&str) + Send)>,
+) -> Result<(LlmResult, Vec<ToolCall>)> {
+    let mut content = String::new();
+    let mut usage: Option<Usage> = None;
+    let mut finish_reason: Option<String> = None;
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut buf = LineBuffer::default();
+    let mut stream = resp.bytes_stream();
+    loop {
+        if interrupt::is_interrupted() {
+            bail!(Interrupted);
+        }
+        // 与打断信号竞争：服务端挂起不吐 token 时也能立即中止
+        let next = tokio::select! {
+            item = stream.next() => item,
+            _ = interrupt::wait() => bail!(Interrupted),
+        };
+        let Some(item) = next else { break };
+        let bytes = item.context("读取响应流失败（连接可能被中断）")?;
+        for line in buf.push(&bytes) {
+            handle_stream_line(
+                &line,
+                &mut usage,
+                &mut finish_reason,
+                &mut content,
+                on_token,
+                on_reasoning,
+                &mut tool_calls,
+            );
+        }
+    }
+    // 个别服务端最后一帧不带换行，收尾时补处理
+    if let Some(line) = buf.finish() {
+        handle_stream_line(
+            &line,
+            &mut usage,
+            &mut finish_reason,
+            &mut content,
+            on_token,
+            on_reasoning,
+            &mut tool_calls,
+        );
+    }
+
+    let (in_tok, out_tok, estimated) = if let Some(u) = usage {
+        (
+            u.prompt_tokens.unwrap_or(0),
+            u.completion_tokens.unwrap_or(0),
+            false,
+        )
+    } else {
+        (
+            estimate_input_tokens(messages),
+            estimate_tokens(&content),
+            true,
+        )
+    };
+    Ok((
+        LlmResult {
+            content,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            estimated,
+            finish_reason,
+        },
+        tool_calls,
+    ))
 }
 
 pub async fn chat(
@@ -414,7 +573,12 @@ pub async fn chat(
         json_mode
     ));
 
-    let mut resp = post_with_retry(client, cfg, build_body(cfg, messages, json_mode, thinking, true)).await?;
+    let mut resp = post_with_retry(
+        client,
+        cfg,
+        build_body(cfg, messages, json_mode, thinking, true, None),
+    )
+    .await?;
 
     // 兼容本地模型：若服务端不认 stream_options / response_format / reasoning_effort
     // (返回 400/422)，则去掉这些字段重试一次。
@@ -424,7 +588,12 @@ pub async fn chat(
             "LLM 返回 {}，去掉扩展字段（stream_options/response_format/reasoning_effort）重试一次",
             resp.status()
         ));
-        resp = post_with_retry(client, cfg, build_body(cfg, messages, json_mode, thinking, false)).await?;
+        resp = post_with_retry(
+            client,
+            cfg,
+            build_body(cfg, messages, json_mode, thinking, false, None),
+        )
+        .await?;
     }
 
     if !resp.status().is_success() {
@@ -435,77 +604,101 @@ pub async fn chat(
         return Err(err);
     }
 
-    let mut content = String::new();
-    let mut usage: Option<Usage> = None;
-    let mut finish_reason: Option<String> = None;
-    let mut buf = LineBuffer::default();
     let mut on_reasoning = on_reasoning;
-    let mut stream = resp.bytes_stream();
-    loop {
-        if interrupt::is_interrupted() {
-            bail!(Interrupted);
-        }
-        // 与打断信号竞争：服务端挂起不吐 token 时也能立即中止
-        let next = tokio::select! {
-            item = stream.next() => item,
-            _ = interrupt::wait() => bail!(Interrupted),
-        };
-        let Some(item) = next else { break };
-        let bytes = item.context("读取响应流失败（连接可能被中断）")?;
-        for line in buf.push(&bytes) {
-            handle_stream_line(
-                &line,
-                &mut usage,
-                &mut finish_reason,
-                &mut content,
-                on_token,
-                &mut on_reasoning,
-            );
-        }
-    }
-    // 个别服务端最后一帧不带换行，收尾时补处理
-    if let Some(line) = buf.finish() {
-        handle_stream_line(
-            &line,
-            &mut usage,
-            &mut finish_reason,
-            &mut content,
-            on_token,
-            &mut on_reasoning,
-        );
-    }
-
-    let (in_tok, out_tok, estimated) = if let Some(u) = usage {
-        (
-            u.prompt_tokens.unwrap_or(0),
-            u.completion_tokens.unwrap_or(0),
-            false,
-        )
-    } else {
-        (
-            estimate_input_tokens(messages),
-            estimate_tokens(&content),
-            true,
-        )
-    };
-
+    let (res, _) = read_stream(resp, messages, on_token, &mut on_reasoning).await?;
     logging::info(format!(
         "LLM 完成 ← {} | model={} | 用时 {:.1}s | in={} out={} estimated={}",
         cfg.api_endpoint,
         cfg.model,
         started.elapsed().as_secs_f64(),
-        in_tok,
-        out_tok,
-        estimated
+        res.input_tokens,
+        res.output_tokens,
+        res.estimated
     ));
+    Ok(res)
+}
 
-    Ok(LlmResult {
-        content,
-        input_tokens: in_tok,
-        output_tokens: out_tok,
+/// 带工具的对话：模型可调用 `tool`，`execute` 把工具参数（JSON 字符串）落地为结果文本，
+/// 回填后继续对话，最多 `MAX_TOOL_ROUNDS` 轮，返回最终 assistant 结果（token 已累加）。
+///
+/// 返回 `Ok(None)` 表示**服务端不支持工具调用**（首个请求返回 400/422），
+/// 调用方应降级到不带工具的方案；其它错误按 `Err` 返回。
+#[allow(clippy::too_many_arguments)]
+pub async fn chat_with_tools(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    messages: &[Message],
+    tool: &serde_json::Value,
+    thinking: bool,
+    on_token: &mut impl FnMut(&str),
+    on_reasoning: Option<&mut (dyn FnMut(&str) + Send)>,
+    execute: &mut (dyn FnMut(&str) -> String + Send),
+) -> Result<Option<LlmResult>> {
+    const MAX_TOOL_ROUNDS: usize = 3;
+    let mut msgs = messages.to_vec();
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+    let mut estimated = false;
+    let mut on_reasoning = on_reasoning;
+    logging::info(format!("工具调用：开始（最多 {MAX_TOOL_ROUNDS} 轮）"));
+    for round in 1..=MAX_TOOL_ROUNDS {
+        let body = build_body(cfg, &msgs, false, thinking, true, Some(tool));
+        let resp = post_with_retry(client, cfg, body).await?;
+        if resp.status() == StatusCode::BAD_REQUEST
+            || resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+        {
+            logging::warn("服务端不支持工具调用（400/422），降级为不带工具的方案");
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let st = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            let err = friendly_http_error(st, &txt, cfg);
+            logging::error(format!("LLM 工具调用失败 | model={} | {err:#}", cfg.model));
+            return Err(err);
+        }
+        let (res, calls) = read_stream(resp, &msgs, on_token, &mut on_reasoning).await?;
+        total_in += res.input_tokens;
+        total_out += res.output_tokens;
+        estimated |= res.estimated;
+        if calls.is_empty() {
+            logging::info(format!("工具调用：第 {round} 轮模型未再请求工具，结束"));
+            return Ok(Some(LlmResult {
+                input_tokens: total_in,
+                output_tokens: total_out,
+                estimated,
+                ..res
+            }));
+        }
+        let summary = calls
+            .iter()
+            .map(|c| {
+                let a: String = c.arguments.chars().take(200).collect();
+                format!("{}({a})", c.name)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        logging::info(format!(
+            "工具调用：第 {round} 轮收到 {} 个调用：{summary}",
+            calls.len()
+        ));
+        let mut assistant = Message::text("assistant", res.content.clone());
+        assistant.tool_calls = calls.clone();
+        msgs.push(assistant);
+        for c in &calls {
+            let out = execute(&c.arguments);
+            let mut tool_msg = Message::text("tool", out);
+            tool_msg.tool_call_id = Some(c.id.clone());
+            msgs.push(tool_msg);
+        }
+    }
+    logging::warn(format!("工具调用：达到最大轮数 {MAX_TOOL_ROUNDS}，返回当前结果"));
+    Ok(Some(LlmResult {
+        input_tokens: total_in,
+        output_tokens: total_out,
         estimated,
-        finish_reason,
-    })
+        ..Default::default()
+    }))
 }
 
 /// 一次 LLM 配置连通性测试的结果（Web/CLI 共用）。
@@ -718,6 +911,7 @@ mod tests {
         let mut content = String::new();
         let mut tokens = String::new();
         let mut reasoning = String::new();
+        let mut tool_calls = Vec::new();
         let mut on_token = |t: &str| tokens.push_str(t);
         let mut on_reasoning = |r: &str| reasoning.push_str(r);
         let mut on_reasoning_opt: Option<&mut (dyn FnMut(&str) + Send)> = Some(&mut on_reasoning);
@@ -731,6 +925,7 @@ mod tests {
                     &mut content,
                     &mut on_token,
                     &mut on_reasoning_opt,
+                    &mut tool_calls,
                 );
             }
         }
@@ -744,6 +939,7 @@ mod tests {
                 &mut content,
                 &mut on_token,
                 &mut on_reasoning_opt,
+                &mut tool_calls,
             );
         }
         if let Some(line) = buf.finish() {
@@ -754,6 +950,7 @@ mod tests {
                 &mut content,
                 &mut on_token,
                 &mut on_reasoning_opt,
+                &mut tool_calls,
             );
         }
 
@@ -765,5 +962,71 @@ mod tests {
         assert_eq!(u.prompt_tokens, Some(12));
         assert_eq!(u.completion_tokens, Some(34));
         assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn stream_accumulates_tool_calls_by_index() {
+        // id/name 只在首帧，arguments 跨帧拼接（模拟真实 OpenAI 流式）
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search_concepts\",\"arguments\":\"{\\\"que\"}}]},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ry\\\":\\\"注意力\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: [DONE]\n"
+        );
+        let mut usage = None;
+        let mut finish_reason = None;
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut on_token = |_: &str| {};
+        let mut on_reasoning: Option<&mut (dyn FnMut(&str) + Send)> = None;
+        let mut buf = LineBuffer::default();
+        for line in buf.push(raw.as_bytes()) {
+            handle_stream_line(
+                &line,
+                &mut usage,
+                &mut finish_reason,
+                &mut content,
+                &mut on_token,
+                &mut on_reasoning,
+                &mut tool_calls,
+            );
+        }
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "search_concepts");
+        assert_eq!(tool_calls[0].arguments, "{\"query\":\"注意力\"}");
+        assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn message_json_serializes_tool_calls_and_tool_result() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "search_concepts".into(),
+            arguments: "{\"query\":\"x\"}".into(),
+        };
+        let mut assistant = Message::text("assistant", "");
+        assistant.tool_calls = vec![call.clone()];
+        let v = message_json(&assistant);
+        assert_eq!(v["tool_calls"][0]["id"], "call_1");
+        assert_eq!(v["tool_calls"][0]["type"], "function");
+        assert_eq!(v["tool_calls"][0]["function"]["name"], "search_concepts");
+
+        let mut tool_msg = Message::text("tool", "结果");
+        tool_msg.tool_call_id = Some("call_1".into());
+        let v2 = message_json(&tool_msg);
+        assert_eq!(v2["role"], "tool");
+        assert_eq!(v2["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn build_body_includes_tools_only_with_extras() {
+        let cfg = test_cfg();
+        let msgs = vec![Message::text("user", "hi")];
+        let tool = json!({ "type": "function", "function": { "name": "f" } });
+        let with = build_body(&cfg, &msgs, false, false, true, Some(&tool));
+        assert_eq!(with["tools"][0]["function"]["name"], "f");
+        assert_eq!(with["tool_choice"], "auto");
+        let without = build_body(&cfg, &msgs, false, false, false, Some(&tool));
+        assert!(without.get("tools").is_none());
     }
 }

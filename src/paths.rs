@@ -6,9 +6,9 @@
 //! - `sessions/<编号>.json`：会话存档，编号 = 首次保存的时间戳（如 20260909_021633），
 //!   作为 `-s` 的恢复参数；list_sessions 返回排序后的编号列表
 //!
-//! 数据目录默认是当前工作目录的 `.paperhelper/`；打包版启动器会设置
-//! `PAPERHELPER_DATA_DIR=%USERPROFILE%\PaperHelper\.paperhelper`（用户目录，换
-//! 工作目录也不会"丢"笔记），环境变量支持绝对路径或 `~` 开头。
+//! 数据目录默认是当前工作目录的 `.paperhelper/`；可用 `PAPERHELPER_DATA_DIR`
+//! 指向固定位置（如 `~/PaperHelper/.paperhelper`），换工作目录也不会"丢"笔记；
+//! 环境变量支持绝对路径或 `~` 开头。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,11 +80,6 @@ pub fn knowledge_path_in(dir: &Path) -> PathBuf {
 /// 指定数据目录下的置顶文件（迁移/测试用）。
 pub fn pins_path_in(dir: &Path) -> PathBuf {
     dir.join("pins.json")
-}
-
-/// 更新检查状态文件（`.paperhelper/update_state.json`）。
-pub fn update_state_path() -> PathBuf {
-    data_dir().join("update_state.json")
 }
 
 /// 上传文件目录（Web 端导入 PDF 等）。

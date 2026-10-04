@@ -33,7 +33,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::app::{App, ExtraInput};
 use crate::interrupt;
 use crate::output::{Emitter, Event as OutEvent};
-use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer, update};
+use crate::{export, knowledge, llm, logging, notes, paths, pdf, session, transfer};
 
 type SharedApp = Arc<Mutex<App>>;
 
@@ -69,11 +69,6 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/export", get(api_export))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/config/test", post(api_config_test))
-        .route("/api/update/check", get(api_update_check))
-        .route("/api/update/skip", post(api_update_skip))
-        .route("/api/update/status", get(api_update_status))
-        .route("/api/update/download", post(api_update_download))
-        .route("/api/update/apply", post(api_update_apply))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/load", post(api_session_load))
         .route("/api/sessions/save", post(api_session_save))
@@ -876,9 +871,7 @@ fn build_state(a: &App) -> serde_json::Value {
             .unwrap_or_default(),
         "session_id": a.session.session_id,
         "export_path": a.export_path,
-        "version": update::current_version(),
-        "desktop": update::is_desktop(),
-        "installed": update::is_installed(),
+        "version": env!("CARGO_PKG_VERSION"),
         "current": a.session.conversation.current_label(),
         "current_input_tokens": current_input_tokens,
         "context_length": a.config.llm.context_length,
@@ -1026,83 +1019,6 @@ async fn install_pymupdf(emitter: &Emitter) -> anyhow::Result<()> {
              可用 PAPERHELPER_PYTHON 指定解释器路径后重试"
         )),
     }
-}
-
-// ===== 版本更新 =====
-
-#[derive(Deserialize)]
-struct UpdateCheckQuery {
-    /// 带 force 参数（任意值）= 手动检查，跳过 24h 节流。
-    #[serde(default)]
-    force: Option<String>,
-}
-
-/// `GET /api/update/check[?force=1]`：检查新版本（自动检查走节流、失败静默）。
-async fn api_update_check(
-    State(app): State<SharedApp>,
-    Query(q): Query<UpdateCheckQuery>,
-) -> Json<serde_json::Value> {
-    let (client, cfg) = {
-        let a = app.lock().await;
-        (a.client.clone(), a.config.update.clone())
-    };
-    let force = q.force.is_some();
-    if !force && !cfg.auto_check {
-        return Json(json!({
-            "ok": true,
-            "disabled": true,
-            "current": update::current_version(),
-        }));
-    }
-    let status = update::check(&client, &cfg, force).await;
-    let mut v = serde_json::to_value(&status).unwrap_or_default();
-    v["desktop"] = json!(update::is_desktop());
-    v["installed"] = json!(update::is_installed());
-    v["auto_install"] = json!(update::is_desktop()
-        && update::is_installed()
-        && !status.setup_url.is_empty());
-    Json(v)
-}
-
-#[derive(Deserialize)]
-struct UpdateSkipReq {
-    version: String,
-}
-
-/// `POST /api/update/skip`：跳过某版本，不再主动提示（手动检查仍能看到）。
-async fn api_update_skip(
-    Json(req): Json<UpdateSkipReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    update::skip(&req.version)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(Json(json!({ "ok": true })))
-}
-
-/// `GET /api/update/status`：安装包下载/安装进度（前端轮询）。
-async fn api_update_status() -> Json<serde_json::Value> {
-    Json(serde_json::to_value(update::download_status()).unwrap_or_default())
-}
-
-/// `POST /api/update/download`：后台下载安装包（进度见 status；重复请求不重开任务）。
-async fn api_update_download(State(app): State<SharedApp>) -> Json<serde_json::Value> {
-    let (client, cfg) = {
-        let a = app.lock().await;
-        (a.client.clone(), a.config.update.clone())
-    };
-    let phase = update::download_status().phase;
-    if phase == "downloading" || phase == "verifying" {
-        return Json(json!({ "ok": true, "phase": phase }));
-    }
-    tokio::spawn(async move {
-        let _ = update::download_setup(&client, &cfg).await;
-    });
-    Json(json!({ "ok": true, "phase": "downloading" }))
-}
-
-/// `POST /api/update/apply`：通知桌面壳退出并静默安装（仅桌面安装版）。
-async fn api_update_apply() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    update::apply_update().map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(Json(json!({ "ok": true })))
 }
 
 /// 服务商预设（先启向导卡片；与 CLI `config presets` 同一份数据）。
@@ -1628,31 +1544,50 @@ fn pct_encode(s: &str) -> String {
 
 async fn api_config_get(State(app): State<SharedApp>) -> Json<serde_json::Value> {
     let a = app.lock().await;
+    let mut fields = Vec::with_capacity(crate::config::CONFIG_FIELDS.len());
+    let mut ui = serde_json::Map::new();
+    for f in crate::config::CONFIG_FIELDS {
+        let raw = a.config.get_field(f.key).unwrap_or_default();
+        let (kind, options, preset): (&str, Vec<&str>, Option<&str>) = match f.kind {
+            crate::config::FieldKind::Secret => ("secret", Vec::new(), None),
+            crate::config::FieldKind::Bool => ("bool", Vec::new(), None),
+            crate::config::FieldKind::Int => ("int", Vec::new(), None),
+            crate::config::FieldKind::Float => ("float", Vec::new(), None),
+            crate::config::FieldKind::Enum(opts) => ("enum", opts.to_vec(), None),
+            crate::config::FieldKind::Shortcut => ("shortcut", Vec::new(), None),
+            crate::config::FieldKind::Presets(pk) => (
+                "presets",
+                Vec::new(),
+                Some(match pk {
+                    crate::config::PresetKind::Models => "models",
+                    crate::config::PresetKind::Endpoints => "endpoints",
+                }),
+            ),
+        };
+        let is_secret = matches!(f.kind, crate::config::FieldKind::Secret);
+        let is_set = !raw.is_empty();
+        if f.group == "ui" {
+            ui.insert(f.key.trim_start_matches("ui.").to_string(), json!(raw));
+        }
+        let value = if is_secret { String::new() } else { raw.clone() };
+        fields.push(json!({
+            "key": f.key,
+            "kind": kind,
+            "group": f.group,
+            "label": f.label,
+            "help": f.help,
+            "env": f.env,
+            "default": f.default,
+            "value": value,
+            "options": options,
+            "preset": preset,
+            "is_set": is_set,
+            "masked": if is_secret { crate::app::mask_key(&raw) } else { String::new() },
+        }));
+    }
     Json(json!({
-        "llm": {
-            "api_endpoint": a.config.llm.api_endpoint,
-            "api_key_masked": crate::app::mask_key(&a.config.llm.api_key),
-            "api_key_set": !a.config.llm.api_key.is_empty(),
-            "model": a.config.llm.model,
-            "context_length": a.config.llm.context_length,
-            "thinking_mode": a.config.llm.thinking_mode,
-            "pdf_input": a.config.llm.pdf_input,
-            "paper_relation": a.config.llm.paper_relation,
-            "context_scope": a.config.llm.context_scope,
-        },
-        "pricing": {
-            "input_price_per_1m": a.config.pricing.input_price_per_1m,
-            "output_price_per_1m": a.config.pricing.output_price_per_1m,
-        },
-        "budget": { "token_budget": a.config.budget.token_budget },
-        "ui": {
-            "toggle_sidebar": a.config.ui.toggle_sidebar,
-            "open_settings": a.config.ui.open_settings,
-            "toggle_ask": a.config.ui.toggle_ask,
-            "toggle_tree": a.config.ui.toggle_tree,
-            "stop_task": a.config.ui.stop_task,
-            "undo": a.config.ui.undo,
-        },
+        "fields": fields,
+        "ui": serde_json::Value::Object(ui),
         "presets": {
             "models": a.config.presets.models,
             "endpoints": a.config.presets.endpoints,
@@ -2300,6 +2235,9 @@ struct AnnotateReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// 本次提问是否关联已学知识（相关概念 / 关联论文 / 概念检索代理，默认 true）。
+    #[serde(default = "default_true")]
+    use_concept: bool,
     /// PDF 批注锚点（笔记批注缺省）。
     #[serde(default)]
     pdf: Option<PdfAnchorReq>,
@@ -2353,6 +2291,7 @@ async fn api_annotate(
                     &req.quote,
                     &req.question,
                     req.record_concept,
+                    req.use_concept,
                     &extra,
                 )
             } else {
@@ -2362,6 +2301,7 @@ async fn api_annotate(
                     req.quote_tex.as_deref(),
                     &req.question,
                     req.record_concept,
+                    req.use_concept,
                     &extra,
                 )
             };
@@ -2413,6 +2353,9 @@ struct AnnotateAnswerReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// 本次提问是否关联已学知识（相关概念 / 关联论文 / 概念检索代理，默认 true）。
+    #[serde(default = "default_true")]
+    use_concept: bool,
     /// 用户上传的附件（仅本次请求，不入历史）。
     #[serde(default)]
     attachments: Vec<AttachmentReq>,
@@ -2444,6 +2387,7 @@ async fn api_annotate_answer(
                 req.quote_tex.as_deref(),
                 &req.question,
                 req.record_concept,
+                req.use_concept,
                 &extra,
             );
             g.emitter = Emitter::terminal();
@@ -2489,6 +2433,9 @@ struct AnnotateReplyReq {
     /// 是否把模型标注的 [[概念: …]] 写入「已学概念」（默认 true）。
     #[serde(default = "default_true")]
     record_concept: bool,
+    /// 本次提问是否关联已学知识（相关概念 / 关联论文 / 概念检索代理，默认 true）。
+    #[serde(default = "default_true")]
+    use_concept: bool,
     /// 用户上传的附件（仅本次请求，不入历史）。
     #[serde(default)]
     attachments: Vec<AttachmentReq>,
@@ -2513,7 +2460,7 @@ async fn api_annotate_reply(
         let prepared = {
             let mut g = app2.lock().await;
             g.emitter = Emitter::channel(tx.clone());
-            let r = g.prepare_annotate_reply(&req.node_id, &req.question, req.record_concept, &extra);
+            let r = g.prepare_annotate_reply(&req.node_id, &req.question, req.record_concept, req.use_concept, &extra);
             g.emitter = Emitter::terminal();
             r
         };
