@@ -159,7 +159,7 @@ paperhelper web --port 9000  # 指定端口（被占自动顺延）
 | `llm.model` | 模型名 | gpt-4o-mini |
 | `llm.context_length` | 上下文长度（token） | 8192 |
 | `llm.thinking_mode` | 思考模式：回答前先让推理模型思考，通常更准，但更慢也更耗 token | false |
-| `llm.pdf_input` | PDF 直传：让模型直接读取 PDF 原件（暂未启用，目前都按提取的文本处理） | false |
+| `llm.pdf_input` | PDF 输入：生成笔记时如何把论文交给模型。自动＝模型能看图就逐页转图、否则只发文字；关闭＝只发文字；转图＝始终逐页转图（需视觉模型）；原生＝先试上传 PDF 原件，服务商不支持时自动降级 | auto |
 | `llm.paper_relation` | 论文关联增强：回答时是否参考其它相关论文。默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token | concept |
 | `llm.context_scope` | 提问上下文：提问时发给模型的资料多少。只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token | note |
 | `llm.kb_agent` | 概念检索代理：回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token | false |

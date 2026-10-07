@@ -48,6 +48,15 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// 附件文档（如整份 PDF 原件），用于原生 PDF 输入。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DocumentPart {
+    pub filename: String,
+    pub mime: String,
+    /// data URL，如 `data:application/pdf;base64,...`。
+    pub data_url: String,
+}
+
 /// 一次对话消息（OpenAI roles: system / user / assistant / tool）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Message {
@@ -57,6 +66,9 @@ pub struct Message {
     /// 仅用于「PDF 页面提问」等在途请求，**不写入会话历史**；为空时按纯文本发送。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// 附加给本条消息的文档（原生 PDF 等）。同样不写入会话历史。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<DocumentPart>,
     /// assistant 消息里的工具调用（工具调用链路用；普通对话为空）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -72,6 +84,7 @@ impl Message {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -177,12 +190,18 @@ fn message_json(m: &Message) -> serde_json::Value {
             .collect();
         return json!({ "role": m.role, "content": m.content, "tool_calls": calls });
     }
-    if m.images.is_empty() {
+    if m.images.is_empty() && m.documents.is_empty() {
         json!({ "role": m.role, "content": m.content })
     } else {
         let mut parts = vec![json!({ "type": "text", "text": m.content })];
         for url in &m.images {
             parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
+        for d in &m.documents {
+            parts.push(json!({
+                "type": "file",
+                "file": { "filename": d.filename, "file_data": d.data_url },
+            }));
         }
         json!({ "role": m.role, "content": parts })
     }
@@ -872,6 +891,22 @@ mod tests {
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA");
         assert_eq!(with_img.image_count(), 1);
+    }
+
+    #[test]
+    fn message_json_emits_file_part_for_document() {
+        let mut with_doc = Message::text("user", "读这份 PDF");
+        with_doc.documents.push(DocumentPart {
+            filename: "paper.pdf".into(),
+            mime: "application/pdf".into(),
+            data_url: "data:application/pdf;base64,QQ==".into(),
+        });
+        let v = message_json(&with_doc);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["file"]["filename"], "paper.pdf");
+        assert_eq!(parts[1]["file"]["file_data"], "data:application/pdf;base64,QQ==");
     }
 
     #[test]

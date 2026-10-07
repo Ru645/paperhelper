@@ -125,10 +125,12 @@ pub struct LlmConfig {
     pub model: String,
     pub context_length: usize,
     pub thinking_mode: bool,
-    /// 是否声明当前模型支持直接读取 PDF（file 模式）。
-    /// false=使用 pdf-extract 抽纯文本塞入 prompt（text 模式，全模型通用）。
-    #[serde(default)]
-    pub pdf_input: bool,
+    /// PDF 输入方式（生成笔记时如何把论文交给模型）：
+    /// `off`=只用抽取的纯文本；`auto`=模型像是视觉模型就逐页转图、否则纯文本（默认）；
+    /// `image`=始终把每页渲染成图片发送（需视觉模型）；`native`=先试上传 PDF 原件，
+    /// 服务商不支持时自动降级为转图 / 纯文本。
+    #[serde(default = "default_pdf_input", deserialize_with = "de_pdf_input")]
+    pub pdf_input: String,
     /// 论文关联增强：提问提及「另一篇已学论文」时如何纳入上下文。
     /// `concept`=只注入相关概念摘要（默认）；`note`=额外注入该论文整篇笔记；
     /// `full`=再额外注入该论文原文全文。后两档会显著增大每次提问的 token 消耗。
@@ -158,6 +160,31 @@ pub const CONTEXT_SCOPE_MODES: &[&str] = &["block", "note", "full"];
 
 fn default_context_scope() -> String {
     "note".into()
+}
+
+/// PDF 输入档位的合法取值。
+pub const PDF_INPUT_MODES: &[&str] = &["off", "auto", "image", "native"];
+
+fn default_pdf_input() -> String {
+    "auto".into()
+}
+
+/// 兼容旧版 `pdf_input = false/true` 的布尔写法：false→off，true→native。
+fn de_pdf_input<'de, D>(d: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Str(String),
+    }
+    Ok(match Raw::deserialize(d)? {
+        Raw::Bool(true) => "native".into(),
+        Raw::Bool(false) => "off".into(),
+        Raw::Str(s) => s,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,7 +381,7 @@ pub const CONFIG_FIELDS: &[FieldDef] = &[
     field_plain!(FieldKind::Presets(PresetKind::Models), "llm.model", Some("PAPERHELPER_MODEL"), "gpt-4o-mini", "模型名", "llm", "", llm.model),
     field_num!(FieldKind::Int, "llm.context_length", Some("PAPERHELPER_CONTEXT_LENGTH"), "8192", "上下文长度（token）", "llm", "", usize, "需要整数", llm.context_length),
     field_bool!("llm.thinking_mode", Some("PAPERHELPER_THINKING"), "false", "思考模式", "llm", "让推理模型在回答前先思考，通常更准，但更慢也更耗 token。", llm.thinking_mode),
-    field_bool!("llm.pdf_input", Some("PAPERHELPER_PDF_INPUT"), "false", "PDF 直传", "llm", "让模型直接读取 PDF 原件（暂未启用，目前都按提取的文本处理）。", llm.pdf_input),
+    field_enum!("llm.pdf_input", Some("PAPERHELPER_PDF_INPUT"), "auto", PDF_INPUT_MODES, "PDF 输入", "llm", "生成笔记时如何把论文交给模型：自动＝模型能看图就逐页转图、否则只发文字（推荐）；关闭＝只发文字；转图＝始终逐页转图（需视觉模型）；原生＝先试上传 PDF 原件，服务商不支持时自动降级。", llm.pdf_input),
     field_enum!("llm.paper_relation", Some("PAPERHELPER_PAPER_RELATION"), "concept", PAPER_RELATION_MODES, "论文关联增强", "llm", "回答时是否参考其它相关论文：默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token。", llm.paper_relation),
     field_enum!("llm.context_scope", Some("PAPERHELPER_CONTEXT_SCOPE"), "note", CONTEXT_SCOPE_MODES, "提问上下文", "llm", "提问时发给模型的资料多少：只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token。", llm.context_scope),
     field_bool!("llm.kb_agent", Some("PAPERHELPER_KB_AGENT"), "false", "概念检索代理", "llm", "回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token。", llm.kb_agent),
@@ -382,7 +409,7 @@ impl Default for Config {
                 model: "gpt-4o-mini".into(),
                 context_length: 8192,
                 thinking_mode: false,
-                pdf_input: false,
+                pdf_input: "auto".into(),
                 paper_relation: "concept".into(),
                 context_scope: "note".into(),
                 kb_agent: false,
@@ -514,6 +541,28 @@ mod tests {
         assert!(c.set_field("llm.context_scope", "full").is_ok());
         assert!(c.set_field("llm.context_scope", "all").is_err());
         assert!(c.set_field("llm.context_scope", "").is_err());
+    }
+
+    /// 旧 config.toml 的布尔写法 `pdf_input = false/true` 需兼容映射。
+    #[test]
+    fn legacy_pdf_input_bool_compat() {
+        let base = "api_endpoint=\"e\"\napi_key=\"\"\nmodel=\"m\"\ncontext_length=8192\nthinking_mode=false\n";
+        let f: LlmConfig = toml::from_str(&format!("{base}pdf_input=false\n")).unwrap();
+        assert_eq!(f.pdf_input, "off");
+        let t: LlmConfig = toml::from_str(&format!("{base}pdf_input=true\n")).unwrap();
+        assert_eq!(t.pdf_input, "native");
+        let d: LlmConfig = toml::from_str(base).unwrap();
+        assert_eq!(d.pdf_input, "auto", "缺省应为自动");
+    }
+
+    #[test]
+    fn pdf_input_validates_modes() {
+        let mut c = Config::default();
+        for m in PDF_INPUT_MODES {
+            assert!(c.set_field("llm.pdf_input", m).is_ok(), "应接受 {m}");
+        }
+        assert!(c.set_field("llm.pdf_input", "native-pdf").is_err());
+        assert!(c.set_field("llm.pdf_input", "").is_err());
     }
 
     #[test]

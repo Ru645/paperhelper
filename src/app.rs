@@ -536,6 +536,66 @@ pub struct IngestJob {
     figures: Vec<notes::Figure>,
     /// 图表媒体目录命名空间（无图表为 None）。
     media_id: Option<String>,
+    /// 论文逐页转图（`pdf_input` 需要时）。
+    page_images: Vec<String>,
+    /// 论文原始 PDF 附件（`pdf_input=native` 时）。
+    pdf_document: Option<crate::llm::DocumentPart>,
+    /// PDF 输入尝试顺序，失败自动降级到下一档（末尾通常是纯文本兜底）。
+    attempts: Vec<PdfModality>,
+}
+
+/// PDF 交给模型的三种方式（用于降级链）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfModality {
+    /// 只发抽取的纯文本。
+    Text,
+    /// 逐页渲染成图片发送（需视觉模型）。
+    Image,
+    /// 上传 PDF 原件（需服务商支持 file 部件）。
+    Native,
+}
+
+impl PdfModality {
+    fn label(self) -> &'static str {
+        match self {
+            PdfModality::Text => "纯文本",
+            PdfModality::Image => "逐页转图",
+            PdfModality::Native => "上传 PDF 原件",
+        }
+    }
+}
+
+/// 模型名是否像是视觉（多模态）模型——仅用于 `pdf_input=auto` 的自动判定。
+fn looks_vision(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "vl", "vision", "visual", "llava", "internvl", "minicpm-v", "pixtral", "moondream",
+    ];
+    if NEEDLES.iter().any(|n| m.contains(n)) {
+        return true;
+    }
+    const EXACT_PREFIX: &[&str] = &[
+        "gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4", "claude-3", "claude-4", "gemini",
+        "glm-4v", "glm-4.5v", "glm-4.6v", "ernie-4.5-turbo-vl",
+    ];
+    EXACT_PREFIX.iter().any(|p| m.starts_with(p))
+}
+
+/// 根据 `pdf_input` 档位与模型名得到 PDF 输入的尝试顺序（从优到兜底）。
+pub fn pdf_attempts(mode: &str, model: &str) -> Vec<PdfModality> {
+    match mode {
+        "off" => vec![PdfModality::Text],
+        "image" => vec![PdfModality::Image, PdfModality::Text],
+        "native" => vec![PdfModality::Native, PdfModality::Image, PdfModality::Text],
+        // auto（含未知取值）：视觉模型才转图，否则只用文本。
+        _ => {
+            if looks_vision(model) {
+                vec![PdfModality::Image, PdfModality::Text]
+            } else {
+                vec![PdfModality::Text]
+            }
+        }
+    }
 }
 
 /// ingest 的三种执行方式：直接导入（无 LLM）、仅阅读 PDF（无 LLM、不生成笔记）
@@ -653,8 +713,59 @@ impl GraphJob {
 }
 
 impl IngestJob {
+    /// 按给定的 PDF 输入方式克隆出本次要发送的消息（仅改动最后一条 user）。
+    fn msgs_for(&self, modality: PdfModality) -> Vec<Message> {
+        let mut msgs = self.msgs.clone();
+        if let Some(last) = msgs.last_mut() {
+            match modality {
+                PdfModality::Text => {}
+                PdfModality::Image => {
+                    for url in &self.page_images {
+                        last.images.push(url.clone());
+                    }
+                }
+                PdfModality::Native => {
+                    if let Some(d) = &self.pdf_document {
+                        last.documents.push(d.clone());
+                    }
+                }
+            }
+        }
+        msgs
+    }
+
     /// 锁外执行 LLM 流式调用（正文 + 思考 + 字数进度）。
+    /// 按 `attempts` 顺序尝试 PDF 输入方式，失败自动降级到下一档（末档失败才返回错误）。
     pub async fn run(&self, emitter: &Emitter) -> Result<crate::llm::LlmResult> {
+        let attempts: Vec<PdfModality> = if self.attempts.is_empty() {
+            vec![PdfModality::Text]
+        } else {
+            self.attempts.clone()
+        };
+        let total = attempts.len();
+        for (i, modality) in attempts.iter().enumerate() {
+            let msgs = self.msgs_for(*modality);
+            match self.stream_once(emitter, &msgs).await {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    if i + 1 == total {
+                        return Err(e);
+                    }
+                    let msg = format!(
+                        "以「{}」生成笔记未成功，已自动降级为「{}」重试：{e}",
+                        modality.label(),
+                        attempts[i + 1].label()
+                    );
+                    crate::logging::warn(&msg);
+                    emitter.stderr(format!("⚠️  {msg}"));
+                }
+            }
+        }
+        anyhow::bail!("笔记生成失败")
+    }
+
+    /// 单次流式调用（不重试、不降级）。
+    async fn stream_once(&self, emitter: &Emitter, msgs: &[Message]) -> Result<crate::llm::LlmResult> {
         interrupt::reset();
         let web = !emitter.is_terminal();
         let mut first_token = true;
@@ -662,7 +773,7 @@ impl IngestJob {
         let mut gen_chars: u64 = 0;
         let mut pending_chars: u64 = 0;
         let mut last_emit = std::time::Instant::now();
-        let res = llm::chat(&self.client, &self.cfg, &self.msgs, false, self.cfg.thinking_mode, &mut |t| {
+        let res = llm::chat(&self.client, &self.cfg, msgs, false, self.cfg.thinking_mode, &mut |t| {
             if first_token {
                 if !web {
                     emitter.progress_done();
@@ -1532,6 +1643,71 @@ PaperHelper 命令：
         }
     }
 
+    /// 按 PDF 输入档位准备「逐页图 / 原生 PDF / 尝试顺序」。失败项自动从降级链剔除。
+    async fn prepare_pdf_inputs(
+        &mut self,
+        file_path: &str,
+        modes: Vec<PdfModality>,
+    ) -> (Vec<String>, Option<crate::llm::DocumentPart>, Vec<PdfModality>) {
+        let mut attempts = modes;
+        let mut page_images = Vec::new();
+        let mut pdf_document = None;
+
+        if attempts.contains(&PdfModality::Image) {
+            self.emitter.progress("逐页转图…");
+            let res = pdf::render_pages(Path::new(file_path)).await;
+            self.emitter.progress_done();
+            match res {
+                Ok(pages) if !pages.is_empty() => page_images = pages,
+                Ok(_) => {
+                    let msg = "逐页转图未得到内容，已退回纯文本".to_string();
+                    crate::logging::warn(&msg);
+                    self.emitter.stderr(format!("⚠️  {msg}"));
+                }
+                Err(e) => {
+                    let msg = format!("逐页转图失败，已退回纯文本：{e}");
+                    crate::logging::warn(&msg);
+                    self.emitter.stderr(format!("⚠️  {msg}"));
+                }
+            }
+            if page_images.is_empty() {
+                attempts.retain(|m| *m != PdfModality::Image);
+            }
+        }
+
+        if attempts.contains(&PdfModality::Native) {
+            match tokio::fs::read(file_path).await {
+                Ok(bytes) => {
+                    let filename = Path::new(file_path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "paper.pdf".to_string());
+                    pdf_document = Some(crate::llm::DocumentPart {
+                        filename,
+                        mime: "application/pdf".to_string(),
+                        data_url: format!(
+                            "data:application/pdf;base64,{}",
+                            crate::export::b64_encode(&bytes)
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("读取 PDF 原件失败，已跳过「上传原件」：{e}");
+                    crate::logging::warn(&msg);
+                    self.emitter.stderr(format!("⚠️  {msg}"));
+                }
+            }
+            if pdf_document.is_none() {
+                attempts.retain(|m| *m != PdfModality::Native);
+            }
+        }
+
+        if attempts.is_empty() {
+            attempts.push(PdfModality::Text);
+        }
+        (page_images, pdf_document, attempts)
+    }
+
     /// ingest 的 **prepare 段**（持锁）：解析参数、抽取文本、组装提示词。
     /// 返回 `IngestPrep::Llm` 时，其任务可在**不持 App 锁**时流式执行。
     pub async fn prepare_ingest(&mut self, rest: &str) -> Result<IngestPrep> {
@@ -1615,6 +1791,17 @@ PaperHelper 命令：
             bail!("已打断");
         }
 
+        // 2b. 按 PDF 输入档位准备逐页图 / 原生 PDF（非 PDF 输入只用文本）
+        let (page_images, pdf_document, attempts) = if mode == "pdf" {
+            let modes = pdf_attempts(&self.config.llm.pdf_input, &self.config.llm.model);
+            self.prepare_pdf_inputs(&file_path, modes).await
+        } else {
+            (Vec::new(), None, vec![PdfModality::Text])
+        };
+        if interrupt::is_interrupted() {
+            bail!("已打断");
+        }
+
         // 3. 确定笔记导出文件名（终端交互询问；Web 用预设 export_path）
         let export_file = self.ask_export_name(&file_path)?;
 
@@ -1660,6 +1847,9 @@ PaperHelper 命令：
             kind: kind.to_string(),
             figures,
             media_id,
+            page_images,
+            pdf_document,
+            attempts,
         })))
     }
 
@@ -4003,8 +4193,9 @@ fn prune_annotations(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_concept, normalize_path_arg, parse_graph_relations, strip_flag, take_bool_arg,
-        take_style_arg, take_value_arg, CommandCompleter, ExtraInput,
+        extract_concept, looks_vision, normalize_path_arg, parse_graph_relations, pdf_attempts,
+        strip_flag, take_bool_arg, take_style_arg, take_value_arg, CommandCompleter, ExtraInput,
+        PdfModality,
     };
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
@@ -4021,6 +4212,33 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(r, "x.pdf");
         assert!(take_style_arg("--style").is_err(), "缺取值应报错");
+    }
+
+    #[test]
+    fn pdf_attempts_follow_config_and_vision() {
+        assert_eq!(pdf_attempts("off", "Qwen3-VL-235B-A22B-Instruct"), vec![PdfModality::Text]);
+        assert_eq!(pdf_attempts("image", "x"), vec![PdfModality::Image, PdfModality::Text]);
+        assert_eq!(
+            pdf_attempts("native", "x"),
+            vec![PdfModality::Native, PdfModality::Image, PdfModality::Text]
+        );
+        assert_eq!(
+            pdf_attempts("auto", "Qwen3-VL-235B-A22B-Instruct"),
+            vec![PdfModality::Image, PdfModality::Text]
+        );
+        assert_eq!(pdf_attempts("auto", "DeepSeek-V4-Pro"), vec![PdfModality::Text]);
+        assert_eq!(pdf_attempts("auto", "gpt-4o-mini"), vec![PdfModality::Image, PdfModality::Text]);
+        assert_eq!(pdf_attempts("bogus", "DeepSeek-V4-Pro"), vec![PdfModality::Text]);
+    }
+
+    #[test]
+    fn looks_vision_detects_known_models() {
+        assert!(looks_vision("Qwen3-VL-235B-A22B-Instruct"));
+        assert!(looks_vision("glm-4.6v"));
+        assert!(looks_vision("gpt-4o-mini"));
+        assert!(looks_vision("claude-3-5-sonnet"));
+        assert!(!looks_vision("DeepSeek-V4-Pro"));
+        assert!(!looks_vision("qwen3-235b-a22b"));
     }
 
     /// 关系行解析：合法行解析、去重、跳过「无」与格式不符/代码块标记的行。

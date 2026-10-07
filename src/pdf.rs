@@ -430,6 +430,51 @@ pub async fn extract_figures(
     Ok(figures)
 }
 
+/// 每页图上限：超出部分不再渲染发送，避免 token / 请求体超支。
+pub const MAX_PAGE_IMAGES: usize = 40;
+
+/// 逐页渲染为 JPEG，输出 JSON 字符串数组（各元素为 `data:image/jpeg;base64,...`）。
+/// 用于 `pdf_input=image`（把论文当图片交给视觉模型）；原生 PDF 不受支持时也走这里。
+const PAGE_SCRIPT: &str = r##"
+import sys, json, base64
+import pymupdf
+doc = pymupdf.open(sys.argv[1])
+max_pages = int(sys.argv[2])
+out = []
+for i in range(min(doc.page_count, max_pages)):
+    page = doc[i]
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
+    out.append("data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=70)).decode())
+sys.stdout.write(json.dumps(out))
+"##;
+
+/// 把 PDF 逐页渲染成 JPEG data URL（最多 [`MAX_PAGE_IMAGES`] 页）。
+/// 失败时返回 `Err`，调用方降级为纯文本。
+pub async fn render_pages(path: &Path) -> Result<Vec<String>> {
+    let t0 = std::time::Instant::now();
+    let (py, args) = python_command().await;
+    let mut cmd = Command::new(&py);
+    cmd.args(&args)
+        .arg("-c")
+        .arg(PAGE_SCRIPT)
+        .arg(path)
+        .arg(MAX_PAGE_IMAGES.to_string());
+    let out = run_killable(cmd, &format!("{py} 逐页转图（需安装 pymupdf）")).await?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("逐页转图失败: {e}"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pages: Vec<String> = serde_json::from_str(text.trim()).unwrap_or_default();
+    logging::info(format!(
+        "逐页转图完成：{} 页，用时 {:.1}s（{}）",
+        pages.len(),
+        t0.elapsed().as_secs_f64(),
+        path.display()
+    ));
+    Ok(pages)
+}
+
 /// 用 Tesseract OCR 对 PDF 逐页做文字识别。
 /// 需要安装：Debian/Ubuntu `sudo apt install tesseract-ocr tesseract-ocr-chi-sim`；
 /// macOS `brew install tesseract tesseract-lang`。

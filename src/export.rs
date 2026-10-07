@@ -107,7 +107,7 @@ fn image_mime(file: &str) -> &'static str {
 }
 
 /// 标准 Base64 编码（内联图片用，不引入新依赖）。
-fn b64_encode(data: &[u8]) -> String {
+pub(crate) fn b64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
