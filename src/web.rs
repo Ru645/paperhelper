@@ -116,6 +116,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/samples", get(api_samples))
         .route("/api/samples/import", post(api_sample_import))
         .route("/api/pdf/file", get(api_pdf_file))
+        .route("/api/media/:media_id/:file", get(api_media))
         .layer(middleware::from_fn(log_requests))
         .with_state(app)
 }
@@ -435,6 +436,45 @@ async fn api_pdf_file(State(app): State<SharedApp>) -> Response {
             format!("读取 PDF 失败：{e}"),
         )
             .into_response(),
+    }
+}
+
+/// 图表媒体文件（从 PDF 裁出的图/表，供笔记正文 `<img>` 加载）。
+/// 只按 `media_id/filename` 两个路径段拼到媒体目录，拒绝任何路径穿越。
+async fn api_media(
+    axum::extract::Path((media_id, file)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let bad = |s: &str| s.is_empty() || s.contains('/') || s.contains('\\') || s.contains("..");
+    if bad(&media_id) || bad(&file) {
+        return (StatusCode::BAD_REQUEST, "非法的媒体路径").into_response();
+    }
+    let path = paths::media_paper_dir(&media_id).join(&file);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, media_mime(&file)),
+                (header::CACHE_CONTROL, "private, max-age=3600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "媒体文件不存在").into_response(),
+    }
+}
+
+/// 按扩展名判断媒体 MIME 类型。
+fn media_mime(file: &str) -> &'static str {
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1082,7 +1122,7 @@ async fn api_note(State(app): State<SharedApp>, Query(q): Query<NoteQuery>) -> R
     if want_md {
         (
             [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
-            export::to_markdown(note),
+            export::to_markdown_inline(note),
         )
             .into_response()
     } else {
@@ -1473,7 +1513,7 @@ async fn api_export(State(app): State<SharedApp>, Query(q): Query<ExportQuery>) 
             "html",
         ),
         "mm" | "mindmap" => (export::to_mindmap(note), "mm"),
-        _ => (export::to_markdown(note), "md"),
+        _ => (export::to_markdown_inline(note), "md"),
     };
     // 文件名：优先用会话的导出名 stem，否则用笔记标题
     let stem = a
@@ -2852,6 +2892,15 @@ fn sanitize_upload_name(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn media_mime_maps_extensions() {
+        assert_eq!(media_mime("a.png"), "image/png");
+        assert_eq!(media_mime("a.JPG"), "image/jpeg");
+        assert_eq!(media_mime("a.jpeg"), "image/jpeg");
+        assert_eq!(media_mime("a.webp"), "image/webp");
+        assert_eq!(media_mime("a.bin"), "application/octet-stream");
+    }
+
     /// 一致性检查：`app.js` 里 `$("id")` 引用的元素，必须都在 `index.html` 里存在。
     /// 防止「新 app.js + 旧 index.html」这类版本错配导致初始化抛错、按钮全部失效。
     #[test]
@@ -3141,6 +3190,12 @@ mod tests {
             "font/woff2"
         );
         assert!(find("marked.min.js").unwrap().bytes.len() > 10_000);
+        assert!(find("purify.min.js").is_some(), "缺少 DOMPurify（HTML 消毒）");
+        assert_eq!(
+            find("purify.min.js").expect("缺少 purify").mime,
+            "text/javascript; charset=utf-8"
+        );
+        assert!(find("purify.min.js").unwrap().bytes.len() > 10_000);
     }
 
     /// 示例材料已内嵌且格式正确（向导第四步的前提）。

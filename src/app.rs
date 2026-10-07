@@ -532,6 +532,10 @@ pub struct IngestJob {
     source_path: String,
     export_file: String,
     kind: String,
+    /// 从 PDF 裁出的图表清单（无则空）。
+    figures: Vec<notes::Figure>,
+    /// 图表媒体目录命名空间（无图表为 None）。
+    media_id: Option<String>,
 }
 
 /// ingest 的三种执行方式：直接导入（无 LLM）、仅阅读 PDF（无 LLM、不生成笔记）
@@ -1476,7 +1480,7 @@ PaperHelper 命令：
         }
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
         let content = match fmt {
-            "md" | "markdown" => export::to_markdown(note),
+            "md" | "markdown" => export::to_markdown_inline(note),
             "mindmap" | "mm" => export::to_mindmap(note),
             "html" | "htm" => export::to_html(note, &self.session.conversation, &self.session.annotations),
             _ => unreachable!(),
@@ -1494,6 +1498,40 @@ PaperHelper 命令：
     /// 3. 成功后 `parse_markdown_note` 解析成树、登记知识库 Paper；
     ///    首次询问导出文件名（写 export_path，之后 ask 自动同步到该文件）。
     /// 全程记录 token，超预算/被打断即中止且不写会话。
+    /// 从 PDF 抽取真实图/表到媒体目录（阶段1，不依赖读图模型）。
+    /// 返回 `(图表清单, 媒体命名空间)`；失败只提示不拦截（返回空，笔记照常生成）。
+    pub(crate) async fn extract_figures_for(
+        &mut self,
+        file_path: &str,
+    ) -> (Vec<notes::Figure>, Option<String>) {
+        let media_id = uuid::Uuid::new_v4().to_string();
+        let dir = match crate::paths::ensure_media_paper_dir(&media_id) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("无法创建图表目录，笔记将不含图片：{e}");
+                crate::logging::warn(&msg);
+                self.emitter.stderr(format!("⚠️  {msg}"));
+                return (Vec::new(), None);
+            }
+        };
+        self.emitter.progress("提取图表…");
+        let res = pdf::extract_figures(Path::new(file_path), &dir).await;
+        self.emitter.progress_done();
+        match res {
+            Ok(figs) if !figs.is_empty() => {
+                outln!(self, "{} 已从 PDF 提取 {} 张图/表", "✓".green().bold(), figs.len());
+                (figs, Some(media_id))
+            }
+            Ok(_) => (Vec::new(), None),
+            Err(e) => {
+                let msg = format!("图表提取失败，笔记将不含图片（不影响正文）：{e}");
+                crate::logging::warn(&msg);
+                self.emitter.stderr(format!("⚠️  {msg}"));
+                (Vec::new(), None)
+            }
+        }
+    }
+
     /// ingest 的 **prepare 段**（持锁）：解析参数、抽取文本、组装提示词。
     /// 返回 `IngestPrep::Llm` 时，其任务可在**不持 App 锁**时流式执行。
     pub async fn prepare_ingest(&mut self, rest: &str) -> Result<IngestPrep> {
@@ -1567,7 +1605,17 @@ PaperHelper 命令：
             bail!("已打断");
         }
 
-        // 2. 确定笔记导出文件名（终端交互询问；Web 用预设 export_path）
+        // 2. PDF 模式：裁出真实图/表（阶段1，不依赖读图模型；失败降级继续）
+        let (figures, media_id) = if mode == "pdf" {
+            self.extract_figures_for(&file_path).await
+        } else {
+            (Vec::new(), None)
+        };
+        if interrupt::is_interrupted() {
+            bail!("已打断");
+        }
+
+        // 3. 确定笔记导出文件名（终端交互询问；Web 用预设 export_path）
         let export_file = self.ask_export_name(&file_path)?;
 
         // 3. 预算检查 + 组装提示词（风格注册表 + 固定输出契约）
@@ -1591,7 +1639,8 @@ PaperHelper 命令：
                 }
             }
         };
-        let prompt = crate::prompts::compose_style_prompt(&style, &raw_text, &extra)?;
+        let prompt =
+            crate::prompts::compose_style_prompt_with_figures(&style, &raw_text, &extra, &figures)?;
         let msgs = vec![
             Message::text("system", "你是笔记生成助手，只输出 Markdown。"),
             Message::text("user", prompt),
@@ -1609,6 +1658,8 @@ PaperHelper 命令：
             source_path: file_path,
             export_file,
             kind: kind.to_string(),
+            figures,
+            media_id,
         })))
     }
 
@@ -1652,6 +1703,9 @@ PaperHelper 命令：
         }
         let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
         note.material_kind = job.kind.clone();
+        note.figures = job.figures.clone();
+        note.media_id = job.media_id.clone();
+        note.ensure_figures_placed();
         let title = note.title.clone();
         let nblocks = note.count_blocks();
         outln!(self, "{} 笔记已生成: 《{}》({} 个结构块)", "✓".green().bold(), title, nblocks);
@@ -1671,6 +1725,9 @@ PaperHelper 命令：
         self.kb.stats.add(in_tok, out_tok, cost);
         let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
         note.material_kind = job.kind.clone();
+        note.figures = job.figures.clone();
+        note.media_id = job.media_id.clone();
+        note.ensure_figures_placed();
         let paper_id = uuid::Uuid::new_v4().to_string();
         note.paper_id = paper_id.clone();
         let title = note.title.clone();
@@ -1740,6 +1797,11 @@ PaperHelper 命令：
         if raw_text.trim().is_empty() {
             bail!("文本内容为空（可能是扫描件，试试 ingest --note --ocr <pdf>）");
         }
+        let (figures, media_id) = if mode == "pdf" {
+            self.extract_figures_for(file_path).await
+        } else {
+            (Vec::new(), None)
+        };
         let export_file = self.ask_export_name(file_path)?;
         let stem = Path::new(file_path)
             .file_stem()
@@ -1748,6 +1810,9 @@ PaperHelper 命令：
         let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
         let mut note = notes::parse_import_note(&raw_text, &title_guess);
         note.material_kind = kind.to_string();
+        note.figures = figures;
+        note.media_id = media_id;
+        note.ensure_figures_placed();
         let title = note.title.clone();
         let nblocks = note.count_blocks();
         let kind_label = match kind {

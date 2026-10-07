@@ -310,6 +310,126 @@ pub async fn extract_pages_lenient(path: &Path) -> Result<Vec<String>> {
     Ok(pages)
 }
 
+/// 从 PDF 裁剪真实图/表：内嵌 Python（PyMuPDF）按图注定位并渲染 PNG。
+///
+/// 策略：找出以 `Figure/Fig./Table/图/表 + 编号` 开头的图注块，在其同栏、相邻
+/// 的上方或下方收集图片 / 矢量绘制包围盒，取并集后 2× 渲染成 PNG。是尽力而为的
+/// 启发式（复杂版式可能漏检或裁到多余留白），失败不阻塞笔记生成。
+const FIGURE_SCRIPT: &str = r##"
+import sys, os, re, json
+import pymupdf
+
+def main():
+    pdf_path, out_dir = sys.argv[1], sys.argv[2]
+    os.makedirs(out_dir, exist_ok=True)
+    doc = pymupdf.open(pdf_path)
+    cap_re = re.compile(r'^\s*(Figure|Fig\.?|Table|图|表)\s*([0-9]+[A-Za-z]?)', re.I)
+    manifest = []
+    idx = 0
+    for pno in range(doc.page_count):
+        if idx >= 40:
+            break
+        page = doc[pno]
+        W, H = page.rect.width, page.rect.height
+        caps = []
+        try:
+            for bb in page.get_text("blocks"):
+                if len(bb) >= 7 and bb[6] != 0:
+                    continue
+                raw = (bb[4] or "").strip()
+                if not raw:
+                    continue
+                m = cap_re.match(raw)
+                if not m:
+                    continue
+                tail = raw[m.end():].lstrip()
+                if tail[:1] in (".", ":", "：") or len(raw) <= 120:
+                    caps.append((pymupdf.Rect(bb[0], bb[1], bb[2], bb[3]), raw, m.group(1)))
+        except Exception:
+            continue
+        if not caps:
+            continue
+        visuals = []
+        try:
+            for it in page.get_image_info():
+                r = pymupdf.Rect(it["bbox"])
+                if r.width > 10 and r.height > 10:
+                    visuals.append(r)
+        except Exception:
+            pass
+        try:
+            for d in page.get_drawings():
+                r = d.get("rect")
+                if r is None:
+                    continue
+                rr = pymupdf.Rect(r)
+                if rr.width > 12 and rr.height > 12:
+                    visuals.append(rr)
+        except Exception:
+            pass
+        for cbox, ctext, kind in caps:
+            if idx >= 40:
+                break
+            same_col = [v for v in visuals if min(v.x1, cbox.x1) - max(v.x0, cbox.x0) > 4]
+            above = [v for v in same_col if v.y1 <= cbox.y0 + 2 and (cbox.y0 - v.y1) < 320]
+            below = [v for v in same_col if v.y0 >= cbox.y1 - 2 and (v.y0 - cbox.y1) < 320]
+            group = above if len(above) >= len(below) else below
+            if group:
+                x0 = min(min(v.x0 for v in group), cbox.x0)
+                y0 = min(min(v.y0 for v in group), cbox.y0)
+                x1 = max(max(v.x1 for v in group), cbox.x1)
+                y1 = max(max(v.y1 for v in group), cbox.y1)
+            else:
+                x0, y0, x1, y1 = 0.0, max(0.0, cbox.y0 - 190), W, min(H, cbox.y1 + 24)
+            pad = 6.0
+            x0 = max(0.0, x0 - pad); y0 = max(0.0, y0 - pad)
+            x1 = min(W, x1 + pad); y1 = min(H, y1 + pad)
+            if (x1 - x0) < 24 or (y1 - y0) < 24:
+                continue
+            idx += 1
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=pymupdf.Rect(x0, y0, x1, y1))
+            fn = "fig-%02d.png" % idx
+            pix.save(os.path.join(out_dir, fn))
+            k = "table" if kind.lower().startswith("t") or kind == "表" else "figure"
+            manifest.append({
+                "id": str(idx),
+                "kind": k,
+                "page": pno + 1,
+                "caption": re.sub(r'\s+', ' ', ctext)[:200],
+                "file": fn,
+                "w": pix.width,
+                "h": pix.height,
+            })
+    sys.stdout.write(json.dumps(manifest, ensure_ascii=False))
+
+main()
+"##;
+
+/// 从 PDF 抽取真实图表到 `out_dir`，返回清单。失败时返回 `Err`（调用方降级继续）。
+pub async fn extract_figures(
+    path: &Path,
+    out_dir: &Path,
+) -> Result<Vec<crate::notes::Figure>> {
+    let t0 = std::time::Instant::now();
+    let (py, args) = python_command().await;
+    let mut cmd = Command::new(&py);
+    cmd.args(&args).arg("-c").arg(FIGURE_SCRIPT).arg(path).arg(out_dir);
+    let out = run_killable(cmd, &format!("{py} 图表提取（需安装 pymupdf）")).await?;
+    if !out.status.success() {
+        let e = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("图表提取失败: {e}"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let figures: Vec<crate::notes::Figure> = serde_json::from_str(text.trim()).unwrap_or_default();
+    logging::info(format!(
+        "图表提取完成：{} 张，用时 {:.1}s（{}）",
+        figures.len(),
+        t0.elapsed().as_secs_f64(),
+        path.display()
+    ));
+    Ok(figures)
+}
+
 /// 用 Tesseract OCR 对 PDF 逐页做文字识别。
 /// 需要安装：Debian/Ubuntu `sudo apt install tesseract-ocr tesseract-ocr-chi-sim`；
 /// macOS `brew install tesseract tesseract-lang`。

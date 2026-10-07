@@ -95,6 +95,25 @@ pub fn ensure_uploads_dir() -> Result<()> {
     Ok(())
 }
 
+/// 媒体文件根目录（从 PDF 裁出的图表等，按 media_id 分目录）。
+pub fn media_dir() -> PathBuf {
+    data_dir().join("media")
+}
+
+/// 某篇材料的媒体目录（命名空间隔离，避免不同论文的图表同名冲突）。
+pub fn media_paper_dir(media_id: &str) -> PathBuf {
+    media_dir().join(media_id)
+}
+
+/// 确保某篇材料的媒体目录存在并返回其路径。
+pub fn ensure_media_paper_dir(media_id: &str) -> Result<PathBuf> {
+    let dir = media_paper_dir(media_id);
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    Ok(dir)
+}
+
 /// 日志目录（Web/CLI 运行日志）。
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
@@ -188,6 +207,11 @@ mod tests {
             resolve_data_dir(Some("D:\\PaperHelper\\.paperhelper"), None),
             PathBuf::from("D:\\PaperHelper\\.paperhelper")
         );
+    }
+
+    #[test]
+    fn media_paper_dir_nests_under_media() {
+        assert!(media_paper_dir("abc").ends_with(Path::new("media").join("abc")));
     }
 
     #[test]

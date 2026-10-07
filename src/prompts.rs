@@ -520,6 +520,40 @@ pub fn compose_style_prompt(style: &str, raw_text: &str, extra: &str) -> Result<
     Ok(prompt)
 }
 
+/// 在 `compose_style_prompt` 基础上附加「图/表清单」：程序已从 PDF 裁出真实图片，
+/// 让模型在正文对应位置留下 `[[fig:ID]]` 占位符（渲染时替换为真实图片）。
+pub fn compose_style_prompt_with_figures(
+    style: &str,
+    raw_text: &str,
+    extra: &str,
+    figures: &[crate::notes::Figure],
+) -> Result<String> {
+    let mut prompt = compose_style_prompt(style, raw_text, extra)?;
+    if figures.is_empty() {
+        return Ok(prompt);
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&figure_contract(figures));
+    Ok(prompt)
+}
+
+/// 图表清单与使用约定（追加到笔记生成提示词末尾）。
+fn figure_contract(figures: &[crate::notes::Figure]) -> String {
+    let mut s = String::from(
+        "【论文中的图/表（程序已从 PDF 裁出真实图片，必须原样使用）】\n\
+         正文提到某图/表时，就在该处单独写一个占位符 `[[fig:编号]]`（编号见下表，原样照抄，不要改动）；\
+         程序会把它替换成对应的真实图片。\n\
+         要求：占位符要点明它对应的图/表，不要把所有占位符堆在文末；\
+         不要用文字复述图片内容，也不要凭空编造图片或数据。\n",
+    );
+    for f in figures {
+        let kind = if f.kind == "table" { "表" } else { "图" };
+        let cap = f.caption.replace(['\n', '\r'], " ");
+        s.push_str(&format!("- [[fig:{}]] = 第 {} 页{}：{}\n", f.id, f.page, kind, cap.trim()));
+    }
+    s
+}
+
 /// 风格 id 合法性：1~40 个 ASCII 字母/数字/`-`/`_`，且以字母或数字开头。
 pub fn valid_style_id(id: &str) -> bool {
     let id = id.trim();
@@ -666,6 +700,20 @@ mod tests {
             assert!(!prompt.trim().is_empty(), "风格 {} 的提示词为空", m.id);
             assert!(!prompt.contains("{raw_text}"), "风格 {} 不应含 {{raw_text}}", m.id);
         }
+    }
+
+    #[test]
+    fn figure_contract_lists_placeholders() {
+        let figs = vec![crate::notes::Figure {
+            id: "2".into(),
+            kind: "table".into(),
+            page: 5,
+            caption: "实验结果".into(),
+            ..Default::default()
+        }];
+        let s = figure_contract(&figs);
+        assert!(s.contains("[[fig:2]]"), "应列出占位符编号");
+        assert!(s.contains('表') && s.contains("实验"), "应含类型与图注");
     }
 
     #[test]

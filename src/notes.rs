@@ -71,6 +71,31 @@ pub struct Block {
     pub explanations: Vec<Explanation>,
 }
 
+/// 从 PDF 裁出的真实图片/表格条目（阶段1 本机抽取，不依赖读图模型）。
+/// 正文以 `[[fig:ID]]` 占位，渲染时按 `media_id` 替换为图片。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Figure {
+    /// 正文占位符编号（`[[fig:ID]]`），由抽取脚本顺序分配。
+    #[serde(default)]
+    pub id: String,
+    /// figure / table。
+    #[serde(default)]
+    pub kind: String,
+    /// 所在页码（1 起）。
+    #[serde(default)]
+    pub page: u32,
+    /// 图注/表注原文。
+    #[serde(default)]
+    pub caption: String,
+    /// 媒体目录下的文件名。
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub w: u32,
+    #[serde(default)]
+    pub h: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Note {
     #[serde(default)]
@@ -94,6 +119,12 @@ pub struct Note {
     /// 旧的已存会话没有该字段，缺省为空。
     #[serde(default)]
     pub source_path: Option<String>,
+    /// 从 PDF 裁出的图表清单（旧的已存会话为空）。
+    #[serde(default)]
+    pub figures: Vec<Figure>,
+    /// 图表媒体目录命名空间（`/api/media/<media_id>/<file>`）；无图表为空。
+    #[serde(default)]
+    pub media_id: Option<String>,
 }
 
 impl Note {
@@ -111,6 +142,58 @@ impl Note {
 
     pub fn count_blocks(&self) -> usize {
         self.flatten().len()
+    }
+
+    /// 确保每个抽取到的图表在正文都有 `[[fig:ID]]` 占位：LLM 已引用的保留，
+    /// 未被引用的统一追加到文末「图表」章节，避免真实图片被漏掉。
+    pub fn ensure_figures_placed(&mut self) {
+        if self.figures.is_empty() {
+            return;
+        }
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (b, _) in self.flatten() {
+            for f in &self.figures {
+                if b.text.contains(&format!("[[fig:{}]]", f.id)) {
+                    used.insert(f.id.clone());
+                }
+            }
+        }
+        let missing: Vec<Figure> = self
+            .figures
+            .iter()
+            .filter(|f| !used.contains(&f.id))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut children = Vec::new();
+        for f in &missing {
+            let kind = if f.kind == "table" { "表" } else { "图" };
+            let cap = f.caption.replace(['\n', '\r'], " ");
+            let text = if cap.trim().is_empty() {
+                format!("第 {} 页{}：\n\n[[fig:{}]]", f.page, kind, f.id)
+            } else {
+                format!("第 {} 页{}：{}\n\n[[fig:{}]]", f.page, kind, cap.trim(), f.id)
+            };
+            children.push(Block {
+                id: uid(),
+                kind: BlockKind::Paragraph,
+                text,
+                number: String::new(),
+                children: Vec::new(),
+                explanations: Vec::new(),
+            });
+        }
+        self.blocks.push(Block {
+            id: uid(),
+            kind: BlockKind::Section,
+            text: "图表".to_string(),
+            number: String::new(),
+            children,
+            explanations: Vec::new(),
+        });
+        assign_numbers(self);
     }
 
     pub fn find_block(&self, id: &str) -> Option<&Block> {
@@ -606,6 +689,8 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         material_kind: String::new(),
         math_macros: macros,
         source_path: None,
+        figures: Vec::new(),
+        media_id: None,
     };
     assign_numbers(&mut note);
     note
@@ -644,6 +729,8 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
         material_kind: String::new(),
         math_macros: macros,
         source_path: None,
+        figures: Vec::new(),
+        media_id: None,
     };
     assign_numbers(&mut note);
     note
@@ -660,6 +747,8 @@ pub fn readonly_note(title: impl Into<String>, raw_text: impl Into<String>) -> N
         material_kind: "paper".to_string(),
         math_macros: None,
         source_path: None,
+        figures: Vec::new(),
+        media_id: None,
     }
 }
 
@@ -903,6 +992,34 @@ fn strip_fences(content: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧会话 JSON（无 figures/media_id 字段）必须仍能加载。
+    #[test]
+    fn note_deserializes_without_figure_fields() {
+        let note: Note = serde_json::from_str(r#"{"title":"旧笔记","raw_text":"正文"}"#).unwrap();
+        assert_eq!(note.title, "旧笔记");
+        assert!(note.figures.is_empty());
+        assert!(note.media_id.is_none());
+    }
+
+    #[test]
+    fn ensure_figures_placed_appends_only_missing() {
+        let mut note = parse_markdown_note("# 标题\n\n正文已引用 [[fig:1]]", "");
+        note.figures = vec![
+            Figure { id: "1".into(), kind: "figure".into(), page: 1, caption: "架构".into(), file: "fig-01.png".into(), ..Default::default() },
+            Figure { id: "2".into(), kind: "table".into(), page: 3, caption: "实验结果".into(), file: "fig-02.png".into(), ..Default::default() },
+        ];
+        note.ensure_figures_placed();
+        let all: String = note
+            .flatten()
+            .iter()
+            .map(|(b, _)| b.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(all.matches("[[fig:1]]").count(), 1, "已引用的不应重复插入");
+        assert!(all.contains("[[fig:2]]"), "未引用的应补进文末图表章节");
+        assert!(note.blocks.iter().any(|b| b.kind == BlockKind::Section && b.text == "图表"));
+    }
 
     #[test]
     fn readonly_note_is_blockless() {

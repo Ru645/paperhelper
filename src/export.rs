@@ -13,12 +13,114 @@
 use std::collections::HashSet;
 
 use crate::conversation::Conversation;
-use crate::notes::{Block, BlockKind, Explanation, Note};
+use crate::notes::{Block, BlockKind, Explanation, Figure, Note};
 use crate::session::Annotation;
 
+/// 图表占位符的渲染方式。
+#[derive(Clone, Copy, PartialEq)]
+enum MediaMode {
+    /// 保留 `[[fig:ID]]` 原样（CLI 打印等不需要图片的场景）。
+    Placeholder,
+    /// 指向 `/api/media/<media_id>/<file>`（Web 端笔记 iframe 同源加载）。
+    Web,
+    /// 读取媒体文件内联为 data URI（导出单文件，离线自包含）。
+    Inline,
+}
+
 /// 整棵笔记渲染为 Markdown（根标题 + 逐块递归，追问挂在所属块下）。
+/// 图表占位符原样保留；需要图片时用 `to_markdown_inline`。
 pub fn to_markdown(note: &Note) -> String {
     to_markdown_with(note, false, &HashSet::new())
+}
+
+/// 导出用 Markdown：把图表占位符内联为 data URI，保证单文件自包含、离线可看。
+pub fn to_markdown_inline(note: &Note) -> String {
+    to_markdown_mode(note, false, &HashSet::new(), MediaMode::Inline)
+}
+
+fn to_markdown_mode(note: &Note, anchors: bool, hidden: &HashSet<String>, mode: MediaMode) -> String {
+    let md = to_markdown_with(note, anchors, hidden);
+    resolve_figures(&md, note, mode)
+}
+
+/// 把正文里的 `[[fig:ID]]` 占位符替换为 Markdown 图片。
+fn resolve_figures(md: &str, note: &Note, mode: MediaMode) -> String {
+    if mode == MediaMode::Placeholder || note.figures.is_empty() || !md.contains("[[fig:") {
+        return md.to_string();
+    }
+    let mut out = md.to_string();
+    for f in &note.figures {
+        let ph = format!("[[fig:{}]]", f.id);
+        if !out.contains(&ph) {
+            continue;
+        }
+        let src = figure_src(note, f, mode);
+        if src.is_empty() {
+            continue;
+        }
+        out = out.replace(&ph, &format!("![{}]({})", figure_alt(f), src));
+    }
+    out
+}
+
+/// 图片替代文字：优先图注，否则按类型编号。
+fn figure_alt(f: &Figure) -> String {
+    let kind = if f.kind == "table" { "表" } else { "图" };
+    let raw = if f.caption.trim().is_empty() {
+        format!("{kind}{}", f.id)
+    } else {
+        f.caption.clone()
+    };
+    raw.replace(['[', ']', '\n', '\r'], " ").trim().to_string()
+}
+
+/// 生成单张图的 src（Web 相对路径或 data URI）。
+fn figure_src(note: &Note, f: &Figure, mode: MediaMode) -> String {
+    let Some(mid) = note.media_id.as_deref().filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    match mode {
+        MediaMode::Placeholder => String::new(),
+        MediaMode::Web => format!("/api/media/{}/{}", mid, f.file),
+        MediaMode::Inline => {
+            let path = crate::paths::media_paper_dir(mid).join(&f.file);
+            match std::fs::read(&path) {
+                Ok(bytes) => format!("data:{};base64,{}", image_mime(&f.file), b64_encode(&bytes)),
+                Err(_) => String::new(),
+            }
+        }
+    }
+}
+
+/// 按扩展名判断图片 MIME。
+fn image_mime(file: &str) -> &'static str {
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/png",
+    }
+}
+
+/// 标准 Base64 编码（内联图片用，不引入新依赖）。
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 /// 渲染 Markdown。
@@ -218,7 +320,7 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation, annotations: &[A
     if path.to_lowercase().ends_with(".html") {
         to_html(note, conv, annotations)
     } else {
-        to_markdown(note)
+        to_markdown_inline(note)
     }
 }
 
@@ -228,13 +330,13 @@ pub fn render_for(path: &str, note: &Note, conv: &Conversation, annotations: &[A
 /// 点击弹出只读小窗口；高亮失败的在文末「批注」列表兜底。
 pub fn to_html(note: &Note, conv: &Conversation, annotations: &[Annotation]) -> String {
     let hidden = annotation_hidden_ids(annotations, conv);
-    to_html_with(note, conv, true, &hidden, annotations)
+    to_html_with(note, conv, true, &hidden, annotations, false)
 }
 
 /// 只渲染笔记正文、不含左侧对话树（Web 内嵌用，避免与页面自身树重复）。
 /// `hidden` 为批注线程的解释 id 集合：这些问答不在正文内联显示（只在弹窗看）。
 pub fn to_html_bare(note: &Note, conv: &Conversation, hidden: &HashSet<String>) -> String {
-    to_html_with(note, conv, false, hidden, &[])
+    to_html_with(note, conv, false, hidden, &[], true)
 }
 
 /// 批注线程涉及的所有解释 id（正文隐藏这些问答）。
@@ -599,8 +701,10 @@ fn to_html_with(
     include_tree: bool,
     hidden: &HashSet<String>,
     annotations: &[Annotation],
+    web: bool,
 ) -> String {
-    let md = convert_inline_math_delims(&to_markdown_with(note, true, hidden));
+    let fig_mode = if web { MediaMode::Web } else { MediaMode::Inline };
+    let md = convert_inline_math_delims(&to_markdown_mode(note, true, hidden, fig_mode));
     let md_json = serde_json::to_string(&md).unwrap_or_default();
     // 数学宏定义（HTML/讲义导入时收集）：渲染公式时注册给 KaTeX
     let macros_json =
@@ -841,5 +945,44 @@ mod tests {
         assert!(!KATEX_CSS_INLINE.contains("url(fonts/"));
         assert!(!KATEX_CSS_INLINE.contains("format('woff')"));
         assert!(!KATEX_CSS_INLINE.contains("format('truetype')"));
+    }
+
+    /// Base64 编码：标准测试向量。
+    #[test]
+    fn b64_encode_known_vectors() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(b64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// Web 模式：`[[fig:ID]]` 替换为 `/api/media/<media_id>/<file>` 图片。
+    #[test]
+    fn figure_placeholder_resolves_to_media_url() {
+        let mut note = crate::notes::parse_markdown_note("# 标题\n\n见图：[[fig:1]]", "");
+        note.media_id = Some("mid123".into());
+        note.figures = vec![Figure {
+            id: "1".into(),
+            kind: "figure".into(),
+            page: 2,
+            caption: "系统架构".into(),
+            file: "fig-01.png".into(),
+            w: 10,
+            h: 10,
+        }];
+        let md = resolve_figures(&to_markdown(&note), &note, MediaMode::Web);
+        assert!(md.contains("![系统架构](/api/media/mid123/fig-01.png)"), "got: {md}");
+        assert!(!md.contains("[[fig:1]]"));
+    }
+
+    /// 无图表时（旧笔记）占位符替换与不替换都不改变正文。
+    #[test]
+    fn figure_resolution_noop_without_figures() {
+        let note = crate::notes::parse_markdown_note("# 标题\n\n正文", "");
+        let md = resolve_figures(&to_markdown(&note), &note, MediaMode::Web);
+        assert!(md.contains("正文"));
     }
 }
