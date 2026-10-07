@@ -1473,14 +1473,14 @@ function applyHighlights() {
 function highlightAnnotation(doc, note, ann) {
   const anchor = doc.getElementById("blk-" + ann.block_id);
   if (!anchor) return;
-  // 块范围：[块锚点, 下一个块锚点)
-  const anchors = note.querySelectorAll('a[id^="blk-"]');
+  // 块范围：[块锚点, 下一个块锚点)。HTML 笔记锚点是块元素自身，Markdown 笔记是前置零宽 <a>
+  const anchors = note.querySelectorAll('[id^="blk-"]');
   let next = null;
   for (const a of anchors) {
     if (a.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_PRECEDING) { next = a; break; }
   }
   const range = doc.createRange();
-  range.setStartAfter(anchor);
+  range.setStartBefore(anchor);
   if (next) range.setEndBefore(next);
   else range.setEnd(note, note.childNodes.length);
   wrapQuote(doc, range, ann.quote, ann.id);
@@ -1643,11 +1643,13 @@ function wrapQuote(doc, range, quote, annId) {
 function blockIdForNode(doc, node) {
   const note = doc.getElementById("note");
   if (!note || !note.contains(node)) return null;
-  // 标题可能把 blk- 锚点包在内部，优先用它
-  const inner = node.querySelector ? node.querySelector('a[id^="blk-"]') : null;
-  if (inner) return inner.id.slice(4);
+  // HTML 笔记：块元素自身带 id，用 closest 向上找最近的可锚定块
+  const el = node.nodeType === 1 ? node : node.parentElement;
+  const own = el && el.closest ? el.closest('[id^="blk-"]') : null;
+  if (own && note.contains(own)) return own.id.slice(4);
+  // Markdown 笔记：零宽 <a id="blk-…"> 前置锚点，取位于该节点之前的最近锚点
   let best = null;
-  for (const a of note.querySelectorAll('a[id^="blk-"]')) {
+  for (const a of note.querySelectorAll('[id^="blk-"]')) {
     const pos = a.compareDocumentPosition(node);
     if (pos & Node.DOCUMENT_POSITION_FOLLOWING) best = a;
     else if (pos & Node.DOCUMENT_POSITION_PRECEDING) break;
@@ -4145,20 +4147,24 @@ const ENUM_LABELS = {
     note: "整篇笔记（默认）",
     full: "整篇笔记 + 论文原文（最全，最费 token）",
   },
+  "note.format": {
+    html: "HTML（推荐，可用 SVG 画示意图）",
+    markdown: "Markdown（旧格式）",
+  },
 };
 
-/// 按 schema 渲染「模型设置」页控件（分组：llm / pricing / budget）。
+/// 按 schema 渲染「模型设置」页控件（分组：llm / note / pricing / budget）。
 function renderConfigFields(fields) {
   const box = $("cfg-fields");
   box.innerHTML = "";
   for (const k in cfgFieldEls) delete cfgFieldEls[k];
-  const titles = { llm: "模型与端点", pricing: "计费单价", budget: "token 预算" };
+  const titles = { llm: "模型与端点", note: "笔记", pricing: "计费单价", budget: "token 预算" };
   const groups = {};
   for (const f of fields) {
     if (f.group === "ui") continue;
     (groups[f.group] = groups[f.group] || []).push(f);
   }
-  for (const g of ["llm", "pricing", "budget"]) {
+  for (const g of ["llm", "note", "pricing", "budget"]) {
     if (!groups[g] || !groups[g].length) continue;
     const h = document.createElement("p");
     h.className = "settings-group-title";

@@ -542,6 +542,8 @@ pub struct IngestJob {
     pdf_document: Option<crate::llm::DocumentPart>,
     /// PDF 输入尝试顺序，失败自动降级到下一档（末尾通常是纯文本兜底）。
     attempts: Vec<PdfModality>,
+    /// 是否生成 HTML 格式笔记（`note.format = html`，阶段3）。
+    html: bool,
 }
 
 /// PDF 交给模型的三种方式（用于降级链）。
@@ -1826,10 +1828,19 @@ PaperHelper 命令：
                 }
             }
         };
-        let prompt =
-            crate::prompts::compose_style_prompt_with_figures(&style, &raw_text, &extra, &figures)?;
+        let html = mode == "pdf" && self.config.note.format == "html";
+        let prompt = if html {
+            crate::prompts::compose_style_prompt_html_with_figures(&style, &raw_text, &extra, &figures)?
+        } else {
+            crate::prompts::compose_style_prompt_with_figures(&style, &raw_text, &extra, &figures)?
+        };
+        let sys = if html {
+            "你是笔记生成助手，只输出 HTML 片段正文。"
+        } else {
+            "你是笔记生成助手，只输出 Markdown。"
+        };
         let msgs = vec![
-            Message::text("system", "你是笔记生成助手，只输出 Markdown。"),
+            Message::text("system", sys),
             Message::text("user", prompt),
         ];
         // 有笔记/对话的会话先分配 id：在途任务完成时按此 key 写回发起会话
@@ -1850,6 +1861,7 @@ PaperHelper 命令：
             page_images,
             pdf_document,
             attempts,
+            html,
         })))
     }
 
@@ -1891,7 +1903,11 @@ PaperHelper 命令：
                 "⚠️ ".yellow()
             );
         }
-        let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
+        let mut note = if job.html {
+            notes::parse_html_note(&res.content, &job.raw_text)
+        } else {
+            notes::parse_markdown_note(&res.content, &job.raw_text)
+        };
         note.material_kind = job.kind.clone();
         note.figures = job.figures.clone();
         note.media_id = job.media_id.clone();
@@ -1913,7 +1929,11 @@ PaperHelper 命令：
         let (in_tok, out_tok) = (res.input_tokens, res.output_tokens);
         let cost = self.price_cost(in_tok, out_tok);
         self.kb.stats.add(in_tok, out_tok, cost);
-        let mut note = notes::parse_markdown_note(&res.content, &job.raw_text);
+        let mut note = if job.html {
+            notes::parse_html_note(&res.content, &job.raw_text)
+        } else {
+            notes::parse_markdown_note(&res.content, &job.raw_text)
+        };
         note.material_kind = job.kind.clone();
         note.figures = job.figures.clone();
         note.media_id = job.media_id.clone();
@@ -2528,15 +2548,19 @@ PaperHelper 命令：
         if text.is_empty() {
             bail!("内容不能为空");
         }
-        let is_section = {
+        let (is_section, is_html) = {
             let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
             let Some(b) = note.find_block(block_id) else {
                 bail!("找不到要重写的块（笔记可能已变化）");
             };
-            b.kind == notes::BlockKind::Section
+            (b.kind == notes::BlockKind::Section, note.is_html())
         };
         let parsed = if is_section {
-            let blocks = notes::parse_markdown_blocks(text);
+            let blocks = if is_html {
+                notes::parse_html_blocks(text)
+            } else {
+                notes::parse_markdown_blocks(text)
+            };
             if blocks.is_empty() {
                 bail!("内容解析不出任何块");
             }
@@ -2576,13 +2600,18 @@ PaperHelper 命令：
         Ok(())
     }
 
-    /// 在目标块之后插入 Markdown 解析出的块（可一次插入多个）。
+    /// 在目标块之后插入解析出的块（可一次插入多个）。
     pub fn insert_after(&mut self, after_block_id: &str, text: &str) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
             bail!("内容不能为空");
         }
-        let blocks = notes::parse_markdown_blocks(text);
+        let is_html = self.session.notes.as_ref().map(|n| n.is_html()).unwrap_or(false);
+        let blocks = if is_html {
+            notes::parse_html_blocks(text)
+        } else {
+            notes::parse_markdown_blocks(text)
+        };
         if blocks.is_empty() {
             bail!("内容解析不出任何块");
         }
@@ -2673,10 +2702,19 @@ PaperHelper 命令：
                 .ok_or_else(|| anyhow!("找不到要处理的块"))?;
             format!("（{kind}）\n{content}")
         };
+        let html = note.is_html();
         let task = if mode == "append" {
-            "请生成要**补充**到该片段之后的新内容；不要重复已有内容，可直接给出新的段落或 `##`/`###` 小节。"
+            if html {
+                "请生成要**补充**到该片段之后的新内容；不要重复已有内容，可直接给出新的 `<p>` 段落或 `<h2>`/`<h3>` 小节。"
+            } else {
+                "请生成要**补充**到该片段之后的新内容；不要重复已有内容，可直接给出新的段落或 `##`/`###` 小节。"
+            }
         } else if is_section {
-            "请**重写**该章节：可重写标题（用 `##` 开头，`###` 表示其下小节）与全部正文；保持结构清晰、内容更完整。"
+            if html {
+                "请**重写**该章节：可重写标题（用 `<h2>`，`<h3>` 表示其下小节）与全部正文；保持结构清晰、内容更完整。"
+            } else {
+                "请**重写**该章节：可重写标题（用 `##` 开头，`###` 表示其下小节）与全部正文；保持结构清晰、内容更完整。"
+            }
         } else {
             "请**重写**该片段（整段替换）；保留原意，使表述更清晰、更完整，必要时可拆成多段。"
         };
@@ -2685,12 +2723,22 @@ PaperHelper 命令：
             "rewrite.txt",
             crate::prompts::DEFAULT_REWRITE_PROMPT,
         );
-        let prompt = template
+        let note_ctx = if html {
+            note.block_markdown(notes::TITLE_ID).unwrap_or_default()
+        } else {
+            note.to_markdown()
+        };
+        let mut prompt = template
             .replace("{paper}", &note.raw_text)
-            .replace("{note}", &note.to_markdown())
+            .replace("{note}", &note_ctx)
             .replace("{target}", &target)
             .replace("{instruction}", instruction)
             .replace("{task}", task);
+        if html {
+            prompt.push_str(
+                "\n\n【输出格式】只输出 HTML 片段（用 <h2>/<h3>/<p>/<ul>/<table> 等，行内公式用 \\(...\\)，行间公式用 \\[...\\]）；不要输出 Markdown、不要代码围栏、不要解释。",
+            );
+        }
         Ok(vec![Message::text("user", prompt)])
     }
 
@@ -2699,13 +2747,24 @@ PaperHelper 命令：
     pub fn restyle_messages(&self, style: &str, extra: &str) -> Result<Vec<Message>> {
         let note = self.session.notes.as_ref().ok_or_else(|| anyhow!("还没有笔记"))?;
         let material = if note.raw_text.trim().is_empty() {
-            note.to_markdown()
+            note.block_markdown(notes::TITLE_ID).unwrap_or_default()
         } else {
             note.raw_text.clone()
         };
-        let prompt = crate::prompts::compose_style_prompt(style, &material, extra)?;
+        let html = note.is_html();
+        let (sys, prompt) = if html {
+            (
+                "你是笔记生成助手，只输出 HTML 片段正文。",
+                crate::prompts::compose_style_prompt_html(style, &material, extra)?,
+            )
+        } else {
+            (
+                "你是笔记生成助手，只输出 Markdown。",
+                crate::prompts::compose_style_prompt(style, &material, extra)?,
+            )
+        };
         Ok(vec![
-            Message::text("system", "你是笔记生成助手，只输出 Markdown。"),
+            Message::text("system", sys),
             Message::text("user", prompt),
         ])
     }
@@ -2761,24 +2820,34 @@ PaperHelper 命令：
 
     /// 用「按风格重写」的结果替换整篇笔记（重建全部块 id）。
     /// 会清空现有批注（块锚点已失效），并入撤销栈供「撤销」恢复。
-    pub fn apply_restyle(&mut self, markdown: &str) -> Result<()> {
-        if markdown.trim().is_empty() {
+    pub fn apply_restyle(&mut self, content: &str) -> Result<()> {
+        if content.trim().is_empty() {
             bail!("内容为空");
         }
         let Some(old) = self.session.notes.as_ref() else {
             bail!("还没有笔记");
         };
+        let is_html = old.is_html();
         let raw_text = old.raw_text.clone();
         let paper_id = old.paper_id.clone();
         let material_kind = old.material_kind.clone();
         let math_macros = old.math_macros.clone();
+        let figures = old.figures.clone();
+        let media_id = old.media_id.clone();
         self.push_undo();
-        let mut note = notes::parse_markdown_note(markdown, &raw_text);
+        let mut note = if is_html {
+            notes::parse_html_note(content, &raw_text)
+        } else {
+            notes::parse_markdown_note(content, &raw_text)
+        };
         note.paper_id = paper_id;
         note.material_kind = material_kind;
         if note.math_macros.is_none() && math_macros.is_some() {
             note.math_macros = math_macros;
         }
+        note.figures = figures;
+        note.media_id = media_id;
+        note.ensure_figures_placed();
         self.session.annotations.clear(); // 旧批注锚定在旧块上，整篇重建后失效
         self.session.notes = Some(note);
         self.update_completions();

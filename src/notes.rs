@@ -61,7 +61,13 @@ pub struct Explanation {
 pub struct Block {
     pub id: String,
     pub kind: BlockKind,
+    /// 纯文本内容：Markdown 笔记为 Markdown 源；HTML 笔记为该块的纯文本
+    /// （由 HTML 剥标签得到，供大纲/定位/提问上下文使用）。
     pub text: String,
+    /// HTML 笔记的块内 HTML（阶段3）。Markdown 笔记恒为 None，走 `text` 渲染。
+    /// 段落块存正文 HTML；Section/Formula 块为 None（标题与公式由渲染器生成）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
     /// 层级编号，如 "3.2"，仅 Section 有；Paragraph 无（空串）。
     #[serde(default)]
     pub number: String,
@@ -125,6 +131,10 @@ pub struct Note {
     /// 图表媒体目录命名空间（`/api/media/<media_id>/<file>`）；无图表为空。
     #[serde(default)]
     pub media_id: Option<String>,
+    /// 正文格式：`"markdown"`（旧，默认）或 `"html"`（阶段3 新论文笔记）。
+    /// HTML 笔记的段落块在 `Block.html` 存 HTML，`Block.text` 存其纯文本。
+    #[serde(default)]
+    pub body_format: String,
 }
 
 impl Note {
@@ -153,7 +163,8 @@ impl Note {
         let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (b, _) in self.flatten() {
             for f in &self.figures {
-                if b.text.contains(&format!("[[fig:{}]]", f.id)) {
+                let ph = format!("[[fig:{}]]", f.id);
+                if b.text.contains(&ph) || b.html.as_deref().is_some_and(|h| h.contains(&ph)) {
                     used.insert(f.id.clone());
                 }
             }
@@ -180,6 +191,7 @@ impl Note {
                 id: uid(),
                 kind: BlockKind::Paragraph,
                 text,
+                html: None,
                 number: String::new(),
                 children: Vec::new(),
                 explanations: Vec::new(),
@@ -189,6 +201,7 @@ impl Note {
             id: uid(),
             kind: BlockKind::Section,
             text: "图表".to_string(),
+            html: None,
             number: String::new(),
             children,
             explanations: Vec::new(),
@@ -227,45 +240,89 @@ impl Note {
     }
 
     /// 修改块文本；`TITLE_ID` 表示修改标题。返回是否找到目标。
+    /// HTML 笔记的段落块：传入的是该块的 HTML 源，同时刷新纯文本（`text`）。
     pub fn set_text(&mut self, id: &str, text: &str) -> bool {
         if id == TITLE_ID {
-            self.title = text.to_string();
+            self.title = if self.body_format == "html" { strip_html_tags(text) } else { text.to_string() };
             return true;
         }
+        let html_mode = self.body_format == "html";
         match self.find_block_mut(id) {
             Some(b) => {
-                b.text = text.to_string();
+                if html_mode && b.kind == BlockKind::Paragraph {
+                    b.html = Some(text.to_string());
+                    b.text = strip_html_tags(text);
+                } else if html_mode {
+                    b.text = strip_html_tags(text);
+                } else {
+                    b.text = text.to_string();
+                }
                 true
             }
             None => false,
         }
     }
 
-    /// 渲染某块（含子树）为 Markdown，供编辑弹窗展示（**不含自动编号**）。
-    /// Section 从 `##` 起、子树逐层 `###`…；段落/公式输出正文。`TITLE_ID` 返回标题 + 全文。
+    /// 是否 HTML 正文格式（阶段3）。
+    pub fn is_html(&self) -> bool {
+        self.body_format == "html"
+    }
+
+    /// 渲染某块（含子树）为编辑器源文本，供编辑弹窗展示（**不含自动编号**）。
+    /// Markdown 笔记返回 Markdown；HTML 笔记返回 HTML 片段。
+    /// Section 从第 2 层起、子树逐层加深；段落/公式输出正文。`TITLE_ID` 返回标题 + 全文。
     pub fn block_markdown(&self, id: &str) -> Option<String> {
-        fn render_block(b: &Block, level: usize, s: &mut String) {
+        let html = self.is_html();
+        fn render_md(b: &Block, level: usize, s: &mut String) {
             match b.kind {
                 BlockKind::Section => {
                     s.push_str(&format!("{} {}\n\n", "#".repeat(level.min(6)), b.text));
                     for c in &b.children {
-                        render_block(c, level + 1, s);
+                        render_md(c, level + 1, s);
                     }
                 }
                 BlockKind::Paragraph => s.push_str(&format!("{}\n\n", b.text)),
                 BlockKind::Formula => s.push_str(&format!("$$\n{}\n$$\n\n", b.text)),
             }
         }
+        fn render_html(b: &Block, level: usize, s: &mut String) {
+            match b.kind {
+                BlockKind::Section => {
+                    let lv = level.clamp(1, 6);
+                    s.push_str(&format!("<h{lv}>{}</h{lv}>\n", escape_html(&b.text)));
+                    for c in &b.children {
+                        render_html(c, level + 1, s);
+                    }
+                }
+                BlockKind::Paragraph => {
+                    let inner = b.html.clone().unwrap_or_else(|| escape_html(&b.text));
+                    s.push_str(&format!("{inner}\n"));
+                }
+                BlockKind::Formula => s.push_str(&format!("$$\n{}\n$$\n", b.text)),
+            }
+        }
         if id == TITLE_ID {
-            let mut s = format!("# {}\n\n", self.title);
+            let mut s = if html {
+                format!("<h1>{}</h1>\n", escape_html(&self.title))
+            } else {
+                format!("# {}\n\n", self.title)
+            };
             for b in &self.blocks {
-                render_block(b, 2, &mut s);
+                if html {
+                    render_html(b, 2, &mut s);
+                } else {
+                    render_md(b, 2, &mut s);
+                }
             }
             return Some(s.trim_end().to_string());
         }
         let b = self.find_block(id)?;
         let mut s = String::new();
-        render_block(b, 2, &mut s);
+        if html {
+            render_html(b, 2, &mut s);
+        } else {
+            render_md(b, 2, &mut s);
+        }
         Some(s.trim_end().to_string())
     }
 
@@ -675,6 +732,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
             id: uid(),
             kind: BlockKind::Paragraph,
             text: t,
+            html: None,
             number: String::new(),
             children: Vec::new(),
             explanations: Vec::new(),
@@ -691,6 +749,7 @@ pub fn parse_markdown_note(md: &str, raw_text: &str) -> Note {
         source_path: None,
         figures: Vec::new(),
         media_id: None,
+        body_format: "markdown".to_string(),
     };
     assign_numbers(&mut note);
     note
@@ -715,6 +774,7 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
             id: uid(),
             kind: BlockKind::Paragraph,
             text: md.trim().to_string(),
+            html: None,
             number: String::new(),
             children: Vec::new(),
             explanations: Vec::new(),
@@ -731,6 +791,7 @@ pub fn parse_import_note(md: &str, fallback_title: &str) -> Note {
         source_path: None,
         figures: Vec::new(),
         media_id: None,
+        body_format: "markdown".to_string(),
     };
     assign_numbers(&mut note);
     note
@@ -749,6 +810,7 @@ pub fn readonly_note(title: impl Into<String>, raw_text: impl Into<String>) -> N
         source_path: None,
         figures: Vec::new(),
         media_id: None,
+        body_format: "markdown".to_string(),
     }
 }
 
@@ -764,6 +826,7 @@ fn split_into_paragraphs(md: &str) -> Vec<Block> {
             id: uid(),
             kind: BlockKind::Paragraph,
             text: t.to_string(),
+            html: None,
             number: String::new(),
             children: Vec::new(),
             explanations: Vec::new(),
@@ -777,6 +840,245 @@ fn split_into_paragraphs(md: &str) -> Vec<Block> {
 pub fn parse_markdown_blocks(md: &str) -> Vec<Block> {
     let (_title, roots) = parse_blocks_core(&strip_reasoning(md), false);
     roots
+}
+
+/// 解析 LLM 输出的 HTML 片段为笔记树（阶段3，`note.format = html`）。
+/// 约定：`<h1>`=标题；`<h2>`…`<h6>`=按层级嵌套的 Section；每个标题到下一个标题
+/// 之间的 HTML 合成为一个 Paragraph（`html`=该段 HTML，`text`=其纯文本）。
+pub fn parse_html_note(html: &str, raw_text: &str) -> Note {
+    let html = strip_html_fences(&strip_reasoning(html));
+    let (mut title, roots) = parse_html_blocks_core(&html, true);
+    if title.is_empty() {
+        title = "未命名论文".to_string();
+    }
+    let mut note = Note {
+        paper_id: String::new(),
+        title,
+        blocks: roots,
+        raw_text: raw_text.to_string(),
+        material_kind: String::new(),
+        math_macros: None,
+        source_path: None,
+        figures: Vec::new(),
+        media_id: None,
+        body_format: "html".to_string(),
+    };
+    assign_numbers(&mut note);
+    note
+}
+
+/// 解析一段 HTML 为块序列（供「插入内容 / 整节重写」使用）。
+pub fn parse_html_blocks(html: &str) -> Vec<Block> {
+    let (_title, roots) = parse_html_blocks_core(&strip_html_fences(&strip_reasoning(html)), false);
+    roots
+}
+
+/// 剥除包住整段 HTML 的 ```html … ``` 围栏（LLM 常把片段放进代码块）。
+fn strip_html_fences(s: &str) -> String {
+    let t = s.trim();
+    let body = if t.starts_with("```") {
+        let rest = &t[3..];
+        let rest = rest.trim_start_matches(|c: char| c.is_alphanumeric());
+        rest.trim_start_matches(['\r', '\n'])
+    } else {
+        t
+    };
+    let body = body.trim_end();
+    match body.strip_suffix("```") {
+        Some(inner) => inner.trim_end().to_string(),
+        None => body.to_string(),
+    }
+}
+
+/// 一个 HTML 标题的位置与内容。`start`/`close_end` 为字节偏移。
+struct HtmlHeading {
+    start: usize,
+    close_end: usize,
+    level: usize,
+    inner: String,
+}
+
+/// 从 `from` 起查找下一个 `<h1>`..`<h6>`（大小写不敏感），返回其范围与内容。
+fn next_heading(html: &str, from: usize) -> Option<HtmlHeading> {
+    let bytes = html.as_bytes();
+    let mut i = from;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'<' && (bytes[i + 1] | 0x20) == b'h' {
+            let lvl = bytes[i + 2];
+            if (b'1'..=b'6').contains(&lvl) {
+                let after = bytes[i + 3];
+                if matches!(after, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/') {
+                    let open_end = i + html[i..].find('>')? + 1;
+                    let level = (lvl - b'0') as usize;
+                    let close_lc = format!("</h{}", level);
+                    let close_uc = format!("</H{}", level);
+                    let rel = html[open_end..]
+                        .find(&close_lc)
+                        .or_else(|| html[open_end..].find(&close_uc))?;
+                    let close_start = open_end + rel;
+                    let close_end = close_start + html[close_start..].find('>')? + 1;
+                    let inner = html[open_end..close_start].to_string();
+                    return Some(HtmlHeading {
+                        start: i,
+                        close_end,
+                        level,
+                        inner,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// HTML 解析核心：返回 (标题, 顶层块)。与 Markdown 版行为一致（一节合成一段）。
+fn parse_html_blocks_core(html: &str, h1_as_title: bool) -> (String, Vec<Block>) {
+    let mut title = String::new();
+    let mut roots: Vec<Block> = Vec::new();
+    let mut stack: Vec<(Block, usize)> = Vec::new();
+
+    fn flush(segment: &str, roots: &mut Vec<Block>, stack: &mut Vec<(Block, usize)>) {
+        if segment.trim().is_empty() {
+            return;
+        }
+        let block = Block {
+            id: uid(),
+            kind: BlockKind::Paragraph,
+            text: strip_html_tags(segment),
+            html: Some(segment.trim().to_string()),
+            number: String::new(),
+            children: Vec::new(),
+            explanations: Vec::new(),
+        };
+        if let Some((sec, _)) = stack.last_mut() {
+            sec.children.push(block);
+        } else {
+            roots.push(block);
+        }
+    }
+
+    let mut content_start = 0usize;
+    let mut pos = 0usize;
+    while let Some(h) = next_heading(html, pos) {
+        flush(&html[content_start..h.start], &mut roots, &mut stack);
+        let text = strip_leading_number(&strip_html_tags(&h.inner));
+        if h.level == 1 && h1_as_title {
+            if title.is_empty() {
+                title = text;
+            }
+        } else {
+            while let Some((_, l)) = stack.last() {
+                if *l >= h.level {
+                    let (sec, _) = stack.pop().unwrap();
+                    if let Some((parent, _)) = stack.last_mut() {
+                        parent.children.push(sec);
+                    } else {
+                        roots.push(sec);
+                    }
+                } else {
+                    break;
+                }
+            }
+            stack.push((
+                Block {
+                    id: uid(),
+                    kind: BlockKind::Section,
+                    text,
+                    html: None,
+                    number: String::new(),
+                    children: Vec::new(),
+                    explanations: Vec::new(),
+                },
+                h.level,
+            ));
+        }
+        content_start = h.close_end;
+        pos = h.close_end;
+    }
+    flush(&html[content_start..], &mut roots, &mut stack);
+    while let Some((sec, _)) = stack.pop() {
+        if let Some((parent, _)) = stack.last_mut() {
+            parent.children.push(sec);
+        } else {
+            roots.push(sec);
+        }
+    }
+    (title, roots)
+}
+
+/// 剥去 HTML 标签、解码常见实体并压缩空白，得到用于大纲/定位/提问上下文的纯文本。
+pub fn strip_html_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+            out.push(' ');
+        } else if !in_tag {
+            out.push(c);
+        }
+    }
+    decode_entities(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_entities(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        if let Some(semi) = after.find(';') {
+            if let Some(ch) = entity_char(&after[1..semi]) {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn entity_char(ent: &str) -> Option<char> {
+    match ent {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" | "#39" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let num = ent.strip_prefix('#')?;
+            let code = if let Some(hex) = num.strip_prefix(['x', 'X']) {
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                num.parse::<u32>().ok()?
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
+/// 转义 HTML 文本（用于 HTML 笔记的纯文本回退渲染）。
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 解析核心：返回 (标题, 顶层块)。`h1_as_title=true` 时 `#` 作标题（ingest 用）；
@@ -801,6 +1103,7 @@ fn parse_blocks_core_inner(md: &str, h1_as_title: bool) -> (String, Vec<Block>) 
                 id: uid(),
                 kind: BlockKind::Paragraph,
                 text: buf.trim().to_string(),
+                html: None,
                 number: String::new(),
                 children: Vec::new(),
                 explanations: Vec::new(),
@@ -862,6 +1165,7 @@ fn parse_blocks_core_inner(md: &str, h1_as_title: bool) -> (String, Vec<Block>) 
                     id: uid(),
                     kind: BlockKind::Section,
                     text,
+                    html: None,
                     number: String::new(),
                     children: Vec::new(),
                     explanations: Vec::new(),
@@ -1674,5 +1978,69 @@ mod tests {
         let (m, md) = take_macros_comment("# T\n\nx");
         assert!(m.is_none());
         assert_eq!(md, "# T\n\nx");
+    }
+
+    #[test]
+    fn parse_html_note_builds_tree_from_headings() {
+        let html = "<h1>论文标题</h1>\n<h2>一、引言</h2>\n<p>这是<b>正文</b>。</p>\n\
+                    <h2>二、方法</h2>\n<h3>2.1 注意力</h3>\n<p>公式 \\(x^2\\)</p>";
+        let note = parse_html_note(html, "raw");
+        assert_eq!(note.title, "论文标题");
+        assert!(note.is_html());
+        assert_eq!(note.body_format, "html");
+        assert_eq!(note.blocks.len(), 2, "两个顶级章节");
+        assert_eq!(note.blocks[0].kind, BlockKind::Section);
+        assert_eq!(note.blocks[1].text, "方法", "自动序号被剥离");
+        let flat = note.flatten();
+        let para = flat
+            .iter()
+            .find(|(b, _)| b.kind == BlockKind::Paragraph)
+            .expect("应有段落");
+        assert!(para.0.text.contains("这是") && para.0.text.contains("正文"));
+        assert!(para.0.html.as_deref().unwrap().contains("<b>正文</b>"));
+    }
+
+    #[test]
+    fn html_note_block_markdown_renders_html() {
+        let html = "<h1>T</h1>\n<h2>章节</h2>\n<p>文本 <code>x_1</code></p>";
+        let note = parse_html_note(html, "raw");
+        let src = note.block_markdown(&note.blocks[0].id).unwrap();
+        assert!(src.contains("<h2>章节</h2>"), "{src}");
+        assert!(src.contains("<p>"), "{src}");
+        assert!(!src.contains("##"), "不应是 Markdown: {src}");
+    }
+
+    #[test]
+    fn html_note_set_text_updates_html_and_plain() {
+        let html = "<h1>T</h1>\n<h2>S</h2>\n<p>旧文本</p>";
+        let mut note = parse_html_note(html, "raw");
+        let pid = note
+            .flatten()
+            .iter()
+            .find(|(b, _)| b.kind == BlockKind::Paragraph)
+            .unwrap()
+            .0
+            .id
+            .clone();
+        assert!(note.set_text(&pid, "<p>新文本 <em>强调</em></p>"));
+        let b = note.find_block(&pid).unwrap();
+        assert_eq!(b.html.as_deref().unwrap(), "<p>新文本 <em>强调</em></p>");
+        assert!(b.text.contains("新文本") && b.text.contains("强调"));
+    }
+
+    #[test]
+    fn parse_html_blocks_splits_headings_and_paragraph() {
+        let blocks = parse_html_blocks("<h2>A</h2>\n<p>p1</p>\n<h3>A1</h3>\n<p>p2</p>");
+        assert_eq!(blocks.len(), 1, "h3 应嵌套在 h2 下");
+        assert_eq!(blocks[0].kind, BlockKind::Section);
+        assert!(blocks[0].children.iter().any(|b| b.kind == BlockKind::Paragraph));
+        assert!(blocks[0].children.iter().any(|b| b.kind == BlockKind::Section));
+    }
+
+    #[test]
+    fn parse_html_note_strips_code_fence() {
+        let note = parse_html_note("```html\n<h1>T</h1>\n<p>正文</p>\n```", "raw");
+        assert_eq!(note.title, "T");
+        assert!(!note.block_markdown(&note.blocks[0].id).unwrap().contains("```"));
     }
 }

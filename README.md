@@ -163,6 +163,7 @@ paperhelper web --port 9000  # 指定端口（被占自动顺延）
 | `llm.paper_relation` | 论文关联增强：回答时是否参考其它相关论文。默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token | concept |
 | `llm.context_scope` | 提问上下文：提问时发给模型的资料多少。只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token | note |
 | `llm.kb_agent` | 概念检索代理：回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token | false |
+| `note.format` | 笔记格式：新生成论文笔记的正文格式。HTML（推荐）可用内联 HTML/SVG 画示意图、公式与排版更丰富；Markdown 为旧格式。旧笔记与导入的 Markdown 笔记不受影响 | html |
 | `pricing.input_price_per_1m` | 输入单价 | 0.15 |
 | `pricing.output_price_per_1m` | 输出单价 | 0.60 |
 | `budget.token_budget` | token 预算（0=不限） | 0 |

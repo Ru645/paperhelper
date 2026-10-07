@@ -282,6 +282,104 @@ fn render_summary(summary: &str, prefix: &str, s: &mut String) {
     }
 }
 
+/// 渲染 HTML 笔记正文（阶段3）：标题/公式由渲染器生成，段落用其 HTML 片段。
+/// 与 `to_markdown_with` 对应：`anchors=true` 时把 `id="blk-…"` 直接放在块元素上。
+fn to_html_body_with(
+    note: &Note,
+    anchors: bool,
+    hidden: &HashSet<String>,
+    mode: MediaMode,
+) -> String {
+    let title = html_escape(&note.title);
+    let mut s = if anchors {
+        format!("<h1 id=\"blk-__title__\">{title}</h1>\n\n")
+    } else {
+        format!("<h1>{title}</h1>\n\n")
+    };
+    walk_html(&note.blocks, 0, anchors, hidden, note, mode, &mut s);
+    s
+}
+
+fn walk_html(
+    blocks: &[Block],
+    depth: usize,
+    anchors: bool,
+    hidden: &HashSet<String>,
+    note: &Note,
+    mode: MediaMode,
+    s: &mut String,
+) {
+    for b in blocks {
+        let id = if anchors {
+            format!(" id=\"blk-{}\"", b.id)
+        } else {
+            String::new()
+        };
+        match b.kind {
+            BlockKind::Section => {
+                let level = (depth + 2).min(6);
+                let title = if b.number.is_empty() {
+                    html_escape(&b.text)
+                } else {
+                    format!("{} {}", b.number, html_escape(&b.text))
+                };
+                s.push_str(&format!("<h{level}{id}>{title}</h{level}>\n\n"));
+            }
+            BlockKind::Paragraph => {
+                let inner = match &b.html {
+                    Some(h) => resolve_figures_html(h, note, mode),
+                    None => resolve_figures_html(&html_escape(&b.text), note, mode),
+                };
+                s.push_str(&format!("<div class=\"note-block\"{id}>\n{inner}\n</div>\n\n"));
+            }
+            BlockKind::Formula => {
+                s.push_str(&format!(
+                    "<div class=\"note-block\"{id}>\n$$\n{}\n$$\n</div>\n\n",
+                    b.text
+                ));
+            }
+        }
+        for (i, e) in b.explanations.iter().enumerate() {
+            if hidden.contains(&e.id) {
+                continue;
+            }
+            if i > 0 {
+                s.push('\n');
+            }
+            render_explanation(e, 1, anchors, hidden, s);
+            s.push('\n');
+        }
+        walk_html(&b.children, depth + 1, anchors, hidden, note, mode, s);
+    }
+}
+
+/// 把 HTML 正文里的 `[[fig:ID]]` 占位符替换为 `<figure><img>…`（Web 相对路径或 data URI）。
+fn resolve_figures_html(html: &str, note: &Note, mode: MediaMode) -> String {
+    if mode == MediaMode::Placeholder || note.figures.is_empty() || !html.contains("[[fig:") {
+        return html.to_string();
+    }
+    let mut out = html.to_string();
+    for f in &note.figures {
+        let ph = format!("[[fig:{}]]", f.id);
+        if !out.contains(&ph) {
+            continue;
+        }
+        let src = figure_src(note, f, mode);
+        if src.is_empty() {
+            continue;
+        }
+        let alt = figure_alt(f);
+        let fig = format!(
+            "<figure class=\"fig\"><img src=\"{}\" alt=\"{}\"><figcaption>{}</figcaption></figure>",
+            html_escape(&src),
+            html_escape(&alt),
+            html_escape(&alt),
+        );
+        out = out.replace(&ph, &fig);
+    }
+    out
+}
+
 /// 输出 markmap 兼容的缩进 markdown，可直接用 markmap 打开为思维导图。
 pub fn to_mindmap(note: &Note) -> String {
     let mut s = format!("# {}\n", note.title);
@@ -398,6 +496,8 @@ fn thread_json(
 /// 导出 HTML 不依赖任何 CDN：断网、内网都能正常渲染公式。
 const MARKED_JS: &str = include_str!("../web/vendor/marked.min.js");
 const KATEX_JS: &str = include_str!("../web/vendor/katex.min.js");
+/// DOMPurify：HTML 笔记（LLM 生成的 HTML）注入前消毒，防止 XSS（MIT）。
+const PURIFY_JS: &str = include_str!("../web/vendor/purify.min.js");
 /// KaTeX 样式：字体已由 `build.rs` 转为 data URI（见 `$OUT_DIR/katex_inline.css`）
 const KATEX_CSS_INLINE: &str = include_str!(concat!(env!("OUT_DIR"), "/katex_inline.css"));
 
@@ -509,26 +609,30 @@ function convertMathDelims(md) {
   }
   return out.join('\n');
 }
-function renderMd(md) {
+function renderMd(md, wrapBare) {
   if (!window.marked) return md;
+  if (wrapBare === undefined) wrapBare = true;
   md = convertMathDelims(md);
   const store = [];
   const token = (i) => '\u2063M' + i + '\u2063';
   let src = md.replace(/\$\$([\s\S]*?)\$\$/g, (m, tex) => { store.push([tex, true]); return token(store.length - 1); });
   // 行内公式：Pandoc 规则（开头 $ 后非空白、结尾 $ 前非空白），避免把货币美元当公式
   src = src.replace(/(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
-  // 包裹漏加 $ 的裸数学 token（下标/上标，如 p_ij、S_n、s^n_k）；跳过代码围栏与行内代码
-  let inFence = false;
-  src = src.split('\n').map((line) => {
-    const t = line.trimStart();
-    if (t.startsWith('```')) { inFence = !inFence; return line; }
-    if (inFence) return line;
-    const codes = [];
-    line = line.replace(/`[^`]*`/g, (m) => { codes.push(m); return '\u2063C' + (codes.length - 1) + '\u2063'; });
-    line = line.replace(/(?<![\w$\\])(\\?[A-Za-z\u0370-\u03ff][A-Za-z0-9\u0370-\u03ff']*(?:(?:_|\^)(?:\{[^{}]*\}|[A-Za-z0-9\u0370-\u03ff]+))+)(?![\w])/g, (m) => { store.push([m, false]); return token(store.length - 1); });
-    line = line.replace(/\u2063C(\d+)\u2063/g, (_, i) => codes[+i]);
-    return line;
-  }).join('\n');
+  // 包裹漏加 $ 的裸数学 token（下标/上标，如 p_ij、S_n、s^n_k）；跳过代码围栏与行内代码。
+  // HTML 笔记（wrapBare=false）跳过：正文是 HTML，避免把属性名等误当公式。
+  if (wrapBare) {
+    let inFence = false;
+    src = src.split('\n').map((line) => {
+      const t = line.trimStart();
+      if (t.startsWith('```')) { inFence = !inFence; return line; }
+      if (inFence) return line;
+      const codes = [];
+      line = line.replace(/`[^`]*`/g, (m) => { codes.push(m); return '\u2063C' + (codes.length - 1) + '\u2063'; });
+      line = line.replace(/(?<![\w$\\])(\\?[A-Za-z\u0370-\u03ff][A-Za-z0-9\u0370-\u03ff']*(?:(?:_|\^)(?:\{[^{}]*\}|[A-Za-z0-9\u0370-\u03ff]+))+)(?![\w])/g, (m) => { store.push([m, false]); return token(store.length - 1); });
+      line = line.replace(/\u2063C(\d+)\u2063/g, (_, i) => codes[+i]);
+      return line;
+    }).join('\n');
+  }
   let html = marked.parse(src);
   html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
     const entry = store[+i];
@@ -580,13 +684,13 @@ function applyAnnotations() {
   for (const ann of ANNOTATIONS) {
     const anchor = document.getElementById('blk-' + ann.block_id);
     if (!anchor) { failed.push(ann); continue; }
-    const anchors = note.querySelectorAll('a[id^="blk-"]');
+    const anchors = note.querySelectorAll('[id^="blk-"]');
     let next = null;
     for (const a of anchors) {
       if (a.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_PRECEDING) { next = a; break; }
     }
     const range = document.createRange();
-    range.setStartAfter(anchor);
+    range.setStartBefore(anchor);
     if (next) range.setEndBefore(next); else range.setEnd(note, note.childNodes.length);
     if (!wrapQuote(document, range, ann.quote, ann)) failed.push(ann);
   }
@@ -704,11 +808,20 @@ fn to_html_with(
     web: bool,
 ) -> String {
     let fig_mode = if web { MediaMode::Web } else { MediaMode::Inline };
-    let md = convert_inline_math_delims(&to_markdown_mode(note, true, hidden, fig_mode));
-    let md_json = serde_json::to_string(&md).unwrap_or_default();
+    // HTML 笔记走块级 HTML 正文；Markdown 笔记走原 Markdown 管线。都交给 renderMd
+    //（marked 会把原始 HTML 原样透传），随后经 DOMPurify 消毒后注入页面。
+    let is_html = note.is_html();
+    let body = if is_html {
+        to_html_body_with(note, true, hidden, fig_mode)
+    } else {
+        to_markdown_mode(note, true, hidden, fig_mode)
+    };
+    let md = convert_inline_math_delims(&body);
+    let md_json = escape_script_json(serde_json::to_string(&md).unwrap_or_default());
     // 数学宏定义（HTML/讲义导入时收集）：渲染公式时注册给 KaTeX
-    let macros_json =
-        serde_json::to_string(note.math_macros.as_deref().unwrap_or("")).unwrap_or_default();
+    let macros_json = escape_script_json(
+        serde_json::to_string(note.math_macros.as_deref().unwrap_or("")).unwrap_or_default(),
+    );
     let summary_map = note.summary_map();
     let anns: Vec<serde_json::Value> = annotations
         .iter()
@@ -727,7 +840,8 @@ fn to_html_with(
             })
         })
         .collect();
-    let annotations_json = serde_json::to_string(&anns).unwrap_or_else(|_| "[]".to_string());
+    let annotations_json =
+        escape_script_json(serde_json::to_string(&anns).unwrap_or_else(|_| "[]".to_string()));
     let aside = if include_tree {
         format!(
             "  <aside>\n    <h2>对话轨迹</h2>\n    {}\n  </aside>\n",
@@ -768,6 +882,11 @@ fn to_html_with(
   main th, main td {{ border: 1px solid #ccc; padding: 6px 12px; font-size: 14px; }}
   main th {{ background: #f3f4f6; }}
   main pre {{ background: #f3f4f6; padding: 10px; border-radius: 6px; overflow-x: auto; }}
+  main .note-block {{ margin: 10px 0; }}
+  main figure.fig {{ margin: 14px 0; text-align: center; }}
+  main figure.fig img {{ max-width: 100%; border: 1px solid #ddd; border-radius: 6px; }}
+  main figcaption {{ font-size: 13px; color: #666; margin-top: 6px; }}
+  main svg {{ max-width: 100%; height: auto; }}
   #fallback {{ display: none; white-space: pre-wrap; font-family: monospace; font-size: 13px; }}
 {ann_css}</style>
 </head>
@@ -782,14 +901,22 @@ fn to_html_with(
 <div id="ann-popup" class="ann-popup hidden"></div>
 <script>{marked_js}</script>
 <script>{katex_js}</script>
+<script>{purify_js}</script>
 <script>
 const MD = {md_json};
+const SANITIZE = {sanitize_json};
 const MACROS_TEXT = {macros_json};
 const MATH_MACROS = parseMathMacros(MACROS_TEXT);
 const ANNOTATIONS = {annotations_json};
 {ann_script}
+function renderNote(src) {{
+  // 同一管线：公式 → marked（HTML 笔记的块级 HTML 由 marked 原样透传）→ 消毒
+  let html = renderMd(src, !SANITIZE);
+  if (!SANITIZE || !window.DOMPurify) return html;
+  return DOMPurify.sanitize(html, {{ USE_PROFILES: {{ html: true, svg: true, mathMl: true }}, ADD_ATTR: ['id'] }});
+}}
 if (window.marked) {{
-  document.getElementById('note').innerHTML = renderMd(MD);
+  document.getElementById('note').innerHTML = renderNote(MD);
   applyAnnotations();
 }} else {{
   // markdown 渲染库缺失时降级为纯文本（正常情况下不会发生：资源已内嵌）
@@ -809,7 +936,9 @@ if (window.marked) {{
         ann_script = ANN_SCRIPT,
         katex_css = KATEX_CSS_INLINE,
         marked_js = MARKED_JS,
-        katex_js = KATEX_JS
+        katex_js = KATEX_JS,
+        purify_js = PURIFY_JS,
+        sanitize_json = is_html
     )
 }
 
@@ -856,6 +985,15 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// 把 JSON 处理成可安全内嵌进 `<script>` 数据岛的字符串。
+/// 转义 `<`（防止内容里的 `</script>` 提前闭合脚本块，导致后续脚本语法错误）、
+/// 以及 U+2028/U+2029（在 JS 里属换行符，会破坏字符串字面量）。JSON 结构字符不含 `<`，故只影响字符串内容。
+fn escape_script_json(s: String) -> String {
+    s.replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// 把 `\(` `\)` `\[` `\]` 定界符统一转换为 `$` `$$`。
@@ -984,5 +1122,37 @@ mod tests {
         let note = crate::notes::parse_markdown_note("# 标题\n\n正文", "");
         let md = resolve_figures(&to_markdown(&note), &note, MediaMode::Web);
         assert!(md.contains("正文"));
+    }
+
+    /// HTML 笔记导出：启用 DOMPurify 消毒，锚点直接落在块元素上。
+    #[test]
+    fn html_note_export_enables_sanitize_and_ids() {
+        let note = crate::notes::parse_html_note("<h1>T</h1>\n<h2>S</h2>\n<p>正文</p>", "");
+        let conv = Conversation::default();
+        let html = to_html(&note, &conv, &[]);
+        assert!(html.contains("const SANITIZE = true;"), "HTML 笔记应启用消毒");
+        assert!(html.contains("blk-__title__"), "应含标题锚点");
+        assert!(html.contains("note-block"), "段落应包成 note-block");
+        assert!(html.contains("DOMPurify"), "应内联 DOMPurify");
+    }
+
+    /// Markdown 笔记导出：仍走原管线，不启用 HTML 消毒分支。
+    #[test]
+    fn markdown_note_export_keeps_markdown_pipeline() {
+        let note = crate::notes::parse_markdown_note("# T\n\n正文", "");
+        let conv = Conversation::default();
+        let html = to_html(&note, &conv, &[]);
+        assert!(html.contains("const SANITIZE = false;"));
+        assert!(html.contains("blk-__title__"), "Markdown 标题仍带锚点");
+    }
+
+    /// 正文含 `</script>` 时，数据岛里的 JSON 必须转义，不能提前闭合脚本块。
+    #[test]
+    fn data_island_escapes_script_breakout() {
+        let note = crate::notes::parse_markdown_note("# T\n\n危险 </script><b>x</b>", "");
+        let conv = Conversation::default();
+        let html = to_html(&note, &conv, &[]);
+        assert!(html.contains("\\u003c/script"), "应转义为 \\u003c/script");
+        assert!(!html.contains("危险 </script>"), "MD 数据岛不得含未转义的 </script>");
     }
 }

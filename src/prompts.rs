@@ -537,6 +537,47 @@ pub fn compose_style_prompt_with_figures(
     Ok(prompt)
 }
 
+/// HTML 笔记的输出契约（`note.format = html`，阶段3）：与 `STYLE_CONTRACT` 等价，
+/// 但正文要求为 HTML 片段，允许用内联 HTML/SVG 画示意图。
+pub const HTML_CONTRACT: &str = "【输出格式（程序解析笔记所必需，必须严格遵守）】
+- 只输出 HTML 片段正文；不要解释、前言、后记，不要用 ```html 代码围栏包裹整篇，不要 <html>/<head>/<body>。
+- 不要输出思考过程、分析草稿，也不要用 <think> 等标记包裹内容；直接给最终笔记。
+- 第一行必须是 `<h1>论文标题</h1>`（整篇笔记的标题）。
+- 章节标题用 `<h2>`、子节用 `<h3>`（可继续细分到 <h6>），不要跳级。
+- 正文用 `<p>`；列表用 `<ul>/<ol>` 与 `<li>`；表格用 `<table>`（可加 <thead>/<tbody>）。
+- 行内公式用 \\(...\\)，行间公式用 \\[...\\]（不要用 `$`，避免与美元符号混淆）。
+- 示意图直接画内联 `<svg>` 或用带内联样式的 `<div>` 绘制；不要引入外部资源、图片链接、<script> 或事件属性（onclick 等）。
+- 每个标题与其下正文合并为一块；正文里不要出现残缺或未闭合的标签。
+
+";
+
+/// 组装 HTML 笔记的完整生成提示词：HTML 契约 + 风格 + 资料全文 + 额外要求。
+pub fn compose_style_prompt_html(style: &str, raw_text: &str, extra: &str) -> Result<String> {
+    let (_, body) = style_prompt(style)?;
+    let body = sanitize_style_prompt(&body);
+    let mut prompt = format!("{HTML_CONTRACT}{body}\n\n资料全文：\n{raw_text}");
+    if !extra.trim().is_empty() {
+        prompt.push_str(&format!("\n\n【本次额外要求】\n{}", extra.trim()));
+    }
+    Ok(prompt)
+}
+
+/// HTML 版图/表清单（追加到 HTML 笔记提示词末尾）。
+pub fn compose_style_prompt_html_with_figures(
+    style: &str,
+    raw_text: &str,
+    extra: &str,
+    figures: &[crate::notes::Figure],
+) -> Result<String> {
+    let mut prompt = compose_style_prompt_html(style, raw_text, extra)?;
+    if figures.is_empty() {
+        return Ok(prompt);
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&figure_contract(figures));
+    Ok(prompt)
+}
+
 /// 图表清单与使用约定（追加到笔记生成提示词末尾）。
 fn figure_contract(figures: &[crate::notes::Figure]) -> String {
     let mut s = String::from(
@@ -763,5 +804,15 @@ mod tests {
         assert!(!valid_style_id("-lead"));
         assert!(!valid_style_id("a/b"));
         assert!(!valid_style_id(&"a".repeat(41)));
+    }
+
+    #[test]
+    fn html_prompt_has_html_contract_and_material() {
+        let p = compose_style_prompt_html("four", "【资料】论文全文", "画个示意图").unwrap();
+        assert!(p.contains("只输出 HTML 片段正文"), "应前置 HTML 契约");
+        assert!(p.contains("<h1>"), "应要求 <h1> 标题");
+        assert!(p.contains("资料全文：\n【资料】论文全文"));
+        assert!(p.contains("【本次额外要求】\n画个示意图"));
+        assert!(!p.contains("只输出 Markdown 正文"), "不应残留 Markdown 契约");
     }
 }

@@ -24,6 +24,33 @@ pub struct Config {
     /// 界面偏好（旧配置缺 `[ui]` 节时用默认）。
     #[serde(default)]
     pub ui: UiConfig,
+    /// 笔记生成偏好（旧配置缺 `[note]` 节时用默认）。
+    #[serde(default)]
+    pub note: NoteConfig,
+}
+
+/// 笔记生成偏好（`[note]` 节）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteConfig {
+    /// 新生成论文笔记的正文格式：`markdown`=沿用 Markdown（旧）；`html`=HTML 片段，
+    /// 可用内联 HTML/SVG 画示意图（默认）。旧笔记不受影响，始终按各自格式渲染。
+    #[serde(default = "default_note_format")]
+    pub format: String,
+}
+
+impl Default for NoteConfig {
+    fn default() -> Self {
+        NoteConfig {
+            format: default_note_format(),
+        }
+    }
+}
+
+/// 笔记正文格式的合法取值。
+pub const NOTE_FORMAT_MODES: &[&str] = &["markdown", "html"];
+
+fn default_note_format() -> String {
+    "html".into()
 }
 
 /// 界面偏好（`[ui]` 节）。
@@ -385,6 +412,7 @@ pub const CONFIG_FIELDS: &[FieldDef] = &[
     field_enum!("llm.paper_relation", Some("PAPERHELPER_PAPER_RELATION"), "concept", PAPER_RELATION_MODES, "论文关联增强", "llm", "回答时是否参考其它相关论文：默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token。", llm.paper_relation),
     field_enum!("llm.context_scope", Some("PAPERHELPER_CONTEXT_SCOPE"), "note", CONTEXT_SCOPE_MODES, "提问上下文", "llm", "提问时发给模型的资料多少：只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token。", llm.context_scope),
     field_bool!("llm.kb_agent", Some("PAPERHELPER_KB_AGENT"), "false", "概念检索代理", "llm", "回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token。", llm.kb_agent),
+    field_enum!("note.format", Some("PAPERHELPER_NOTE_FORMAT"), "html", NOTE_FORMAT_MODES, "笔记格式", "note", "新生成论文笔记的正文格式：HTML（推荐）可用内联 HTML/SVG 画示意图，公式与排版更丰富；Markdown 为旧格式。旧笔记不受影响。", note.format),
     field_num!(FieldKind::Float, "pricing.input_price_per_1m", Some("PAPERHELPER_INPUT_PRICE"), "0.15", "输入单价（/1M token）", "pricing", "", f64, "需要数字", pricing.input_price_per_1m),
     field_num!(FieldKind::Float, "pricing.output_price_per_1m", Some("PAPERHELPER_OUTPUT_PRICE"), "0.60", "输出单价（/1M token）", "pricing", "", f64, "需要数字", pricing.output_price_per_1m),
     field_num!(FieldKind::Int, "budget.token_budget", Some("PAPERHELPER_TOKEN_BUDGET"), "0", "token 预算", "budget", "0 = 不限。", u64, "需要整数", budget.token_budget),
@@ -423,6 +451,7 @@ impl Default for Config {
             },
             presets: PresetsConfig::default(),
             ui: UiConfig::default(),
+            note: NoteConfig::default(),
         }
     }
 }
@@ -563,6 +592,27 @@ mod tests {
         }
         assert!(c.set_field("llm.pdf_input", "native-pdf").is_err());
         assert!(c.set_field("llm.pdf_input", "").is_err());
+    }
+
+    /// 笔记格式默认 HTML；合法值 markdown/html。
+    #[test]
+    fn note_format_default_and_modes() {
+        let mut c = Config::default();
+        assert_eq!(c.note.format, "html");
+        assert!(c.set_field("note.format", "markdown").is_ok());
+        assert!(c.set_field("note.format", "html").is_ok());
+        assert!(c.set_field("note.format", "org").is_err());
+        assert!(c.set_field("note.format", "").is_err());
+    }
+
+    /// 旧 config.toml 没有 [note] 节时应回落到默认 html。
+    #[test]
+    fn legacy_config_defaults_note_format() {
+        let cfg: Config = toml::from_str(
+            "[llm]\napi_endpoint = \"e\"\napi_key = \"\"\nmodel = \"m\"\ncontext_length = 8192\nthinking_mode = false\n\n[pricing]\ninput_price_per_1m = 0\noutput_price_per_1m = 0\n\n[budget]\ntoken_budget = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.note.format, "html");
     }
 
     #[test]
