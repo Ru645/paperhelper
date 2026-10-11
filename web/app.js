@@ -39,6 +39,7 @@ const SEL_SEP = "\u0001";
 const selection = { sessions: new Set(), papers: new Set(), concepts: new Set() };
 const selAnchor = { sessions: null, papers: null, concepts: null };
 let lastSessions = [];
+let lastFolders = [];
 let lastPapers = [];
 let lastConcepts = [];
 
@@ -66,9 +67,9 @@ function paintSelection(kind) {
   const ul = $(kind);
   if (!ul) return;
   const sel = selection[kind];
-  for (const li of ul.children) {
-    const k = li.dataset ? li.dataset.key : null;
-    if (k != null) li.classList.toggle("selected", sel.has(k));
+  // 会话列表是文件夹树，条目可能嵌套；用 data-key 全量选取。
+  for (const li of ul.querySelectorAll("[data-key]")) {
+    li.classList.toggle("selected", sel.has(li.dataset.key));
   }
   const badge = $(`sel-count-${kind}`);
   if (badge) badge.textContent = sel.size ? `已选 ${sel.size} · Esc 取消` : "";
@@ -3230,14 +3231,25 @@ async function postSse(url, body, onEvent, opts = {}) {
 async function refreshSessions() {
   try {
     const data = await (await fetch("/api/sessions")).json();
-    renderSessions(data.sessions || []);
+    renderSessions(data.sessions || [], data.folders || []);
   } catch (e) {
     console.error(e);
   }
 }
 
-function renderSessions(list) {
+// 文件夹折叠状态（本地视图偏好，按 id 存 localStorage）。
+const FOLDER_COLLAPSE_KEY = "ph-folder-collapsed";
+function loadCollapsedFolders() {
+  try { return JSON.parse(localStorage.getItem(FOLDER_COLLAPSE_KEY)) || {}; } catch { return {}; }
+}
+function saveCollapsedFolders(obj) {
+  try { localStorage.setItem(FOLDER_COLLAPSE_KEY, JSON.stringify(obj)); } catch {}
+}
+
+/// 会话栏：顶层「＋ 新会话」+ 文件夹树（可嵌套、可折叠、按名排序、置顶优先）+ 未归档会话。
+function renderSessions(list, folders) {
   lastSessions = list;
+  lastFolders = folders || [];
   const ul = $("sessions");
   ul.innerHTML = "";
   // 永远置顶的“新会话”
@@ -3248,34 +3260,113 @@ function renderSessions(list) {
   newLi.onclick = () => runCommand("new");
   ul.appendChild(newLi);
 
-  if (!list.length) {
-    const empty = document.createElement("li");
-    empty.className = "muted";
-    empty.textContent = "（无历史会话）";
-    ul.appendChild(empty);
-    pruneSelection("sessions", []);
-    paintSelection("sessions");
-    return;
+  const ids = new Set(lastFolders.map((f) => f.id));
+  const childFolders = new Map(); // parentId -> [folder]
+  for (const f of lastFolders) {
+    const p = f.parent && ids.has(f.parent) ? f.parent : "";
+    if (!childFolders.has(p)) childFolders.set(p, []);
+    childFolders.get(p).push(f);
   }
-  pruneSelection("sessions", list.map((s) => s.id));
-  const activeId = lastState && lastState.session_id ? lastState.session_id : null;
+  const childSessions = new Map(); // folderId -> [session]
   for (const s of list) {
+    const p = s.folder && ids.has(s.folder) ? s.folder : "";
+    if (!childSessions.has(p)) childSessions.set(p, []);
+    childSessions.get(p).push(s);
+  }
+  const collapsed = loadCollapsedFolders();
+  const activeId = lastState && lastState.session_id ? lastState.session_id : null;
+
+  const sortFolders = (arr) =>
+    arr.sort((a, b) => {
+      if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
+      return (a.name || "").localeCompare(b.name || "", "zh");
+    });
+  const sortSessions = (arr) =>
+    arr.sort((a, b) => {
+      if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
+      return (b.updated_at || "").localeCompare(a.updated_at || "");
+    });
+
+  const makeSessionLi = (s) => {
     const li = document.createElement("li");
     li.dataset.id = s.id;
     li.dataset.key = s.id;
     if (s.id === activeId) li.classList.add("active");
-    if (selection.sessions.has(s.id)) li.classList.add("selected");
     const pin = s.pinned ? '<span class="pin" title="已置顶">★</span>' : "";
     li.innerHTML = `${pin}<span class="s-name">${esc(s.name)}</span><span class="s-time">${esc(fmtTime(s.updated_at))}</span>`;
-    li.title = "点击加载 · Ctrl/⌘ 点选、Shift 连选 · 右键更多";
-    li.onclick = (e) => listClick("sessions", e, s.id, () => loadSession(s.id));
+    li.title = "点击加载 · Ctrl/⌘ 点选、Shift 连选 · 长按拖动到文件夹 · 右键更多";
+    li.onclick = (e) => {
+      if (justDragged) { justDragged = false; return; }
+      listClick("sessions", e, s.id, () => loadSession(s.id));
+    };
     li.oncontextmenu = (e) => {
       e.preventDefault();
+      e.stopPropagation();
       showSessionMenu(e.clientX, e.clientY, s);
     };
-    ul.appendChild(li);
+    beginSessionPress(li, s);
+    return li;
+  };
+
+  const makeFolderLi = (f) => {
+    const li = document.createElement("li");
+    li.className = "folder";
+    li.dataset.folder = f.id;
+    const isCollapsed = !!collapsed[f.id];
+    if (isCollapsed) li.classList.add("collapsed");
+    const fSessions = childSessions.get(f.id) || [];
+    const fFolders = childFolders.get(f.id) || [];
+    const head = document.createElement("div");
+    head.className = "folder-head";
+    const total = fSessions.length + fFolders.length;
+    head.innerHTML = `<span class="folder-toggle">${isCollapsed ? "▸" : "▾"}</span>${f.pinned ? '<span class="pin" title="已置顶">★</span>' : ""}<span class="folder-name">${esc(f.name || "（未命名）")}</span><span class="folder-count">${total || ""}</span>`;
+    head.title = "点击折叠 / 展开 · 右键更多";
+    head.onclick = (e) => { e.stopPropagation(); toggleFolder(f.id); };
+    head.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showFolderMenu(e.clientX, e.clientY, f);
+    };
+    li.appendChild(head);
+    const childUl = document.createElement("ul");
+    childUl.className = "folder-children";
+    for (const cf of sortFolders(fFolders)) childUl.appendChild(makeFolderLi(cf));
+    for (const cs of sortSessions(fSessions)) childUl.appendChild(makeSessionLi(cs));
+    li.appendChild(childUl);
+    return li;
+  };
+
+  for (const f of sortFolders(childFolders.get("") || [])) ul.appendChild(makeFolderLi(f));
+  for (const s of sortSessions(childSessions.get("") || [])) ul.appendChild(makeSessionLi(s));
+
+  if (!list.length && !lastFolders.length) {
+    const empty = document.createElement("li");
+    empty.className = "muted";
+    empty.textContent = "（无历史会话）";
+    ul.appendChild(empty);
   }
+
+  // 空白处右键 → 新建顶层文件夹
+  ul.oncontextmenu = (e) => {
+    if (e.target.closest("li")) return;
+    e.preventDefault();
+    showMenu(e.clientX, e.clientY, [{ label: "新建文件夹", fn: () => createFolder("") }]);
+  };
+
+  pruneSelection("sessions", list.map((s) => s.id));
   paintSelection("sessions");
+}
+
+function toggleFolder(id) {
+  const li = document.querySelector(`#sessions li.folder[data-folder="${id}"]`);
+  if (!li) return;
+  const collapsed = !li.classList.contains("collapsed");
+  li.classList.toggle("collapsed", collapsed);
+  const t = li.querySelector(".folder-toggle");
+  if (t) t.textContent = collapsed ? "▸" : "▾";
+  const st = loadCollapsedFolders();
+  if (collapsed) st[id] = 1; else delete st[id];
+  saveCollapsedFolders(st);
 }
 
 async function loadSession(id, opts = {}) {
@@ -3329,6 +3420,7 @@ function showSessionMenu(x, y, s) {
         label: `${allPinned ? "取消置顶" : "置顶"}选中 ${bulk.length} 项`,
         fn: () => pinSessionsBulk(bulk, !allPinned),
       },
+      { label: `移动选中 ${bulk.length} 项到文件夹…`, fn: () => showMoveMenu(x, y, bulk.map((it) => it.id)) },
       { label: `导出选中 ${bulk.length} 项`, fn: () => exportSessionsBulk(bulk) },
       { label: `删除选中 ${bulk.length} 项…`, danger: true, fn: () => deleteSessionsBulk(bulk) },
     ]);
@@ -3338,9 +3430,48 @@ function showSessionMenu(x, y, s) {
   showMenu(x, y, [
     { label: s.pinned ? "取消置顶" : "置顶会话", fn: () => pinSession(s.id, !s.pinned) },
     { label: "重命名", fn: () => renameSession(s) },
+    { label: "移动到文件夹…", fn: () => showMoveMenu(x, y, [s.id]) },
     { label: "导出会话", fn: () => downloadUrl(`/api/sessions/export?id=${encodeURIComponent(s.id)}`) },
     { label: "删除会话", danger: true, fn: () => deleteSession(s) },
   ]);
+}
+
+/// 文件夹右键菜单：置顶 / 重命名 / 新建子文件夹 / 删除。
+function showFolderMenu(x, y, f) {
+  showMenu(x, y, [
+    { label: f.pinned ? "取消置顶" : "置顶文件夹", fn: () => pinFolder(f.id, !f.pinned) },
+    { label: "重命名", fn: () => renameFolder(f) },
+    { label: "新建子文件夹", fn: () => createFolder(f.id) },
+    { label: "删除文件夹", danger: true, fn: () => deleteFolder(f) },
+  ]);
+}
+
+/// 把会话移动到文件夹：列出「（顶层）」+ 全部文件夹（按层级缩进）。
+function showMoveMenu(x, y, ids) {
+  const byId = new Map(lastFolders.map((f) => [f.id, f]));
+  const depthOf = (f) => {
+    let d = 0;
+    let cur = f;
+    while (cur && cur.parent && byId.has(cur.parent)) { d++; cur = byId.get(cur.parent); }
+    return d;
+  };
+  const sorted = [...lastFolders].sort((a, b) =>
+    ("　".repeat(depthOf(a)) + (a.name || "")).localeCompare("　".repeat(depthOf(b)) + (b.name || ""), "zh")
+  );
+  const items = [{ label: "（顶层）", fn: () => moveSessions(ids, "") }];
+  for (const f of sorted) {
+    items.push({ label: "　".repeat(depthOf(f) + 1) + (f.name || "（未命名）"), fn: () => moveSessions(ids, f.id) });
+  }
+  showMenu(x, y, items);
+}
+
+async function moveSessions(ids, folder) {
+  for (const id of ids) {
+    try { await postJson("/api/sessions/move", { id, folder }); }
+    catch (e) { appendConsole("❌ 移动失败: " + e.message, "err"); }
+  }
+  clearSelection("sessions");
+  refreshSessions();
 }
 
 /// 触发浏览器下载（GET 带 Content-Disposition）。
@@ -3504,6 +3635,133 @@ async function deleteSession(s) {
   } else {
     refreshSessions();
   }
+}
+
+// ===== 会话文件夹：新建 / 重命名 / 置顶 / 删除 =====
+
+async function createFolder(parent) {
+  const name = prompt(parent ? "新建子文件夹名称" : "新建文件夹名称", "新建文件夹");
+  if (name == null) return;
+  const nm = name.trim();
+  if (!nm) return;
+  try {
+    await postJson("/api/folders/create", { name: nm, parent: parent || "" });
+  } catch (e) {
+    appendConsole("❌ 新建文件夹失败: " + e.message, "err");
+    return;
+  }
+  if (parent) {
+    const st = loadCollapsedFolders();
+    delete st[parent];
+    saveCollapsedFolders(st);
+  }
+  refreshSessions();
+}
+
+async function renameFolder(f) {
+  const name = prompt("重命名文件夹", f.name);
+  if (name == null) return;
+  const nm = name.trim();
+  if (!nm) return;
+  try { await postJson("/api/folders/rename", { id: f.id, name: nm }); }
+  catch (e) { appendConsole("❌ 重命名失败: " + e.message, "err"); }
+  refreshSessions();
+}
+
+async function pinFolder(id, pinned) {
+  try { await postJson("/api/folders/pin", { id, pinned }); }
+  catch (e) { appendConsole("❌ 置顶失败: " + e.message, "err"); }
+  refreshSessions();
+}
+
+async function deleteFolder(f) {
+  if (!confirm(`删除文件夹「${f.name || "（未命名）"}」？\n里面的子文件夹与会话会上移到上一级，不会被删除。`)) return;
+  try { await postJson("/api/folders/delete", { id: f.id }); }
+  catch (e) { appendConsole("❌ 删除失败: " + e.message, "err"); }
+  refreshSessions();
+}
+
+// ===== 长按拖动会话到文件夹 =====
+
+let justDragged = false;
+
+function sessionFolderOf(id) {
+  const s = lastSessions.find((x) => x.id === id);
+  return s && s.folder ? s.folder : "";
+}
+
+function clearDropHints() {
+  for (const n of document.querySelectorAll("#sessions .drop-hint")) n.classList.remove("drop-hint");
+}
+
+function dropTargetAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  const folderLi = el.closest("#sessions li.folder");
+  if (folderLi) return folderLi.dataset.folder;
+  const sessLi = el.closest("#sessions li[data-id]");
+  if (sessLi) return sessionFolderOf(sessLi.dataset.id);
+  if (el.closest("#sessions")) return "";
+  return null;
+}
+
+function highlightDropTarget(x, y) {
+  clearDropHints();
+  const el = document.elementFromPoint(x, y);
+  if (!el) return;
+  const folderLi = el.closest("#sessions li.folder");
+  if (folderLi) { folderLi.classList.add("drop-hint"); return; }
+  const sessLi = el.closest("#sessions li[data-id]");
+  if (sessLi) {
+    const f = sessionFolderOf(sessLi.dataset.id);
+    if (f) {
+      const fl = document.querySelector(`#sessions li.folder[data-folder="${f}"]`);
+      if (fl) fl.classList.add("drop-hint");
+    }
+  }
+}
+
+/// 左键长按 320ms 进入拖动；拖动中高亮目标文件夹，松开即移动。
+function beginSessionPress(li, s) {
+  li.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let active = false;
+    const timer = setTimeout(() => {
+      active = true;
+      li.classList.add("dragging");
+      document.body.classList.add("session-dragging");
+    }, 320);
+
+    const onMove = (ev) => {
+      if (!active) {
+        if (Math.abs(ev.clientX - startX) > 6 || Math.abs(ev.clientY - startY) > 6) cleanup();
+        return;
+      }
+      ev.preventDefault();
+      highlightDropTarget(ev.clientX, ev.clientY);
+    };
+    const onUp = async (ev) => {
+      cleanup();
+      if (!active) return;
+      li.classList.remove("dragging");
+      document.body.classList.remove("session-dragging");
+      const target = dropTargetAt(ev.clientX, ev.clientY);
+      clearDropHints();
+      if (target === null) return;
+      justDragged = true;
+      setTimeout(() => { justDragged = false; }, 400);
+      await moveSessions([s.id], target);
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp, true);
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp, true);
+  });
 }
 
 // ===== 批量置顶 / 删除（多选后右键）=====

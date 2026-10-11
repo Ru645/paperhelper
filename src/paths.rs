@@ -5,6 +5,7 @@
 //! - `knowledge.json`：跨论文知识库（论文清单+已学概念+累计用量）
 //! - `sessions/<编号>.json`：会话存档，编号 = 首次保存的时间戳（如 20260909_021633），
 //!   作为 `-s` 的恢复参数；list_sessions 返回排序后的编号列表
+//! - `folders.json`：会话文件夹树（可嵌套；会话以 `Session.folder` 引用其 id）
 //!
 //! 数据目录默认是当前工作目录的 `.paperhelper/`；可用 `PAPERHELPER_DATA_DIR`
 //! 指向固定位置（如 `~/PaperHelper/.paperhelper`），换工作目录也不会"丢"笔记；
@@ -80,6 +81,11 @@ pub fn knowledge_path_in(dir: &Path) -> PathBuf {
 /// 指定数据目录下的置顶文件（迁移/测试用）。
 pub fn pins_path_in(dir: &Path) -> PathBuf {
     dir.join("pins.json")
+}
+
+/// 会话文件夹结构文件（`.paperhelper/folders.json`）。
+pub fn folders_path_in(dir: &Path) -> PathBuf {
+    dir.join("folders.json")
 }
 
 /// 上传文件目录（Web 端导入 PDF 等）。

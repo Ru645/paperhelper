@@ -75,6 +75,11 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/sessions/pin", post(api_session_pin))
         .route("/api/sessions/rename", post(api_session_rename))
         .route("/api/sessions/delete", post(api_session_delete))
+        .route("/api/sessions/move", post(api_session_move))
+        .route("/api/folders/create", post(api_folder_create))
+        .route("/api/folders/rename", post(api_folder_rename))
+        .route("/api/folders/pin", post(api_folder_pin))
+        .route("/api/folders/delete", post(api_folder_delete))
         .route("/api/sessions/export", get(api_sessions_export))
         .route(
             "/api/sessions/import",
@@ -1705,9 +1710,13 @@ fn resolve_session_id(key: &str) -> Result<String, (StatusCode, String)> {
     }
 }
 
-/// 会话列表：置顶优先，其余按 `updated_at` 新→旧。
+/// 会话列表：置顶优先，其余按 `updated_at` 新→旧。同时返回文件夹树，
+/// 会话的 `folder` 若指向已不存在的文件夹则回落到顶层（空串）。
 async fn api_sessions() -> Json<serde_json::Value> {
     let pins = session::load_pins();
+    let folders = session::load_folders();
+    let folder_ids: std::collections::HashSet<&str> =
+        folders.iter().map(|f| f.id.as_str()).collect();
     let mut list: Vec<serde_json::Value> = paths::list_sessions()
         .iter()
         .map(|id| {
@@ -1718,11 +1727,17 @@ async fn api_sessions() -> Json<serde_json::Value> {
             } else {
                 raw.to_string()
             };
+            let folder = if folder_ids.contains(meta.folder.as_str()) {
+                meta.folder.clone()
+            } else {
+                String::new()
+            };
             json!({
                 "id": id,
                 "name": name,
                 "updated_at": meta.updated_at,
                 "pinned": pins.iter().any(|p| p == id),
+                "folder": folder,
             })
         })
         .collect();
@@ -1735,7 +1750,27 @@ async fn api_sessions() -> Json<serde_json::Value> {
             ub.cmp(ua)
         })
     });
-    Json(json!({ "sessions": list }))
+    let mut fjson: Vec<serde_json::Value> = folders
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "name": f.name,
+                "parent": f.parent,
+                "pinned": f.pinned,
+            })
+        })
+        .collect();
+    fjson.sort_by(|a, b| {
+        let pa = a["pinned"].as_bool().unwrap_or(false);
+        let pb = b["pinned"].as_bool().unwrap_or(false);
+        pb.cmp(&pa).then_with(|| {
+            let na = a["name"].as_str().unwrap_or("");
+            let nb = b["name"].as_str().unwrap_or("");
+            na.cmp(nb)
+        })
+    });
+    Json(json!({ "sessions": list, "folders": fjson }))
 }
 
 #[derive(Deserialize)]
@@ -1852,6 +1887,138 @@ async fn api_session_delete(
         reset = true;
     }
     Ok(Json(json!({ "ok": true, "id": target, "reset": reset })))
+}
+
+// ===== 会话文件夹 =====
+
+#[derive(Deserialize)]
+struct SessionMoveReq {
+    id: String,
+    /// 目标文件夹 id；空串/缺省表示移出到顶层。
+    #[serde(default)]
+    folder: String,
+}
+
+/// 把会话移动到指定文件夹（会话文件里只改 `folder` 元数据，不动 `updated_at`）。
+async fn api_session_move(
+    State(app): State<SharedApp>,
+    Json(req): Json<SessionMoveReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let target = resolve_session_id(&req.id)?;
+    let folders = session::load_folders();
+    let folder = if req.folder.is_empty() || folders.iter().any(|f| f.id == req.folder) {
+        req.folder.clone()
+    } else {
+        return Err((StatusCode::NOT_FOUND, "目标文件夹不存在".into()));
+    };
+    let path = paths::session_path(&target);
+    let mut sess = session::Session::load(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    sess.folder = folder.clone();
+    // 移动属元数据修改，不改写 updated_at，避免会话列表排序跳动。
+    sess.save_preserving_time(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let mut a = app.lock().await;
+    if a.session.session_id == target {
+        a.session.folder = folder.clone();
+    }
+    Ok(Json(json!({ "ok": true, "id": target, "folder": folder })))
+}
+
+#[derive(Deserialize)]
+struct FolderCreateReq {
+    name: String,
+    /// 父文件夹 id；空串/缺省表示顶层。
+    #[serde(default)]
+    parent: String,
+    #[serde(default)]
+    pinned: bool,
+}
+
+async fn api_folder_create(
+    Json(req): Json<FolderCreateReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let name = req.name.trim().to_string();
+    let parent = if req.parent.is_empty() {
+        None
+    } else {
+        let folders = session::load_folders();
+        if !folders.iter().any(|f| f.id == req.parent) {
+            return Err((StatusCode::NOT_FOUND, "父文件夹不存在".into()));
+        }
+        Some(req.parent.clone())
+    };
+    let mut folders = session::load_folders();
+    let folder = session::Folder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        parent,
+        pinned: req.pinned,
+    };
+    folders.push(folder.clone());
+    session::save_folders(&folders)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({
+        "ok": true,
+        "folder": { "id": folder.id, "name": folder.name, "parent": folder.parent, "pinned": folder.pinned },
+    })))
+}
+
+#[derive(Deserialize)]
+struct FolderRenameReq {
+    id: String,
+    name: String,
+}
+
+async fn api_folder_rename(
+    Json(req): Json<FolderRenameReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut folders = session::load_folders();
+    let Some(f) = folders.iter_mut().find(|f| f.id == req.id) else {
+        return Err((StatusCode::NOT_FOUND, "文件夹不存在".into()));
+    };
+    f.name = req.name.trim().to_string();
+    let name = f.name.clone();
+    session::save_folders(&folders)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true, "id": req.id, "name": name })))
+}
+
+#[derive(Deserialize)]
+struct FolderPinReq {
+    id: String,
+    pinned: bool,
+}
+
+async fn api_folder_pin(
+    Json(req): Json<FolderPinReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut folders = session::load_folders();
+    let Some(f) = folders.iter_mut().find(|f| f.id == req.id) else {
+        return Err((StatusCode::NOT_FOUND, "文件夹不存在".into()));
+    };
+    f.pinned = req.pinned;
+    session::save_folders(&folders)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true, "id": req.id, "pinned": req.pinned })))
+}
+
+#[derive(Deserialize)]
+struct FolderIdReq {
+    id: String,
+}
+
+/// 删除文件夹：其直接子文件夹上提一级；引用它的会话下次列表时回落到顶层。
+async fn api_folder_delete(
+    Json(req): Json<FolderIdReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut folders = session::load_folders();
+    if !session::remove_folder(&mut folders, &req.id) {
+        return Err((StatusCode::NOT_FOUND, "文件夹不存在".into()));
+    }
+    session::save_folders(&folders)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true, "id": req.id })))
 }
 
 // ===== 会话迁移：导出 / 导入 =====

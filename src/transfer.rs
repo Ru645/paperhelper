@@ -35,6 +35,9 @@ pub struct SessionBundle {
     pub knowledge: Option<KnowledgeBase>,
     #[serde(default)]
     pub pins: Vec<String>,
+    /// 会话文件夹结构（整库导出时带全部；多选导出只带被选会话引用的文件夹）。
+    #[serde(default)]
+    pub folders: Vec<session::Folder>,
 }
 
 /// 解析后的导入输入。
@@ -116,12 +119,35 @@ pub fn export_bundle(dir: &Path, ids: Option<&[String]>) -> Result<SessionBundle
     } else {
         None
     };
+    // 文件夹：整库带全部；多选只带被选会话引用的（含祖先链），避免把无关目录带出去。
+    let all_folders = session::load_folders_from(dir);
+    let folders = if full {
+        all_folders
+    } else {
+        let mut keep: HashSet<String> = HashSet::new();
+        for id in &wanted {
+            let meta = session::read_meta(&paths::session_path_in(dir, id));
+            let Some(meta) = meta else { continue };
+            let mut cur = Some(meta.folder).filter(|f| !f.is_empty());
+            while let Some(c) = cur {
+                if !keep.insert(c.clone()) {
+                    break;
+                }
+                cur = all_folders
+                    .iter()
+                    .find(|f| f.id == c)
+                    .and_then(|f| f.parent.clone());
+            }
+        }
+        all_folders.into_iter().filter(|f| keep.contains(&f.id)).collect()
+    };
     Ok(SessionBundle {
         paperhelper_bundle: BUNDLE_VERSION,
         exported_at: chrono::Utc::now().to_rfc3339(),
         sessions,
         knowledge,
         pins,
+        folders,
     })
 }
 
@@ -132,10 +158,45 @@ pub fn import_into(dir: &Path, input: ImportInput) -> Result<ImportReport> {
     let mut report = ImportReport::default();
     let mut id_map: HashMap<String, String> = HashMap::new();
 
-    let (sessions, knowledge, pins) = match input {
-        ImportInput::Single(s) => (vec![*s], None, Vec::new()),
-        ImportInput::Bundle(b) => (b.sessions, b.knowledge, b.pins),
+    let (sessions, knowledge, pins, folders) = match input {
+        ImportInput::Single(s) => (vec![*s], None, Vec::new(), Vec::new()),
+        ImportInput::Bundle(b) => (b.sessions, b.knowledge, b.pins, b.folders),
     };
+    let full_bundle = knowledge.is_some();
+
+    // 先把文件夹 id 映射好（编号为空或与本地冲突时分配新 id），供会话 remap 使用。
+    let mut local_folders = session::load_folders_from(dir);
+    let mut used_folder_ids: HashSet<String> =
+        local_folders.iter().map(|f| f.id.clone()).collect();
+    let mut folder_map: HashMap<String, String> = HashMap::new();
+    for f in &folders {
+        let old = f.id.clone();
+        let new = if old.is_empty() || used_folder_ids.contains(&old) {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            old.clone()
+        };
+        used_folder_ids.insert(new.clone());
+        folder_map.insert(old, new);
+    }
+    let mut mapped_folders: Vec<session::Folder> = Vec::new();
+    for f in &folders {
+        let new_id = folder_map.get(&f.id).cloned().unwrap_or_else(|| f.id.clone());
+        let parent = match f.parent.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => folder_map
+                .get(p)
+                .cloned()
+                .or_else(|| used_folder_ids.contains(p).then(|| p.to_string())),
+            None => None,
+        };
+        mapped_folders.push(session::Folder {
+            id: new_id,
+            name: f.name.clone(),
+            parent,
+            pinned: f.pinned,
+        });
+    }
+    let mut written_folders: HashSet<String> = HashSet::new();
 
     for mut sess in sessions {
         let from = if sess.session_id.trim().is_empty() {
@@ -165,7 +226,18 @@ pub fn import_into(dir: &Path, input: ImportInput) -> Result<ImportReport> {
         let to = unique_session_id(&mut used, &from);
         id_map.insert(from.clone(), to.clone());
         sess.session_id = to.clone();
-        // 跨平台路径清理：目标机上不可用的导出路径置空（相对路径保留）
+        // 会话所属文件夹按映射改写；指向未一起导入的文件夹则回落到顶层。
+        if !sess.folder.is_empty() {
+            sess.folder = match folder_map.get(&sess.folder) {
+                Some(nf) => nf.clone(),
+                None if used_folder_ids.contains(&sess.folder) => sess.folder.clone(),
+                None => String::new(),
+            };
+            if !sess.folder.is_empty() {
+                written_folders.insert(sess.folder.clone());
+            }
+        }
+        // 跨平台路径清理：目标机上不可用的 export_path 置空（相对路径保留）
         sess.export_path = sess.export_path.filter(|p| usable_export_path(p));
         let json = serde_json::to_string_pretty(&sess).context("序列化会话失败")?;
         fs::write(paths::session_path_in(dir, &to), json)
@@ -176,6 +248,35 @@ pub fn import_into(dir: &Path, input: ImportInput) -> Result<ImportReport> {
             name: sess.session_name,
             skipped: false,
         });
+    }
+
+    // 文件夹合并：整库导入带全部文件夹；多选导入只保留实际落地会话引用的（含祖先链）。
+    let mut keep: HashSet<String> = HashSet::new();
+    if full_bundle {
+        for f in &mapped_folders {
+            keep.insert(f.id.clone());
+        }
+    } else {
+        for id in &written_folders {
+            let mut cur = Some(id.clone());
+            while let Some(c) = cur {
+                if !keep.insert(c.clone()) {
+                    break;
+                }
+                cur = mapped_folders
+                    .iter()
+                    .find(|f| f.id == c)
+                    .and_then(|f| f.parent.clone());
+            }
+        }
+    }
+    for f in mapped_folders {
+        if keep.contains(&f.id) {
+            local_folders.push(f);
+        }
+    }
+    if !local_folders.is_empty() {
+        session::save_folders_to(dir, &local_folders)?;
     }
 
     if let Some(other) = knowledge {
@@ -320,6 +421,7 @@ mod tests {
             sessions: vec![sess, sess2],
             knowledge: None,
             pins: vec![],
+            folders: vec![],
         };
         let bundle_json = serde_json::to_vec(&bundle).unwrap();
 
@@ -443,6 +545,7 @@ mod tests {
             sessions: vec![b],
             knowledge: Some(remote_kb),
             pins: vec!["20260101_000011".into()],
+            folders: vec![],
         };
 
         let r = import_into(&dir, ImportInput::Bundle(Box::new(bundle))).unwrap();
@@ -474,6 +577,7 @@ mod tests {
             sessions: vec![incoming],
             knowledge: None,
             pins: vec!["20260101_000020".into()],
+            folders: vec![],
         };
         let r = import_into(&dir, ImportInput::Bundle(Box::new(bundle))).unwrap();
         let new_id = r.sessions[0].to.clone();
@@ -481,6 +585,85 @@ mod tests {
         let pins = session::load_pins_from(&dir);
         assert!(pins.contains(&new_id), "置顶应映射到新编号: {pins:?}");
         assert!(!pins.contains(&"20260101_000020".to_string()));
+    }
+
+    #[test]
+    fn export_bundle_partial_includes_referenced_folders() {
+        let dir = tmp_dir("folders_export");
+        let mut a = sample_session("20260101_000030", "A", "2026-01-01T00:00:00Z");
+        a.folder = "f1".into();
+        write_session(&dir, &a);
+        let c = sample_session("20260101_000031", "C", "2026-01-01T00:00:00Z");
+        write_session(&dir, &c);
+        session::save_folders_to(
+            &dir,
+            &[
+                session::Folder {
+                    id: "f1".into(),
+                    name: "甲".into(),
+                    parent: None,
+                    pinned: false,
+                },
+                session::Folder {
+                    id: "f2".into(),
+                    name: "乙".into(),
+                    parent: Some("f1".into()),
+                    pinned: false,
+                },
+                session::Folder {
+                    id: "f9".into(),
+                    name: "无关".into(),
+                    parent: None,
+                    pinned: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let part = export_bundle(&dir, Some(&[a.session_id.clone()])).unwrap();
+        let ids: Vec<_> = part.folders.iter().map(|f| f.id.clone()).collect();
+        assert!(ids.contains(&"f1".to_string()), "应带被引用文件夹");
+        assert!(!ids.contains(&"f9".to_string()), "不应带无关文件夹");
+
+        let all = export_bundle(&dir, None).unwrap();
+        assert_eq!(all.folders.len(), 3, "整库导出带全部文件夹");
+    }
+
+    #[test]
+    fn import_bundle_remaps_session_folders() {
+        let dir = tmp_dir("folders_import");
+        let mut a = sample_session("20260101_000040", "A", "2026-01-01T00:00:00Z");
+        a.folder = "f1".into();
+        let bundle = SessionBundle {
+            paperhelper_bundle: BUNDLE_VERSION,
+            exported_at: String::new(),
+            sessions: vec![a],
+            knowledge: None,
+            pins: vec![],
+            folders: vec![
+                session::Folder {
+                    id: "f1".into(),
+                    name: "甲".into(),
+                    parent: None,
+                    pinned: true,
+                },
+                session::Folder {
+                    id: "f2".into(),
+                    name: "乙".into(),
+                    parent: Some("f1".into()),
+                    pinned: false,
+                },
+            ],
+        };
+        let r = import_into(&dir, ImportInput::Bundle(Box::new(bundle))).unwrap();
+        let imported =
+            session::Session::load(&paths::session_path_in(&dir, &r.sessions[0].to)).unwrap();
+        assert_eq!(imported.folder, "f1", "文件夹无冲突时应沿用原 id");
+
+        let folders = session::load_folders_from(&dir);
+        assert_eq!(folders.len(), 1, "只落地被会话引用的文件夹");
+        assert_eq!(folders[0].id, "f1");
+        assert!(folders[0].pinned);
     }
 
     #[test]

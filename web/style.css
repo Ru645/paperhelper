@@ -128,6 +128,28 @@ ul.session-list .s-time { color: var(--muted); font-size: 11px; flex-shrink: 0; 
 .pin { color: #d97706; flex-shrink: 0; margin-right: 4px; }
 .muted { color: var(--muted); }
 
+/* 会话文件夹（可嵌套 / 折叠） */
+ul.session-list ul.folder-children {
+  list-style: none; margin: 0 0 0 7px; padding-left: 7px;
+  border-left: 1px solid var(--line);
+}
+ul.session-list li.folder { display: block; padding: 0; }
+ul.session-list li.folder.collapsed > ul.folder-children { display: none; }
+ul.session-list .folder-head {
+  display: flex; align-items: center; gap: 6px; padding: 5px 6px;
+  border-radius: 6px; cursor: pointer; line-height: 1.3;
+}
+ul.session-list .folder-head:hover { background: #e4e4e1; }
+ul.session-list .folder-toggle { color: var(--muted); width: 12px; flex-shrink: 0; font-size: 11px; }
+ul.session-list .folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+ul.session-list .folder-count { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+ul.session-list li.folder .folder-head.drop-hint,
+ul.session-list li.folder.drop-hint > .folder-head {
+  background: var(--blue-light); box-shadow: inset 0 0 0 1.5px var(--blue);
+}
+body.session-dragging { user-select: none; cursor: grabbing; }
+ul.session-list li.dragging { opacity: 0.5; }
+
 /* ===== 主区 ===== */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .tabs {

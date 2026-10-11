@@ -72,6 +72,9 @@ pub struct Session {
     /// 仅阅读会话：只挂 PDF 原件、未生成笔记（不自动导出、默认进「原文」）。
     #[serde(default)]
     pub read_only: bool,
+    /// 所属文件夹 id（`.paperhelper/folders.json` 中的 Folder.id）；空串表示不在任何文件夹。
+    #[serde(default)]
+    pub folder: String,
 }
 
 /// 一条批注：笔记里的一段引用文字 + 其对话线程（以 `root_node_id` 为根的会话子树）。
@@ -242,6 +245,66 @@ pub struct SessionMeta {
     pub updated_at: String,
     #[serde(default)]
     pub current_paper_id: Option<String>,
+    #[serde(default)]
+    pub folder: String,
+}
+
+/// 会话文件夹节点：可递归嵌套（`parent` 为空表示顶层），按名字排序显示。
+/// 存于 `.paperhelper/folders.json`；会话通过 `Session.folder` 引用其 `id`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Folder {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// 读取全部文件夹节点（`.paperhelper/folders.json`），不存在则空。
+pub fn load_folders() -> Vec<Folder> {
+    load_folders_from(&paths::data_dir())
+}
+
+/// 读取指定数据目录的文件夹结构（迁移/测试用）。
+pub fn load_folders_from(dir: &Path) -> Vec<Folder> {
+    match fs::read_to_string(paths::folders_path_in(dir)) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 写回文件夹结构。
+pub fn save_folders(folders: &[Folder]) -> Result<()> {
+    save_folders_to(&paths::data_dir(), folders)
+}
+
+/// 写回指定数据目录的文件夹结构（迁移/测试用）。
+pub fn save_folders_to(dir: &Path, folders: &[Folder]) -> Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    let s = serde_json::to_string_pretty(folders)?;
+    fs::write(paths::folders_path_in(dir), s)?;
+    Ok(())
+}
+
+/// 删除指定文件夹，并把它的直接子文件夹上提一级（保持树的连通，不丢结构）。
+/// 返回是否命中并删除。引用该文件夹的会话由调用方视为顶层（见 `api_sessions`）。
+pub fn remove_folder(folders: &mut Vec<Folder>, id: &str) -> bool {
+    let parent = match folders.iter().find(|f| f.id == id) {
+        Some(f) => f.parent.clone(),
+        None => return false,
+    };
+    folders.retain(|f| f.id != id);
+    for f in folders.iter_mut() {
+        if f.parent.as_deref() == Some(id) {
+            f.parent = parent.clone();
+        }
+    }
+    true
 }
 
 /// 读取会话文件里的元信息（serde 跳过未知的大字段如 raw_text）。
@@ -303,6 +366,8 @@ struct SessionScan {
     #[serde(default)]
     current_paper_id: Option<String>,
     #[serde(default)]
+    folder: String,
+    #[serde(default)]
     notes: Option<NoteLite>,
     #[serde(default)]
     conversation: ConvLite,
@@ -317,6 +382,7 @@ impl SessionScan {
             session_name: self.session_name.clone(),
             updated_at: self.updated_at.clone(),
             current_paper_id: self.current_paper_id.clone(),
+            folder: self.folder.clone(),
         }
     }
 
@@ -540,6 +606,7 @@ mod tests {
             annotations: Vec::new(),
             export_path: None,
             read_only: true,
+            folder: String::new(),
         };
         sess.session_id = "20260101_000000".into();
         sess.save(&path).unwrap();
@@ -689,5 +756,74 @@ mod tests {
         let old = r#"{"session_id":"20250101_000000","notes":null}"#;
         let sess: Session = serde_json::from_str(old).unwrap();
         assert!(!sess.read_only, "旧会话 read_only 默认应为 false");
+    }
+
+    /// 文件夹结构可存储往返；删除文件夹时子文件夹上提一级。
+    #[test]
+    fn folder_storage_roundtrip_and_remove_reparents() {
+        let dir = std::env::temp_dir().join("paperhelper_test").join("folders_rt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let folders = vec![
+            Folder {
+                id: "a".into(),
+                name: "甲".into(),
+                parent: None,
+                pinned: true,
+            },
+            Folder {
+                id: "b".into(),
+                name: "乙".into(),
+                parent: Some("a".into()),
+                pinned: false,
+            },
+            Folder {
+                id: "c".into(),
+                name: "丙".into(),
+                parent: Some("b".into()),
+                pinned: false,
+            },
+        ];
+        save_folders_to(&dir, &folders).unwrap();
+        let mut back = load_folders_from(&dir);
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].name, "甲");
+        assert!(back[0].pinned);
+
+        assert!(remove_folder(&mut back, "b"));
+        assert_eq!(back.len(), 2);
+        assert_eq!(
+            back.iter().find(|f| f.id == "c").unwrap().parent.as_deref(),
+            Some("a"),
+            "删除乙后丙应上提到甲下"
+        );
+        assert!(back.iter().all(|f| f.id != "b"));
+        assert!(!remove_folder(&mut back, "missing"), "删除不存在的文件夹返回 false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧会话没有 folder 字段，加载后应为空串（向后兼容）。
+    #[test]
+    fn session_folder_backward_compatible() {
+        let old = r#"{"session_id":"20250101_000000"}"#;
+        let sess: Session = serde_json::from_str(old).unwrap();
+        assert_eq!(sess.folder, "");
+    }
+
+    /// read_meta 轻量解析也应带出 folder。
+    #[test]
+    fn read_meta_reads_folder() {
+        let dir = std::env::temp_dir().join("paperhelper_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("meta_folder.json");
+        let mut sess = Session {
+            session_id: "20260101_000001".into(),
+            folder: "f1".into(),
+            ..Default::default()
+        };
+        sess.save(&path).unwrap();
+        let meta = read_meta(&path).unwrap();
+        assert_eq!(meta.folder, "f1");
+        let _ = std::fs::remove_file(&path);
     }
 }
