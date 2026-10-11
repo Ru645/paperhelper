@@ -389,6 +389,8 @@ function showBusyHint(text) {
 let currentTab = "note";   // 当前激活的标签（note | pdf | graph | console | 动态）
 
 function switchTab(key) {
+  // 「仅阅读」会话没有笔记，禁止切到「笔记」标签（只展示原文）
+  if (key === "note" && lastState && lastState.read_only) key = "pdf";
   currentTab = key;
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.key === key));
   document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.dataset.key === key));
@@ -918,12 +920,15 @@ function showGraphInfo(data, name, anchor) {
 }
 
 /// 无笔记时隐藏 iframe，显示居中的导入入口（导入只在新笔记时需要）。
+/// 「仅阅读」会话没有笔记，隐藏「笔记」标签、只留「原文」。
 function renderNoteEmpty(st) {
   const empty = $("note-empty");
   if (!empty) return;
   const has = !!(st && st.has_note);
   empty.classList.toggle("hidden", has);
   noteFrame.classList.toggle("hidden", !has);
+  const noteTab = $("tab-note");
+  if (noteTab) noteTab.classList.toggle("hidden", !!(st && st.read_only));
 }
 
 // ===== 「原文」（PDF 阅读器）标签 =====
