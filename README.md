@@ -69,7 +69,7 @@ paperhelper web --port 9000  # 指定端口
 
 **导入**：新建会话（或还没有笔记）时，笔记页中央「＋ 导入资料」；也可直接把 PDF / TXT / MD / HTML 拖进窗口（**仅「新建且尚未导入」的会话可用**；已有笔记 / 原文的会话拖入会提示先新建，避免误覆盖）。上传前选模式：
 - **论文 → 生成笔记**：读论文全文，按所选风格生成笔记（默认四段式；扫描版可选 OCR）。
-- **笔记 / 讲义 → 导入**：解析成笔记树、不调模型（按风格 AI 整理或「逐段翻译」也支持）。HTML 会自动转成 Markdown（公式按 KaTeX 还原、MathJax 的 `\newcommand` 宏定义自动收集注册，自定义宏照常渲染）。
+- **笔记 / 讲义 → 导入**：解析成笔记树、不调模型（按风格 AI 整理或「逐段翻译」也支持）。**HTML 原样导入时按 HTML 笔记解析**（保留排版 / 表格 / 内联 SVG，脚本与样式自动剔除；无标题文档按顶层块切段），选 AI 风格时则在浏览器端转成 Markdown（公式按 KaTeX 还原、MathJax 的 `\newcommand` 宏定义自动收集注册，自定义宏照常渲染）。
 - **PDF → 仅阅读（不生成笔记）**：只接受 PDF，不调模型、不生成笔记，导入后自动进入「原文」视图供阅读与选中提问；仍可切到空的「笔记」页，不自动导出。
 
 导入窗口里还能填「**本次额外要求**」（拼到风格提示词之后）、「**另存为风格**」、或点「**管理…**」直接编辑风格。
@@ -232,7 +232,7 @@ PAPERHELPER_DATA_DIR="$HOME/PaperHelper/.paperhelper" paperhelper web
 - **PDF 原文阅读器**：前端内嵌 [PDF.js](https://mozilla.github.io/pdf.js/)（`web/vendor/pdfjs/`，Apache-2.0）负责渲染与文本层，`web/pdf-viewer.js` 是薄适配层；`/api/pdf/file` 只服务**当前会话**对应的原件（`pdf_source()`：笔记 `source_path` 优先，回退知识库论文路径），PDF 批注提问时把该页 canvas 渲染成 PNG（data URL）作为多模态图片随请求发送，不走检索。
 - **向后兼容**：全部数据字段带 `#[serde(default)]`，老存档正常载入、新字段自动补齐。
 - **文件布局**：数据放 `.paperhelper/`（config/knowledge/styles/sessions/…），Web 上传与笔记导出分开存放。
-- **导入解析**：有标题建 Section 树、无标题按空行切段、HTML 走浏览器端白名单转换（锚点/脚本剔除）；MathJax 的 `\newcommand` 宏块收集进 `Note.math_macros` 供 KaTeX 渲染。
+- **导入解析**：有标题建 Section 树、无标题按空行切段；`.html`/`.htm` 原样导入按 HTML 笔记解析（取 `<body>` 与 `<title>`、剥除 `<script>`/`<style>`/注释，无标题时按顶层块切段），选 AI 风格时改走浏览器端白名单转换；MathJax 的 `\newcommand` 宏块收集进 `Note.math_macros` 供 KaTeX 渲染。
 - **可编辑树**：块级编辑尽量保持块 id 稳定；`parse_markdown_blocks` 统一编号；`undo` 多级内存撤销。
 - **流式 + 并发模型**：LLM 输出流式渲染（字节缓冲 + UTF-8 行边界解码，中文不会切花）；推理模型的 `reasoning_content` 走独立 SSE 事件。LLM 阶段不持锁（prepare → 锁外 run → commit 三段），用全局门串 + session 版本号 epoch 防误写，非 LLM 请求生成期间照常服务。
 - **可中止 / 健壮性**：全局 `interrupt` 信号 + `tokio::select!`，LLM 发送/读取、重试退避、PDF/OCR 子进程（`kill_on_drop`）都能被停止；网络错误自动重试 2 次、超上下文自动截断早期对话、token 预算封顶、上传限量 200MB 流式写盘。

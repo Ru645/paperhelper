@@ -3788,18 +3788,22 @@ async function importFile(file) {
   if (!file) return;
   if (running || llmBusyTask) { showBusyHint(); return; }
   const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 20);
-  const opts = await promptImport(file, "笔记_" + stem + ".md");
+  const defaultExport = "笔记_" + stem + (/\.html?$/i.test(file.name) ? ".html" : ".md");
+  const opts = await promptImport(file, defaultExport);
   if (!opts) return; // 取消
-  const exportName = opts.name.trim() || ("笔记_" + stem + ".md");
+  const exportName = opts.name.trim() || defaultExport;
   const isRead = opts.mode === "read";
   try {
     if (isRead && !/\.pdf$/i.test(file.name)) {
       throw new Error("「仅阅读」只支持 PDF 文件（请选 PDF，或改用其他导入方式）");
     }
-    // HTML：浏览器端先转成 Markdown（公式按 KaTeX 隐藏层还原），再当 md 上传
+    // HTML：原样导入时按 HTML 笔记直接上传（保留排版/表格/SVG）；
+    // 需要 LLM 生成时先在浏览器端转成 Markdown（公式按 KaTeX 隐藏层还原）再上传。
+    const isRaw = opts.mode === "note" && opts.style === "__raw__";
+    const isHtml = /\.html?$/i.test(file.name);
     let uploadTarget = file;
     let isText = /\.(txt|md|markdown)$/i.test(file.name);
-    if (!isRead && /\.html?$/i.test(file.name)) {
+    if (!isRead && isHtml && !isRaw) {
       setProgress("转换 HTML…");
       const conv = htmlToMarkdown(await file.text());
       if (!conv.md.trim()) throw new Error("HTML 里没有提取到正文");
@@ -3809,13 +3813,14 @@ async function importFile(file) {
         : conv.md;
       uploadTarget = new File([withMacros], stem + ".md", { type: "text/markdown" });
       isText = true;
+    } else if (!isRead && isHtml) {
+      isText = true; // 上传原始 .html，后端按 HTML 笔记解析
     }
     setProgress(isRead ? "解析 PDF…" : "上传中…");
     // 反馈全部进「笔记区」覆盖层（阶段/思考/流式笔记），不占用控制台
     switchTab("note");
     noteGenReset();
     noteGenPhase(isRead ? "解析 PDF…" : "上传中…");
-    const isRaw = opts.mode === "note" && opts.style === "__raw__";
     const modeLabel = isRead
       ? "PDF → 仅阅读（不生成笔记）"
       : opts.mode === "paper" ? "论文 → 生成笔记" : isRaw ? "原样导入" : "风格 " + opts.style;

@@ -583,6 +583,18 @@ fn looks_vision(model: &str) -> bool {
     EXACT_PREFIX.iter().any(|p| m.starts_with(p))
 }
 
+/// 判断按文本读入的导入文件是否为 HTML：优先看扩展名，其次嗅探开头内容
+/// （`<!DOCTYPE html>` / `<html` / `<body`）。用于选择 HTML 笔记解析器。
+fn looks_like_html(content: &str, file_path: &str) -> bool {
+    let lower_path = file_path.to_ascii_lowercase();
+    if lower_path.ends_with(".html") || lower_path.ends_with(".htm") {
+        return true;
+    }
+    let head: String = content.trim_start().chars().take(300).collect();
+    let head = head.to_ascii_lowercase();
+    head.starts_with("<!doctype html") || head.starts_with("<html") || head.starts_with("<body")
+}
+
 /// 根据 `pdf_input` 档位与模型名得到 PDF 输入的尝试顺序（从优到兜底）。
 pub fn pdf_attempts(mode: &str, model: &str) -> Vec<PdfModality> {
     match mode {
@@ -1205,7 +1217,8 @@ impl App {
         let h = "\
 PaperHelper 命令：
   ingest <pdf>            解析 PDF 并按风格生成笔记（--style <风格id>，默认 four）
-  ingest --note <文件>    直接导入笔记/讲义（不调 LLM；--kind paper|note|lecture）
+  ingest --note <文件>    直接导入笔记/讲义/网页（不调 LLM；--kind paper|note|lecture）
+                          .html/.htm 按 HTML 笔记导入（保留排版、表格与 SVG）
   ingest --read <pdf>     仅阅读 PDF 原件（不调 LLM、不生成笔记；扫描件也能读）
   ingest --text <txt>     直接读取文本文件（跳过PDF解析）
   ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
@@ -1730,11 +1743,17 @@ PaperHelper 命令：
         } else if rest == "--text" || rest == "--ocr" {
             bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] [--text|--ocr] <路径>");
         } else {
-            ("pdf", normalize_path_arg(rest))
+            let p = normalize_path_arg(rest);
+            let lower = p.to_ascii_lowercase();
+            if lower.ends_with(".html") || lower.ends_with(".htm") {
+                ("text", p)
+            } else {
+                ("pdf", p)
+            }
         };
 
         if file_path.is_empty() {
-            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --read <pdf路径>  仅阅读原件（不生成笔记）\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
+            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --read <pdf路径>  仅阅读原件（不生成笔记）\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --note <html路径>  直接导入网页/HTML 笔记（保留排版，不调 LLM）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
         let p = Path::new(&file_path);
         if !p.exists() {
@@ -2018,7 +2037,11 @@ PaperHelper 命令：
             .and_then(|s| s.to_str())
             .unwrap_or("note");
         let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
-        let mut note = notes::parse_import_note(&raw_text, &title_guess);
+        let mut note = if mode == "text" && looks_like_html(&raw_text, file_path) {
+            notes::parse_import_html_note(&raw_text, &title_guess)
+        } else {
+            notes::parse_import_note(&raw_text, &title_guess)
+        };
         note.material_kind = kind.to_string();
         note.figures = figures;
         note.media_id = media_id;
@@ -2166,7 +2189,12 @@ PaperHelper 命令：
             .and_then(|s| s.to_str())
             .unwrap_or("note");
         let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
-        let default_name = format!("笔记_{title_guess}.md");
+        let lower_path = file_path.to_ascii_lowercase();
+        let html_note = lower_path.ends_with(".html")
+            || lower_path.ends_with(".htm")
+            || (lower_path.ends_with(".pdf") && self.config.note.format == "html");
+        let ext = if html_note { "html" } else { "md" };
+        let default_name = format!("笔记_{title_guess}.{ext}");
         if self.emitter.is_terminal() {
             print!("请输入笔记导出文件名（回车默认 {default_name}）: ");
             io::stdout().flush()?;
@@ -2481,7 +2509,8 @@ PaperHelper 命令：
         }
         if self.export_path.is_none() {
             let title = self.session.notes.as_ref().map(|n| n.title.clone()).unwrap_or_default();
-            let default_name = format!("笔记_{}.md", title.chars().take(20).collect::<String>());
+            let ext = if self.session.notes.as_ref().is_some_and(|n| n.is_html()) { "html" } else { "md" };
+            let default_name = format!("笔记_{}.{ext}", title.chars().take(20).collect::<String>());
             if self.emitter.is_terminal() {
                 print!("请输入笔记导出文件名（回车默认 {}，输 skip 跳过）: ", default_name);
                 io::stdout().flush()?;
@@ -4262,9 +4291,9 @@ fn prune_annotations(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_concept, looks_vision, normalize_path_arg, parse_graph_relations, pdf_attempts,
-        strip_flag, take_bool_arg, take_style_arg, take_value_arg, CommandCompleter, ExtraInput,
-        PdfModality,
+        extract_concept, looks_like_html, looks_vision, normalize_path_arg, parse_graph_relations,
+        pdf_attempts, strip_flag, take_bool_arg, take_style_arg, take_value_arg, CommandCompleter,
+        ExtraInput, PdfModality,
     };
     use rustyline::completion::Completer;
     use std::sync::{Arc, Mutex};
@@ -4308,6 +4337,17 @@ mod tests {
         assert!(looks_vision("claude-3-5-sonnet"));
         assert!(!looks_vision("DeepSeek-V4-Pro"));
         assert!(!looks_vision("qwen3-235b-a22b"));
+    }
+
+    #[test]
+    fn looks_like_html_by_extension_and_sniff() {
+        assert!(looks_like_html("任意内容", "/tmp/notes/a.HTML"));
+        assert!(looks_like_html("任意内容", "a.htm"));
+        assert!(looks_like_html("  <!DOCTYPE html>\n<p>x</p>", "a.txt"));
+        assert!(looks_like_html("<html><body>x</body></html>", "a.txt"));
+        assert!(looks_like_html("<body><p>x</p></body>", "a.txt"));
+        assert!(!looks_like_html("# 标题\n\n正文", "a.md"));
+        assert!(!looks_like_html("普通文本 <html> 但不以它开头", "a.txt"));
     }
 
     /// 关系行解析：合法行解析、去重、跳过「无」与格式不符/代码块标记的行。

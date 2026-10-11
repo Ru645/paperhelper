@@ -846,10 +846,15 @@ pub fn parse_markdown_blocks(md: &str) -> Vec<Block> {
 /// 约定：`<h1>`=标题；`<h2>`…`<h6>`=按层级嵌套的 Section；每个标题到下一个标题
 /// 之间的 HTML 合成为一个 Paragraph（`html`=该段 HTML，`text`=其纯文本）。
 pub fn parse_html_note(html: &str, raw_text: &str) -> Note {
+    parse_html_note_inner(html, "未命名论文", raw_text)
+}
+
+/// `parse_html_note` 的实现：`title_fallback` 在正文没有 `<h1>` 时兜底。
+fn parse_html_note_inner(html: &str, title_fallback: &str, raw_text: &str) -> Note {
     let html = strip_html_fences(&strip_reasoning(html));
     let (mut title, roots) = parse_html_blocks_core(&html, true);
-    if title.is_empty() {
-        title = "未命名论文".to_string();
+    if title.trim().is_empty() {
+        title = title_fallback.to_string();
     }
     let mut note = Note {
         paper_id: String::new(),
@@ -865,6 +870,223 @@ pub fn parse_html_note(html: &str, raw_text: &str) -> Note {
     };
     assign_numbers(&mut note);
     note
+}
+
+/// 直接导入外部 HTML 文件时的解析：先取出 `<body>` 正文与 `<title>`，
+/// 去掉 `<head>`/`<script>`/`<style>` 与注释，再按 HTML 笔记同规则建树。
+/// 有标题元素（`<h1>`…）时按层级分节；整篇没有标题时按顶层块元素切段，
+/// 保证大纲 / 锚点 / 批注 / 逐块编辑仍然可用。`raw_text` 置空（同 Markdown 直接导入）。
+pub fn parse_import_html_note(html: &str, fallback_title: &str) -> Note {
+    let (macros, html) = take_macros_comment(html);
+    let (body, doc_title) = extract_html_body(&html);
+    let fallback = doc_title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| fallback_title.to_string());
+    let has_heading = has_html_heading(&body);
+    let (title, roots) = if has_heading {
+        let (mut t, roots) = parse_html_blocks_core(&strip_html_fences(&body), true);
+        if t.trim().is_empty() {
+            t = fallback;
+        }
+        (t, roots)
+    } else {
+        let chunks = split_html_top_level_blocks(&body);
+        let roots: Vec<Block> = chunks
+            .into_iter()
+            .map(|seg| Block {
+                id: uid(),
+                kind: BlockKind::Paragraph,
+                text: strip_html_tags(&seg),
+                html: Some(seg),
+                number: String::new(),
+                children: Vec::new(),
+                explanations: Vec::new(),
+            })
+            .filter(|b| !b.text.is_empty() || b.html.as_deref().is_some_and(|h| h.contains("<img") || h.contains("<svg")))
+            .collect();
+        (fallback, roots)
+    };
+    let mut note = Note {
+        paper_id: String::new(),
+        title,
+        blocks: roots,
+        raw_text: String::new(),
+        material_kind: String::new(),
+        math_macros: macros,
+        source_path: None,
+        figures: Vec::new(),
+        media_id: None,
+        body_format: "html".to_string(),
+    };
+    assign_numbers(&mut note);
+    note
+}
+
+/// 正文里是否存在 `h1`..`h6` 标题（大小写不敏感）。
+fn has_html_heading(html: &str) -> bool {
+    next_heading(html, 0).is_some()
+}
+
+/// 从 HTML 文档中取出正文与 `<title>`：优先 `<body>` 内容，并去掉
+/// `<head>`/`<script>`/`<style>` 块与 HTML 注释，避免样式、脚本混入笔记正文。
+fn extract_html_body(html: &str) -> (String, Option<String>) {
+    let doc_title = element_inner(html, "title").map(|t| strip_html_tags(&t));
+    let mut s = strip_element_blocks(html, "script");
+    s = strip_element_blocks(&s, "style");
+    s = strip_element_blocks(&s, "head");
+    s = strip_comments(&s);
+    let body = element_inner(&s, "body").unwrap_or(s);
+    (body.trim().to_string(), doc_title)
+}
+
+/// 大小写不敏感地查找标签起始：`<tag` 或 `</tag`，且其后紧跟界符
+/// （`>`、空白或 `/`），避免把 `<header>` 误配到 `</head>`。
+fn find_tag(s: &str, tag: &str, closing: bool) -> Option<usize> {
+    let needle = if closing { format!("</{tag}") } else { format!("<{tag}") };
+    let lower = s.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(p) = lower[from..].find(&needle) {
+        let abs = from + p;
+        let after = abs + needle.len();
+        let ok = match s[after..].chars().next() {
+            None => true,
+            Some(c) => c == '>' || c == '/' || c.is_ascii_whitespace(),
+        };
+        if ok {
+            return Some(abs);
+        }
+        from = abs + 1;
+    }
+    None
+}
+
+/// 取第一个 `<tag …>…</tag>` 的内容（大小写不敏感）。
+fn element_inner(s: &str, tag: &str) -> Option<String> {
+    let open = find_tag(s, tag, false)?;
+    let gt = s[open..].find('>')?;
+    let content_start = open + gt + 1;
+    let rel = find_tag(&s[content_start..], tag, true)?;
+    Some(s[content_start..content_start + rel].to_string())
+}
+
+/// 删除所有 `<tag …>…</tag>` 块（含标签本身）；未闭合时删除开标签后的全部内容。
+fn strip_element_blocks(s: &str, tag: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        let Some(i) = find_tag(rest, tag, false) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..i]);
+        let Some(gt) = rest[i..].find('>') else {
+            break;
+        };
+        let after_open = i + gt + 1;
+        match find_tag(&rest[after_open..], tag, true) {
+            Some(rel) => {
+                let close_start = after_open + rel;
+                match rest[close_start..].find('>') {
+                    Some(gt2) => rest = &rest[close_start + gt2 + 1..],
+                    None => break,
+                }
+            }
+            None => rest = &rest[after_open..],
+        }
+    }
+    out
+}
+
+/// 删除 HTML 注释 `<!-- … -->`。
+fn strip_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        match rest[i + 4..].find("-->") {
+            Some(rel) => rest = &rest[i + 4 + rel + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 解析一个标签名（去掉 `<`/`>`）：返回 (名字小写, 是否闭合, 是否自闭合)。
+fn parse_tag(inner: &str) -> (Option<String>, bool, bool) {
+    let mut s = inner.trim();
+    let closing = s.starts_with('/');
+    if closing {
+        s = s[1..].trim_start();
+    }
+    let name: String = s.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+    if name.is_empty() {
+        return (None, false, false);
+    }
+    let self_close = s.trim_end().ends_with('/');
+    (Some(name.to_ascii_lowercase()), closing, self_close)
+}
+
+const HTML_BLOCK_TAGS: &[&str] = &[
+    "p", "div", "ul", "ol", "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "pre",
+    "blockquote", "figure", "figcaption", "section", "article", "header", "footer", "nav", "aside",
+    "main", "dl", "dt", "dd", "h1", "h2", "h3", "h4", "h5", "h6",
+];
+
+const HTML_VOID_TAGS: &[&str] = &[
+    "hr", "img", "br", "input", "meta", "link", "source", "col", "area", "base", "embed", "param",
+    "track", "wbr",
+];
+
+/// 按顶层块元素把一段 HTML 切成若干片段（保留块之间的纯文本），
+/// 供无标题文档切段。嵌套在同一顶层块里的内容保持为一个片段。
+fn split_html_top_level_blocks(html: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = html.as_bytes();
+    let mut depth: i32 = 0;
+    let mut chunk_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let Some(gt) = html[i..].find('>') else { break };
+            let tag_end = i + gt + 1;
+            let (name, closing, self_close) = parse_tag(&html[i + 1..i + gt]);
+            if let Some(name) = name {
+                if HTML_BLOCK_TAGS.contains(&name.as_str()) {
+                    if closing {
+                        if depth > 0 {
+                            depth -= 1;
+                            if depth == 0 {
+                                push_chunk(&mut out, &html[chunk_start..tag_end]);
+                                chunk_start = tag_end;
+                            }
+                        }
+                    } else if !self_close && !HTML_VOID_TAGS.contains(&name.as_str()) {
+                        if depth == 0 {
+                            push_chunk(&mut out, &html[chunk_start..i]);
+                            chunk_start = i;
+                        }
+                        depth += 1;
+                    }
+                }
+            }
+            i = tag_end;
+        } else {
+            i += 1;
+        }
+    }
+    push_chunk(&mut out, &html[chunk_start..]);
+    out
+}
+
+fn push_chunk(out: &mut Vec<String>, seg: &str) {
+    let t = seg.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
 }
 
 /// 解析一段 HTML 为块序列（供「插入内容 / 整节重写」使用）。
@@ -2042,5 +2264,79 @@ mod tests {
         let note = parse_html_note("```html\n<h1>T</h1>\n<p>正文</p>\n```", "raw");
         assert_eq!(note.title, "T");
         assert!(!note.block_markdown(&note.blocks[0].id).unwrap().contains("```"));
+    }
+
+    #[test]
+    fn import_html_note_extracts_body_title_and_tree() {
+        let doc = "<!DOCTYPE html><html><head><title>网页标题</title>\
+                   <style>p{color:red}</style><script>alert(1)</script></head>\
+                   <body><h1>论文标题</h1><h2>一、引言</h2><p>正文 <b>加粗</b></p>\
+                   <h2>二、方法</h2><p>公式 \\(x^2\\)</p></body></html>";
+        let note = parse_import_html_note(doc, "文件名");
+        assert!(note.is_html());
+        assert_eq!(note.body_format, "html");
+        assert_eq!(note.title, "论文标题", "有 <h1> 时优先用它");
+        assert_eq!(note.blocks.len(), 2, "两个顶级章节");
+        assert!(note.raw_text.is_empty(), "直接导入的笔记 raw_text 应为空");
+        let flat = note.flatten();
+        let para = flat
+            .iter()
+            .find(|(b, _)| b.kind == BlockKind::Paragraph)
+            .expect("应有段落");
+        assert!(para.0.text.contains("正文") && para.0.text.contains("加粗"));
+        assert!(para.0.html.as_deref().unwrap().contains("<b>加粗</b>"));
+        let all: String = note
+            .flatten()
+            .iter()
+            .map(|(b, _)| b.html.as_deref().unwrap_or(&b.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("alert(1)"), "脚本应被剥除: {all}");
+        assert!(!all.contains("color:red"), "样式应被剥除: {all}");
+        assert!(!all.contains("<title>"), "标题标签应被剥除: {all}");
+    }
+
+    #[test]
+    fn import_html_note_uses_title_tag_when_no_h1() {
+        let doc = "<html><head><title>来自 title</title></head>\
+                   <body><h2>章节</h2><p>内容</p></body></html>";
+        let note = parse_import_html_note(doc, "文件名");
+        assert_eq!(note.title, "来自 title");
+    }
+
+    #[test]
+    fn import_html_note_headingless_splits_blocks() {
+        let doc = "<html><body><p>第一段</p><div>第二段 <em>强调</em></div>\
+                   <p>第三段</p></body></html>";
+        let note = parse_import_html_note(doc, "讲义");
+        assert_eq!(note.title, "讲义");
+        assert_eq!(note.blocks.len(), 3, "按顶层块切段");
+        assert!(note.blocks.iter().all(|b| b.kind == BlockKind::Paragraph));
+        assert!(note.blocks.iter().any(|b| b.text.contains("强调")));
+        assert!(note.blocks.iter().any(|b| b.html.as_deref().unwrap().contains("<em>")));
+    }
+
+    #[test]
+    fn import_html_note_keeps_nested_blocks_together() {
+        let doc = "<body><div><p>外层</p><p>内层</p></div><p>下一段</p></body>";
+        let note = parse_import_html_note(doc, "讲义");
+        assert_eq!(note.blocks.len(), 2, "嵌套块不应被拆开");
+        assert!(note.blocks[0].html.as_deref().unwrap().contains("内层"));
+    }
+
+    #[test]
+    fn import_html_note_extracts_macros_comment() {
+        let doc = "<!-- paperhelper-macros\n\\newcommand{\\ket}[1]{\\vert#1\\rangle}\n-->\n\
+                   <html><body><h1>讲义</h1><p>公式 $\\ket{0}$</p></body></html>";
+        let note = parse_import_html_note(doc, "fallback");
+        assert_eq!(note.title, "讲义");
+        assert!(note.math_macros.as_deref().unwrap_or("").contains("\\ket"));
+        let all: String = note
+            .flatten()
+            .iter()
+            .map(|(b, _)| b.html.as_deref().unwrap_or(&b.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("paperhelper-macros"));
     }
 }
