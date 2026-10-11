@@ -3168,6 +3168,7 @@ async function sendAnnotation() {
   setAnnProgress("");
   const rbox = $("ann-reasoning");
   if (rbox && !rbox.classList.contains("hidden")) rbox.open = false; // 思考过程收起但保留
+  await loadMathLibs();
   await refreshState();
   await refreshAnnotations();
   // 发送完成后要展示的该条批注：回复→原批注；回答→发起时的宿主（保持整条对话森林）；
@@ -3196,6 +3197,12 @@ async function sendAnnotation() {
     renderAnnThread(roots);
     const el = document.querySelector(`#ann-thread .ann-node[data-node-id="${annSelectedNode}"]`);
     if (el) el.scrollIntoView({ block: "center" });
+  } else if (streamed && document.body.contains(ansEl)) {
+    // 兜底：刷新批注缓存后仍没定位到这条批注（如 PDF 选区坐标有细微差异、或缓存暂时落后），
+    // 至少把已流式输出的文本按 Markdown 渲染，避免停在裸 Markdown 文本上（须刷新页面才正常）。
+    ansEl.innerHTML = renderMathMarkdown(streamed);
+    const pend = ansEl.closest(".ann-node");
+    if (pend) pend.classList.remove("pending");
   }
   annHostId = null;
   reloadNote(null, true);
