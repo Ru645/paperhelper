@@ -1417,6 +1417,9 @@ PaperHelper 命令：
                 r.status,
                 r.latency_ms
             );
+            if !r.hint.is_empty() {
+                outln!(self, "{}", r.hint);
+            }
             outln!(self, "原始响应：\n{}", r.raw);
         }
         Ok(())

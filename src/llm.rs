@@ -255,12 +255,21 @@ fn friendly_net_error(e: &reqwest::Error) -> String {
     }
 }
 
-/// 把 HTTP 错误归类成「中文摘要 + 排查建议 + 原始响应」的错误链。
-/// 摘要用于界面展示，`{e:#}` 的完整链包含原始响应，便于日志/详情排查。
-fn friendly_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> anyhow::Error {
+/// 判断错误体是否表示「模型暂无可用部署」（网关把该模型的部署临时下线/进入冷却）。
+/// 常见文案：`No deployments available for selected model` / `cooldown_list`。
+fn looks_like_no_deployment(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("no deployments available")
+        || lower.contains("no deployment available")
+        || lower.contains("cooldown_list")
+        || lower.contains("model is currently unavailable")
+}
+
+/// 把 HTTP 错误归类成「中文摘要 + 排查建议」。
+fn classify_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> (String, String) {
     let code = status.as_u16();
     let lower = body.to_lowercase();
-    let (summary, hint): (String, String) = match code {
+    match code {
         401 => (
             "API Key 无效或未授权".to_string(),
             "检查 llm.api_key 是否正确：Web「配置 → 测试连接」，或 `config set llm.api_key <key>`。"
@@ -277,9 +286,20 @@ fn friendly_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> anyho
                 cfg.api_endpoint
             ),
         ),
+        429 if looks_like_no_deployment(body) => (
+            format!("模型「{}」暂无可用部署（429）", cfg.model),
+            format!(
+                "这是服务提供方那一侧的问题：该模型的部署被临时下线 / 进入冷却（常见于过载或维护），与你的额度、Key 无关。稍等几秒重试通常即可恢复；若长时间如此，改用其它模型（如 DeepSeek-V4-Flash）或联系服务提供方。"
+            ),
+        ),
         429 => (
-            "请求过于频繁或额度不足（429）".to_string(),
+            "请求过于频繁或并发超限（429）".to_string(),
             "稍后重试；若持续出现，检查账号余额 / 并发配额。".to_string(),
+        ),
+        503 if looks_like_no_deployment(body) => (
+            format!("模型「{}」暂无可用部署（503）", cfg.model),
+            "服务提供方临时下线了该模型的部署，稍等几秒重试；持续失败可改用其它模型或联系服务提供方。"
+                .to_string(),
         ),
         400 | 422
             if lower.contains("context")
@@ -315,7 +335,13 @@ fn friendly_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> anyho
             format!("LLM 请求失败（HTTP {code}）"),
             "检查端点 / 模型 / Key 配置：Web「配置 → 测试连接」。".to_string(),
         ),
-    };
+    }
+}
+
+/// 把 HTTP 错误归类成「中文摘要 + 排查建议 + 原始响应」的错误链。
+/// 摘要用于界面展示，`{e:#}` 的完整链包含原始响应，便于日志/详情排查。
+fn friendly_http_error(status: StatusCode, body: &str, cfg: &LlmConfig) -> anyhow::Error {
+    let (summary, hint) = classify_http_error(status, body, cfg);
     let raw: String = body.chars().take(2000).collect();
     anyhow::anyhow!("原始响应：{raw}")
         .context(hint)
@@ -349,7 +375,33 @@ async fn post_with_retry(
             _ = interrupt::wait() => bail!(Interrupted),
         };
         match result {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                // 服务端限流 / 模型暂无可用部署：网关通常会提示「Try again in N seconds」。
+                // 在还有重试额度时按提示（Retry-After，缺省 5s）等待后重发，让瞬时冷却自愈。
+                let status = resp.status();
+                let transient =
+                    status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE;
+                if transient && attempt < MAX_RETRIES {
+                    let wait = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or(5)
+                        .clamp(1, 30);
+                    logging::warn(format!(
+                        "服务端限流 / 模型暂不可用（HTTP {status}），{wait}s 后重试 ({}/{})",
+                        attempt + 1,
+                        MAX_RETRIES,
+                    ));
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+                        _ = interrupt::wait() => bail!(Interrupted),
+                    }
+                    continue;
+                }
+                return Ok(resp);
+            }
             Err(e) if is_retryable(&e) && attempt < MAX_RETRIES => {
                 let wait = std::time::Duration::from_secs(1 << attempt); // 1s, 2s
                 logging::warn(format!(
@@ -730,6 +782,9 @@ pub struct LlmTestResult {
     pub reply: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 失败时的中文摘要 + 排查建议（成功为空）。
+    #[serde(default)]
+    pub hint: String,
     /// 原始响应体（成功为 JSON，失败为错误体），供界面/CLI 排查。
     pub raw: String,
 }
@@ -746,6 +801,7 @@ pub async fn test(client: &reqwest::Client, cfg: &LlmConfig) -> LlmTestResult {
         reply: String::new(),
         input_tokens: 0,
         output_tokens: 0,
+        hint: String::new(),
         raw: String::new(),
     };
     if cfg.api_key.is_empty() {
@@ -796,10 +852,18 @@ pub async fn test(client: &reqwest::Client, cfg: &LlmConfig) -> LlmTestResult {
                         result.raw = format!("HTTP {status} 响应不是合法 JSON：{txt}");
                     }
                 }
+            } else {
+                let (summary, advice) = classify_http_error(status, &txt, cfg);
+                result.hint = format!("{summary}。{advice}");
             }
         }
         Err(e) => {
-            result.raw = format!("请求失败：{}", friendly_net_error(&e));
+            let reason = friendly_net_error(&e);
+            result.hint = format!(
+                "无法连接 LLM 端点（{}）：{reason}\n提示：检查本机网络/代理是否可用，并确认 api_endpoint 是完整 URL（含 /v1/chat/completions）。",
+                cfg.api_endpoint
+            );
+            result.raw = format!("请求失败：{reason}");
         }
     }
     logging::info(format!(
@@ -845,6 +909,25 @@ mod tests {
         let e = friendly_http_error(StatusCode::NOT_FOUND, "not found", &test_cfg());
         let msg = format!("{e:#}");
         assert!(msg.contains("接口地址不存在"), "{msg}");
+    }
+
+    #[test]
+    fn friendly_error_explains_no_deployment_429() {
+        // 网关把模型部署临时下线（冷却）时返回 429；不应误报成额度不足。
+        let body = r#"{"error":{"message":"No deployments available for selected model, Try again in 5 seconds. Passed model=DeepSeek-V4-Pro. pre-call-checks=False, cooldown_list=['cc7b25a9']","code":"429"}}"#;
+        let e = friendly_http_error(StatusCode::TOO_MANY_REQUESTS, body, &test_cfg());
+        let msg = format!("{e:#}");
+        assert!(msg.contains("暂无可用部署"), "{msg}");
+        assert!(msg.contains("服务提供方"), "{msg}");
+        assert!(!msg.contains("额度不足"), "{msg}");
+    }
+
+    #[test]
+    fn friendly_error_keeps_quota_hint_for_plain_429() {
+        let e = friendly_http_error(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded", &test_cfg());
+        let msg = format!("{e:#}");
+        assert!(msg.contains("429"), "{msg}");
+        assert!(msg.contains("并发"), "{msg}");
     }
 
     #[test]

@@ -4747,6 +4747,12 @@ async function testConfig() {
       head.textContent =
         `✗ 连接失败 · ${r.status ? "HTTP " + r.status : "网络错误"} · ${r.latency_ms}ms`;
       result.appendChild(head);
+      if (r.hint) {
+        const hint = document.createElement("div");
+        hint.className = "test-hint";
+        hint.textContent = r.hint;
+        result.appendChild(hint);
+      }
       if (r.raw) {
         const det = document.createElement("details");
         const sum = document.createElement("summary");
@@ -4922,7 +4928,7 @@ async function testWizardConfig() {
       result.textContent = `✓ 连接成功 · ${r.latency_ms}ms · 模型 ${r.model} · 回复「${r.reply}」`;
     } else {
       result.className = "test-result err";
-      result.textContent = `✗ 连接失败${r.status ? "（HTTP " + r.status + "）" : ""}：${r.raw || "无响应"}`;
+      result.textContent = `✗ 连接失败${r.status ? "（HTTP " + r.status + "）" : ""}：${r.hint || r.raw || "无响应"}`;
     }
   } catch (e) {
     if (e && e.name !== "AbortError") {

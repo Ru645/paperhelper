@@ -500,6 +500,8 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 .styles-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .test-result.err { color: var(--danger); }
 .test-result summary { cursor: pointer; color: var(--blue); font-size: 12px; }
+.test-result .test-hint { color: #444; margin-top: 4px; }
+.test-result .test-hint { color: #444; margin: 4px 0; white-space: pre-wrap; }
 
 /* ===== 批注（选中文字提问） ===== */
 .sel-btn {
