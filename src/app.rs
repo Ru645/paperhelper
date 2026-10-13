@@ -2207,10 +2207,26 @@ PaperHelper 命令：
             let mut name = String::new();
             io::stdin().lock().read_line(&mut name)?;
             let name = name.trim();
-            if name.is_empty() {
-                Ok(default_name)
+            let mut chosen = if name.is_empty() {
+                default_name
             } else {
-                Ok(sanitize_filename(&normalize_path_arg(name)))
+                sanitize_filename(&normalize_path_arg(name))
+            };
+            // 重名保护：提示用户改用「 (2)」建议名，或另输入一个名字
+            loop {
+                let Some(sugg) = suggest_unique_name(&chosen) else {
+                    return Ok(chosen);
+                };
+                print!("「{chosen}」已存在。回车用建议名「{sugg}」，或输入新名字: ");
+                io::stdout().flush()?;
+                let mut next = String::new();
+                io::stdin().lock().read_line(&mut next)?;
+                let next = next.trim();
+                chosen = if next.is_empty() {
+                    sugg
+                } else {
+                    sanitize_filename(&normalize_path_arg(next))
+                };
             }
         } else {
             let name = self.export_path.clone().unwrap_or(default_name);
@@ -4040,6 +4056,39 @@ fn sanitize_filename(s: &str) -> String {
     }
 }
 
+/// 导出名已与现有文件重名时，返回不重名的建议名（在文件名末尾依次加「 (2)」「 (3)」…，保留扩展名）。
+fn suggest_unique_name(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return None;
+    }
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("note");
+    let ext = p.extension().and_then(|s| s.to_str()).filter(|e| !e.is_empty());
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty());
+    for n in 2..=999 {
+        let file = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let cand = match dir {
+            Some(d) => d.join(&file).to_string_lossy().to_string(),
+            None => file,
+        };
+        if !Path::new(&cand).exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 导出前检查：把用户输入的名字规范化后，若同名文件已存在，返回建议的不重名名字。
+pub(crate) fn export_name_conflict(name: &str) -> Option<String> {
+    if name.trim().is_empty() {
+        return None;
+    }
+    suggest_unique_name(&sanitize_filename(name))
+}
+
 /// 判断是否是章节编号：如 "3", "3.2", "3.2.1"。
 fn is_section_number(s: &str) -> bool {
     !s.is_empty()
@@ -4632,6 +4681,30 @@ mod tests {
             _ => panic!("应走 LLM 生成分支"),
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重名保护：已存在时给出「 (2)」「 (3)」建议名；不存在或空名不报冲突。
+    #[test]
+    fn export_name_conflict_suggests_numbered_name() {
+        use super::export_name_conflict;
+        let dir = std::env::temp_dir().join("phdup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("note.md");
+        std::fs::write(&a, b"x").unwrap();
+        let a = a.to_string_lossy().to_string();
+        let s2 = dir.join("note (2).md").to_string_lossy().to_string();
+        let s3 = dir.join("note (3).md").to_string_lossy().to_string();
+        assert_eq!(export_name_conflict(&a).as_deref(), Some(s2.as_str()));
+        std::fs::write(&s2, b"x").unwrap();
+        assert_eq!(export_name_conflict(&a).as_deref(), Some(s3.as_str()));
+        assert_eq!(
+            export_name_conflict(&dir.join("nope.md").to_string_lossy()),
+            None,
+            "不存在的名字不应报冲突"
+        );
+        assert_eq!(export_name_conflict("  "), None, "空名不应报冲突");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

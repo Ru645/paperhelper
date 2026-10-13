@@ -453,6 +453,10 @@ button.mini { padding: 2px 8px; font-size: 12px; border-radius: 5px; }
 #import-extra { min-height: 54px; }
 .import-extra-actions { display: flex; justify-content: flex-end; margin: -4px 0 8px; }
 .import-extra-actions.hidden, #import-extra-wrap.hidden { display: none; }
+#import-name-warn {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: #b45309; margin: 2px 0 4px;
+}
 
 /* 设置弹窗：模型设置 / 笔记风格 两个页签 */
 .settings-box { width: 660px; }

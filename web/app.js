@@ -4057,6 +4057,7 @@ async function promptImport(file, defaultName) {
     $("import-format").value = importCtx.format;
     $("import-name").value = defaultName;
     $("import-extra").value = "";
+    hideImportNameWarn();
     document.querySelectorAll("#import-modes .mode-tab").forEach((t) => {
       t.classList.toggle("active", t.dataset.mode === importCtx.mode);
       // 「仅阅读」只接受 PDF：非 PDF 时禁用该选项
@@ -4080,6 +4081,56 @@ function closeImportModal(result) {
     importResolve = null;
     r(result);
   }
+}
+
+/// 提交导入弹窗：导出名与已有文件重名时先提醒（可改用建议名或改名字），不直接覆盖。
+async function submitImport() {
+  if (!importCtx) { closeImportModal(null); return; }
+  const result = {
+    name: $("import-name").value.trim(),
+    mode: importCtx.mode,
+    style: $("import-style").value,
+    format: $("import-format").value,
+    extra: $("import-extra").value,
+  };
+  // 仅阅读不导出；空名字交给后端用默认名
+  if (result.mode !== "read" && result.name) {
+    try {
+      const r = await fetch("/api/export-exists?name=" + encodeURIComponent(result.name));
+      const d = await r.json();
+      if (d && d.exists) {
+        showImportNameWarn(result.name, d.suggestion || "");
+        return;
+      }
+    } catch (e) {
+      /* 检查失败不拦截，按原名继续（后端仍有目录校验） */
+    }
+  }
+  closeImportModal(result);
+}
+
+function showImportNameWarn(name, suggestion) {
+  const el = $("import-name-warn");
+  el.textContent = suggestion
+    ? `已有同名文件「${name}」。`
+    : `已有同名文件「${name}」，请换一个名字。`;
+  if (suggestion) {
+    const btn = document.createElement("button");
+    btn.className = "mini";
+    btn.textContent = "改用 " + suggestion;
+    btn.onclick = () => {
+      $("import-name").value = suggestion;
+      if (importCtx) importCtx.nameEdited = true;
+      hideImportNameWarn();
+      submitImport();
+    };
+    el.appendChild(btn);
+  }
+  el.classList.remove("hidden");
+}
+
+function hideImportNameWarn() {
+  $("import-name-warn").classList.add("hidden");
 }
 
 /// 「另存为风格…」：把所选风格的提示词 + 本次额外要求保存成一个新风格。
@@ -5685,16 +5736,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // 导入弹窗：模式 + 动态风格 + 临时额外要求 + 风格管理
   $("btn-import-cancel").onclick = () => closeImportModal(null);
-  $("btn-import-ok").onclick = () =>
-    closeImportModal({
-      name: $("import-name").value.trim(),
-      mode: importCtx ? importCtx.mode : "paper",
-      style: $("import-style").value,
-      format: $("import-format").value,
-      extra: $("import-extra").value,
-    });
+  $("btn-import-ok").onclick = () => submitImport();
   $("import-name").addEventListener("input", () => {
     if (importCtx) importCtx.nameEdited = true;
+    hideImportNameWarn();
   });
   $("import-format").onchange = () => {
     localStorage.setItem(IMPORT_FORMAT_KEY, $("import-format").value);

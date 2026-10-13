@@ -67,6 +67,7 @@ pub fn router(app: SharedApp) -> Router {
         .route("/api/note/restyle", post(api_note_restyle))
         .route("/api/note/restyle/apply", post(api_note_restyle_apply))
         .route("/api/export", get(api_export))
+        .route("/api/export-exists", get(api_export_exists))
         .route("/api/config", get(api_config_get).post(api_config_set))
         .route("/api/config/test", post(api_config_test))
         .route("/api/sessions", get(api_sessions))
@@ -1560,6 +1561,20 @@ async fn api_export(State(app): State<SharedApp>, Query(q): Query<ExportQuery>) 
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
     resp
+}
+
+#[derive(Deserialize)]
+struct ExportExistsQuery {
+    #[serde(default)]
+    name: String,
+}
+
+/// `GET /api/export-exists?name=...`：导出前检查同名文件是否已存在；存在则返回「 (2)」建议名。
+async fn api_export_exists(Query(q): Query<ExportExistsQuery>) -> Response {
+    match crate::app::export_name_conflict(&q.name) {
+        Some(sugg) => Json(json!({ "exists": true, "suggestion": sugg })).into_response(),
+        None => Json(json!({ "exists": false })).into_response(),
+    }
 }
 
 /// 下载文件名安全化（去掉路径分隔符等）。
