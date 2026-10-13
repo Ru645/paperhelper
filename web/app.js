@@ -3939,7 +3939,8 @@ function uploadFile(file, onProgress) {
 // ===== 导入（论文 / 笔记·讲义）与笔记风格 =====
 
 let stylesCache = [];   // GET /api/styles 的结果
-let importCtx = null;   // 导入弹窗状态：{ file, mode: "paper"|"note" }
+let importCtx = null;   // 导入弹窗状态：{ file, mode: "paper"|"note", format, stem, nameEdited }
+const IMPORT_FORMAT_KEY = "ph.import.format"; // 记忆上次选择的笔记格式
 
 /// 拉取风格列表（导入弹窗与风格管理共用）。
 async function refreshStyles() {
@@ -3989,6 +3990,32 @@ function updateImportStyleHint() {
     : (s ? s.desc : "");
   $("import-extra-wrap").classList.toggle("hidden", raw);
   $("btn-import-save-style").classList.toggle("hidden", raw);
+  updateImportOptions();
+}
+
+/// 当前设置是否会调用 LLM 生成笔记：「仅阅读」不生成；「原样导入」按文件类型决定格式，均无需选格式。
+function importShowsFormat() {
+  if (!importCtx) return false;
+  if (importCtx.mode === "read") return false;
+  return $("import-style").value !== "__raw__";
+}
+
+/// 生成/导入笔记的默认文件名（随模式与格式变化）。
+function importDefaultName() {
+  const stem = importCtx ? importCtx.stem : "note";
+  let ext;
+  if (importCtx && importCtx.mode === "note" && $("import-style").value === "__raw__") {
+    ext = importCtx.isHtmlFile ? "html" : "md";
+  } else {
+    ext = $("import-format").value === "markdown" ? "md" : "html";
+  }
+  return "笔记_" + stem + "." + ext;
+}
+
+/// 用户未手动改过文件名时，跟随模式/格式自动更新默认名。
+function updateImportName() {
+  if (!importCtx || importCtx.nameEdited) return;
+  $("import-name").value = importDefaultName();
 }
 
 function setImportMode(mode) {
@@ -4006,6 +4033,8 @@ function updateImportOptions() {
   const read = importCtx && importCtx.mode === "read";
   $("import-note-opts").classList.toggle("hidden", !!read);
   $("import-read-hint").classList.toggle("hidden", !read);
+  $("import-format-wrap").classList.toggle("hidden", !importShowsFormat());
+  updateImportName();
   $("btn-import-ok").textContent = read ? "打开阅读" : "导入";
 }
 
@@ -4015,8 +4044,17 @@ async function promptImport(file, defaultName) {
   const isPdf = /\.pdf$/i.test(file.name);
   return new Promise((resolve) => {
     importResolve = resolve;
-    importCtx = { file, mode: isPdf ? "paper" : "note" };
+    const stem = file.name.replace(/\.[^.]+$/, "").slice(0, 20);
+    importCtx = {
+      file,
+      mode: isPdf ? "paper" : "note",
+      format: localStorage.getItem(IMPORT_FORMAT_KEY) === "markdown" ? "markdown" : "html",
+      stem,
+      isHtmlFile: /\.html?$/i.test(file.name),
+      nameEdited: false,
+    };
     $("import-file").textContent = "文件：" + file.name + "（可直接拖拽多个文件逐个导入）";
+    $("import-format").value = importCtx.format;
     $("import-name").value = defaultName;
     $("import-extra").value = "";
     document.querySelectorAll("#import-modes .mode-tab").forEach((t) => {
@@ -4132,9 +4170,10 @@ async function importFile(file) {
       const textArg = isText ? "--text " : "";
       // PDF 讲义标为 lecture，md/txt/html 笔记标为 note
       const kind = opts.mode === "note" ? (/\.pdf$/i.test(file.name) ? "lecture" : "note") : "paper";
+      const fmtArg = " --format " + (opts.format === "markdown" ? "markdown" : "html");
       cmd = isRaw
         ? `ingest --note --kind ${kind} ${textArg}` + shellQuote(j.path)
-        : `ingest --style ${opts.style} --kind ${kind}${extraArg} ${textArg}` + shellQuote(j.path);
+        : `ingest --style ${opts.style} --kind ${kind}${extraArg}${fmtArg} ${textArg}` + shellQuote(j.path);
     }
     // 记录发起会话：用户切走再切回时恢复实时反馈覆盖层
     importRun = { sessionId: (lastState && lastState.session_id) || "" };
@@ -5651,8 +5690,16 @@ document.addEventListener("DOMContentLoaded", () => {
       name: $("import-name").value.trim(),
       mode: importCtx ? importCtx.mode : "paper",
       style: $("import-style").value,
+      format: $("import-format").value,
       extra: $("import-extra").value,
     });
+  $("import-name").addEventListener("input", () => {
+    if (importCtx) importCtx.nameEdited = true;
+  });
+  $("import-format").onchange = () => {
+    localStorage.setItem(IMPORT_FORMAT_KEY, $("import-format").value);
+    updateImportName();
+  };
   $("import-name").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); $("btn-import-ok").click(); }
   });

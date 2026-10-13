@@ -412,7 +412,7 @@ pub const CONFIG_FIELDS: &[FieldDef] = &[
     field_enum!("llm.paper_relation", Some("PAPERHELPER_PAPER_RELATION"), "concept", PAPER_RELATION_MODES, "论文关联增强", "llm", "回答时是否参考其它相关论文：默认只补充相关概念；调高后还会带上关联论文的笔记，甚至原文，更全面但更耗 token。", llm.paper_relation),
     field_enum!("llm.context_scope", Some("PAPERHELPER_CONTEXT_SCOPE"), "note", CONTEXT_SCOPE_MODES, "提问上下文", "llm", "提问时发给模型的资料多少：只发选中段落最省；发整篇笔记更完整；连论文原文一起发最全也最费 token。", llm.context_scope),
     field_bool!("llm.kb_agent", Some("PAPERHELPER_KB_AGENT"), "false", "概念检索代理", "llm", "回答前先让模型自动挑选知识库里的相关概念（服务商不支持时自动改用本地匹配）；更准，但会多一次调用、更耗 token。", llm.kb_agent),
-    field_enum!("note.format", Some("PAPERHELPER_NOTE_FORMAT"), "html", NOTE_FORMAT_MODES, "笔记格式", "note", "新生成论文笔记的正文格式：HTML（推荐）可用内联 HTML/SVG 画示意图，公式与排版更丰富；Markdown 为旧格式。旧笔记不受影响。", note.format),
+    field_enum!("note.format", Some("PAPERHELPER_NOTE_FORMAT"), "html", NOTE_FORMAT_MODES, "笔记格式", "note", "导入生成笔记时的默认正文格式：HTML（推荐）可用内联 HTML/SVG 画示意图，公式与排版更丰富；Markdown 为旧格式。每次导入可在「导入资料」弹窗里单独选择格式覆盖此默认（CLI 用 --format html|markdown）。旧笔记不受影响。", note.format),
     field_num!(FieldKind::Float, "pricing.input_price_per_1m", Some("PAPERHELPER_INPUT_PRICE"), "0.15", "输入单价（/1M token）", "pricing", "", f64, "需要数字", pricing.input_price_per_1m),
     field_num!(FieldKind::Float, "pricing.output_price_per_1m", Some("PAPERHELPER_OUTPUT_PRICE"), "0.60", "输出单价（/1M token）", "pricing", "", f64, "需要数字", pricing.output_price_per_1m),
     field_num!(FieldKind::Int, "budget.token_budget", Some("PAPERHELPER_TOKEN_BUDGET"), "0", "token 预算", "budget", "0 = 不限。", u64, "需要整数", budget.token_budget),

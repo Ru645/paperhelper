@@ -1217,6 +1217,7 @@ impl App {
         let h = "\
 PaperHelper 命令：
   ingest <pdf>            解析 PDF 并按风格生成笔记（--style <风格id>，默认 four）
+                          --format html|markdown 指定笔记正文格式（覆盖配置里的 note.format）
   ingest --note <文件>    直接导入笔记/讲义/网页（不调 LLM；--kind paper|note|lecture）
                           .html/.htm 按 HTML 笔记导入（保留排版、表格与 SVG）
   ingest --read <pdf>     仅阅读 PDF 原件（不调 LLM、不生成笔记；扫描件也能读）
@@ -1224,6 +1225,7 @@ PaperHelper 命令：
   ingest --ocr <pdf>      OCR 识别扫描件（需 tesseract）
   ingest --extra 「要求」   本次额外要求（拼到所选风格提示词之后）
                           例: ingest --style translate paper.pdf   （逐段翻译）
+                              ingest --format markdown paper.pdf   （本次生成 Markdown 笔记）
                               ingest --note lecture.md             （直接导入讲义）
                               ingest --style lecture lecture.pdf   （LLM 整理成讲义提纲）
   styles                  列出笔记风格（styles show <id> 看提示词；Web「管理风格」可编辑）
@@ -1737,6 +1739,7 @@ PaperHelper 命令：
         let (kind_raw, rest) = take_value_arg(&rest, "kind");
         let (direct_import, rest) = take_bool_arg(&rest, "note");
         let (read_only, rest) = take_bool_arg(&rest, "read");
+        let (format_raw, rest) = take_value_arg(&rest, "format");
         let rest = rest.trim();
         // 解析选项（路径参数做 shell 风格还原：剥引号/反斜杠转义，支持含空格文件名）
         let (mode, file_path) = if let Some(r) = rest.strip_prefix("--text ") {
@@ -1756,7 +1759,7 @@ PaperHelper 命令：
         };
 
         if file_path.is_empty() {
-            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] <pdf路径>\n  ingest --read <pdf路径>  仅阅读原件（不生成笔记）\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --note <html路径>  直接导入网页/HTML 笔记（保留排版，不调 LLM）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
+            bail!("用法: ingest [--style <风格>] [--note] [--extra <要求>] [--format html|markdown] <pdf路径>\n  ingest --read <pdf路径>  仅阅读原件（不生成笔记）\n  ingest --text <txt路径>  直接读文本（跳过PDF解析）\n  ingest --note <html路径>  直接导入网页/HTML 笔记（保留排版，不调 LLM）\n  ingest --ocr <pdf路径>  OCR提取（需安装 tesseract）");
         }
         let p = Path::new(&file_path);
         if !p.exists() {
@@ -1779,6 +1782,9 @@ PaperHelper 命令：
             return Ok(IngestPrep::Direct { file_path, mode: mode.to_string(), kind: kind.to_string() });
         }
         interrupt::reset();
+
+        // 笔记格式：--format 显式指定优先；否则 PDF 按全局配置 note.format，其它输入一律 Markdown。
+        let html = resolve_note_html(mode, &format_raw, &self.config.note.format)?;
 
         // 1. 抽取文本（PDF/OCR 子进程已异步，可被 Ctrl-C / Web 停止打断）
         let progress_msg = match mode {
@@ -1827,7 +1833,7 @@ PaperHelper 命令：
         }
 
         // 3. 确定笔记导出文件名（终端交互询问；Web 用预设 export_path）
-        let export_file = self.ask_export_name(&file_path)?;
+        let export_file = self.ask_export_name(&file_path, html)?;
 
         // 3. 预算检查 + 组装提示词（风格注册表 + 固定输出契约）
         if !self.check_budget()? {
@@ -1850,7 +1856,6 @@ PaperHelper 命令：
                 }
             }
         };
-        let html = mode == "pdf" && self.config.note.format == "html";
         let prompt = if html {
             crate::prompts::compose_style_prompt_html_with_figures(&style, &raw_text, &extra, &figures)?
         } else {
@@ -2034,13 +2039,14 @@ PaperHelper 命令：
         } else {
             (Vec::new(), None)
         };
-        let export_file = self.ask_export_name(file_path)?;
+        let html_note = mode == "text" && looks_like_html(&raw_text, file_path);
+        let export_file = self.ask_export_name(file_path, html_note)?;
         let stem = Path::new(file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
         let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
-        let mut note = if mode == "text" && looks_like_html(&raw_text, file_path) {
+        let mut note = if html_note {
             notes::parse_import_html_note(&raw_text, &title_guess)
         } else {
             notes::parse_import_note(&raw_text, &title_guess)
@@ -2186,16 +2192,13 @@ PaperHelper 命令：
     }
 
     /// 确定笔记导出文件名：终端交互询问；Web 用预设 export_path，否则用文件名的默认名。
-    fn ask_export_name(&mut self, file_path: &str) -> Result<String> {
+    /// `html_note`：生成/导入的笔记是否为 HTML 格式（决定默认扩展名）。
+    fn ask_export_name(&mut self, file_path: &str, html_note: bool) -> Result<String> {
         let stem = Path::new(file_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("note");
         let title_guess: String = strip_upload_stamp(stem).chars().take(20).collect();
-        let lower_path = file_path.to_ascii_lowercase();
-        let html_note = lower_path.ends_with(".html")
-            || lower_path.ends_with(".htm")
-            || (lower_path.ends_with(".pdf") && self.config.note.format == "html");
         let ext = if html_note { "html" } else { "md" };
         let default_name = format!("笔记_{title_guess}.{ext}");
         if self.emitter.is_terminal() {
@@ -3917,6 +3920,18 @@ fn split_args_quoted(s: &str) -> Vec<String> {
     out
 }
 
+/// 决定本次导入生成 HTML 还是 Markdown 笔记。
+/// `explicit` 为空时用默认策略：PDF 输入按全局配置 `note.format`，其它输入（文本/网页）一律 Markdown。
+/// `explicit` 为 `html` / `markdown`(或 `md`) 时按用户本次选择覆盖默认。
+fn resolve_note_html(mode: &str, explicit: &str, cfg_format: &str) -> Result<bool> {
+    match explicit.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(mode == "pdf" && cfg_format == "html"),
+        "html" => Ok(true),
+        "markdown" | "md" => Ok(false),
+        other => bail!("--format 只支持 html / markdown（当前: {other}）"),
+    }
+}
+
 /// 取出 `--<name> <值>` / `--<name>=<值>`（值按 shell 风格还原引号/转义），返回 (值, 剩余)。
 fn take_value_arg(rest: &str, name: &str) -> (String, String) {
     let toks = split_args_quoted(rest);
@@ -4578,6 +4593,44 @@ mod tests {
             Err(e) => e,
         };
         assert!(e.to_string().contains("只支持 PDF"), "错误应说明仅支持 PDF: {e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 笔记格式：显式 `--format` 优先；未指定时 PDF 按全局配置、文本/网页一律 Markdown。
+    #[test]
+    fn resolve_note_html_precedence() {
+        use super::resolve_note_html;
+        assert!(resolve_note_html("pdf", "html", "markdown").unwrap(), "显式 html 应覆盖配置");
+        assert!(!resolve_note_html("pdf", "markdown", "html").unwrap(), "显式 markdown 应覆盖配置");
+        assert!(!resolve_note_html("text", "md", "html").unwrap(), "md 等价于 markdown");
+        assert!(resolve_note_html("text", "HTML", "markdown").unwrap(), "取值大小写不敏感");
+        assert!(resolve_note_html("pdf", "", "html").unwrap(), "未指定时 PDF 看配置");
+        assert!(!resolve_note_html("pdf", "", "markdown").unwrap());
+        assert!(!resolve_note_html("text", "", "html").unwrap(), "文本输入默认 Markdown");
+        assert!(!resolve_note_html("ocr", "", "html").unwrap());
+        assert!(resolve_note_html("pdf", "org", "html").is_err(), "非法格式应报错");
+    }
+
+    /// `--format` 选项不应污染路径解析，且能决定生成 HTML 笔记。
+    #[tokio::test]
+    async fn prepare_ingest_format_flag_routes_html_note() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        let mut app = super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        let dir = std::env::temp_dir().join("paperhelper_format_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, b"# Title\n\nsome text").unwrap();
+
+        let prep = app
+            .prepare_ingest(&format!("--format html {}", txt.display()))
+            .await
+            .unwrap();
+        match prep {
+            super::IngestPrep::Llm(job) => assert!(job.html, "--format html 应生成 HTML 笔记"),
+            _ => panic!("应走 LLM 生成分支"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
