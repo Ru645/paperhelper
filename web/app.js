@@ -17,6 +17,7 @@ let annAbort = null;        // 当前批注请求的 AbortController
 let importResolve = null;   // 导入弹窗的 Promise resolve
 let editBlockId = null;     // 正在编辑的块 id
 let editBlockKind = "paragraph"; // 正在编辑的块类型：paragraph | section | title
+let editIsHtml = false;      // 当前笔记是否为 HTML 正文（决定编辑框加载 HTML 源 + 预览按 HTML 渲染）
 let editMode = "manual";    // manual | rewrite | append
 // AI 生成结果按块存草稿：block_id -> { text, status, cls }（关弹窗/切会话都不丢）
 const editDrafts = new Map();
@@ -1133,6 +1134,7 @@ function loadMathLibs() {
     "katex.min.css": "katex@0.16.9/dist/katex.min.css",
     "marked.min.js": "marked@12.0.2/marked.min.js",
     "katex.min.js": "katex@0.16.9/dist/katex.min.js",
+    "purify.min.js": "dompurify@3.4.16/dist/purify.min.js",
   };
   const url = (src, name) => {
     if (src === "/vendor") return `/vendor/${name}`;
@@ -1167,6 +1169,7 @@ function loadMathLibs() {
     await load("link", "katex.min.css");
     await load("script", "marked.min.js");
     await load("script", "katex.min.js");
+    await load("script", "purify.min.js");
   })();
   return mathLibsPromise;
 }
@@ -1255,7 +1258,7 @@ function convertMathDelims(md) {
   return out.join("\n");
 }
 
-function renderMathMarkdown(md) {
+function renderMathMarkdown(md, htmlMode) {
   if (!window.marked) return esc(md);
   md = convertMathDelims(md);
   const store = [];
@@ -1264,18 +1267,21 @@ function renderMathMarkdown(md) {
   // 行内公式：遵循 Pandoc 规则——开头 $ 后不能是空白、结尾 $ 前不能是空白，
   // 以免把货币美元（如 "$200 元"）误当成公式定界符。同时跳过转义的 \$
   src = src.replace(/(?<!\\)\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, tex) => { store.push([tex, false]); return token(store.length - 1); });
-  // 包裹漏加 $ 的裸数学 token（下标/上标，如 p_ij、S_n、s^n_k）；跳过代码围栏与行内代码
-  let inFence = false;
-  src = String(src).split("\n").map((line) => {
-    const t = line.trimStart();
-    if (t.startsWith("```")) { inFence = !inFence; return line; }
-    if (inFence) return line;
-    const codes = [];
-    line = line.replace(/`[^`]*`/g, (m) => { codes.push(m); return "\u2063C" + (codes.length - 1) + "\u2063"; });
-    line = line.replace(/(?<![\w$\\])(\\?[A-Za-z\u0370-\u03ff][A-Za-z0-9\u0370-\u03ff']*(?:(?:_|\^)(?:\{[^{}]*\}|[A-Za-z0-9\u0370-\u03ff]+))+)(?![\w])/g, (m) => { store.push([m, false]); return token(store.length - 1); });
-    line = line.replace(/\u2063C(\d+)\u2063/g, (_, i) => codes[+i]);
-    return line;
-  }).join("\n");
+  // 包裹漏加 $ 的裸数学 token（下标/上标，如 p_ij、S_n、s^n_k）；跳过代码围栏与行内代码。
+  // HTML 笔记（htmlMode）跳过：正文是 HTML，避免把属性名等误当公式。
+  if (!htmlMode) {
+    let inFence = false;
+    src = String(src).split("\n").map((line) => {
+      const t = line.trimStart();
+      if (t.startsWith("```")) { inFence = !inFence; return line; }
+      if (inFence) return line;
+      const codes = [];
+      line = line.replace(/`[^`]*`/g, (m) => { codes.push(m); return "\u2063C" + (codes.length - 1) + "\u2063"; });
+      line = line.replace(/(?<![\w$\\])(\\?[A-Za-z\u0370-\u03ff][A-Za-z0-9\u0370-\u03ff']*(?:(?:_|\^)(?:\{[^{}]*\}|[A-Za-z0-9\u0370-\u03ff]+))+)(?![\w])/g, (m) => { store.push([m, false]); return token(store.length - 1); });
+      line = line.replace(/\u2063C(\d+)\u2063/g, (_, i) => codes[+i]);
+      return line;
+    }).join("\n");
+  }
   let html = marked.parse(src);
   html = html.replace(/\u2063M(\d+)\u2063/g, (_, i) => {
     const entry = store[+i];
@@ -1730,11 +1736,13 @@ function showAnnSelButton() {
 
 // ---- 笔记块编辑（悬浮 ✎ → 弹窗：手动 / AI 重写 / AI 补充）----
 
-/// 找到某块的展示元素：段落锚点在 <p> 内（与文字同段）；章节锚点常被单独包在
-/// 空 <p> 里，此时取它的下一个元素（真正的标题）。
+/// 找到某块的展示元素：HTML 笔记的 id 直接挂在块元素（<hN> / <div class="note-block">）上，
+/// 返回它本身；Markdown 笔记是零宽 <a> 前置锚点，段落锚点与文字同段（取所在 <p>），
+/// 章节锚点常被单独包在空 <p> 里（取下一个元素，即真正的标题）。
 function blockElementFor(doc, id) {
   const anchor = doc.getElementById("blk-" + id);
   if (!anchor) return null;
+  if (anchor.tagName !== "A") return anchor;
   const parent = anchor.parentElement;
   if (!parent) return null;
   if (parent.tagName === "P" && !parent.textContent.trim()) {
@@ -1825,9 +1833,17 @@ const EDIT_PREVIEW_W_KEY = "ph.edit.previewW";
 function renderEditPreview() {
   const box = $("edit-preview-body");
   if (!box || $("edit-preview").classList.contains("hidden")) return;
-  const md = $("edit-text").value;
-  if (!window.marked) { box.textContent = md || "（无内容）"; return; }
-  box.innerHTML = renderMathMarkdown(md) || '<p class="muted">（无内容）</p>';
+  const src = $("edit-text").value;
+  if (!window.marked) { box.textContent = src || "（无内容）"; return; }
+  if (editIsHtml && !window.DOMPurify) { box.textContent = src || "（无内容）"; return; }
+  let html = renderMathMarkdown(src, editIsHtml);
+  if (editIsHtml && window.DOMPurify) {
+    html = DOMPurify.sanitize(html, {
+      USE_PROFILES: { html: true, svg: true, mathMl: true },
+      ADD_ATTR: ["id"],
+    });
+  }
+  box.innerHTML = html || '<p class="muted">（无内容）</p>';
 }
 
 let editPrevTimer = null;
@@ -1929,6 +1945,10 @@ async function openEditModal(id) {
     const b = await res.json();
     const isTitle = id === "__title__";
     editBlockKind = isTitle ? "title" : b.kind;
+    editIsHtml = !!b.is_html;
+    $("edit-text").placeholder = editIsHtml
+      ? "支持 HTML；数学公式用 $...$ 或 $$...$$；可用 <p>、<strong>、<ul> 等标签"
+      : "支持 Markdown；数学公式用 $...$ 或 $$...$$；## / ### 表示小节";
     // 标题：提供「按风格重写全文」；不支持 AI 补充
     $("edit-tab-restyle").classList.toggle("hidden", !isTitle);
     document.querySelector('.edit-tab[data-mode="append"]').classList.toggle("hidden", isTitle);
@@ -1940,8 +1960,11 @@ async function openEditModal(id) {
       refreshStyles().then(populateEditStyles);
       $("edit-hint").textContent = "按所选笔记风格重写整篇（以原文或当前笔记为素材）；应用后会重建全部结构块，现有批注将失效，可用「撤销」恢复。";
     }
-    // 章节：编辑框展示「标题 + 全部子块」；段落/标题：只有自身文字
-    $("edit-text").value = editBlockKind === "section" && b.markdown ? b.markdown : (b.text || "");
+    // 章节：编辑框展示「标题 + 全部子块」；HTML 笔记的段落也要 HTML 源（保留排版）；
+    // 其余（Markdown 段落 / 公式）：只有自身文字
+    if (editBlockKind === "section" && b.markdown) $("edit-text").value = b.markdown;
+    else if (editIsHtml && editBlockKind === "paragraph" && b.markdown) $("edit-text").value = b.markdown;
+    else $("edit-text").value = b.text || "";
     // 后台生成的草稿（含生成中途的实时内容）：打开时恢复
     const draft = editDrafts.get(id);
     if (draft && draft.text) $("edit-text").value = draft.text;
@@ -1959,13 +1982,16 @@ async function openEditModal(id) {
     if (b.explanations) parts.push(`${b.explanations} 条追问`);
     if (b.children) parts.push(`${b.children} 个子块`);
     if (editBlockKind === "section") {
-      $("edit-hint").textContent = parts.length
+      $("edit-hint").textContent = (parts.length
         ? `编辑框含本节标题与全部内容（${parts.join(" / ")}）：应用后会整体重写本节，子块的批注需重做。`
-        : "编辑框含本节标题与内容；应用后会整体重写本节。";
+        : "编辑框含本节标题与内容；应用后会整体重写本节。")
+        + (editIsHtml ? " 内容为 HTML，可用 <p>、<strong>、<ul> 等标签排版。" : "");
     } else {
       $("edit-hint").textContent = parts.length
         ? `该块含 ${parts.join(" / ")}：改文字不影响它们。`
-        : "支持 Markdown；数学公式用 $...$ 或 $$...$$。";
+        : editIsHtml
+          ? "支持 HTML；数学公式用 $...$ 或 $$...$$。"
+          : "支持 Markdown；数学公式用 $...$ 或 $$...$$。";
     }
     $("btn-edit-delete").classList.toggle("hidden", isTitle);
     renderEditPreview();

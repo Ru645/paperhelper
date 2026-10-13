@@ -1279,6 +1279,7 @@ async fn api_note_block(
             "number": "",
             "text": note.title,
             "markdown": note.title,
+            "is_html": note.is_html(),
             "explanations": 0,
             "children": 0,
         })));
@@ -1292,6 +1293,7 @@ async fn api_note_block(
         "number": b.number,
         "text": b.text,
         "markdown": note.block_markdown(&b.id),
+        "is_html": note.is_html(),
         "explanations": b.explanations.len(),
         "children": b.children.len(),
     })))
