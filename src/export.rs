@@ -913,7 +913,7 @@ function renderNote(src) {{
   // 同一管线：公式 → marked（HTML 笔记的块级 HTML 由 marked 原样透传）→ 消毒
   let html = renderMd(src, !SANITIZE);
   if (!SANITIZE || !window.DOMPurify) return html;
-  return DOMPurify.sanitize(html, {{ USE_PROFILES: {{ html: true, svg: true, mathMl: true }}, ADD_ATTR: ['id'] }});
+  return DOMPurify.sanitize(html, {{ USE_PROFILES: {{ html: true, svg: true, svgFilters: true, mathMl: true }}, ADD_TAGS: ['style', 'use', 'foreignObject'], ADD_ATTR: ['id'] }});
 }}
 if (window.marked) {{
   document.getElementById('note').innerHTML = renderNote(MD);
@@ -1134,6 +1134,11 @@ mod tests {
         assert!(html.contains("blk-__title__"), "应含标题锚点");
         assert!(html.contains("note-block"), "段落应包成 note-block");
         assert!(html.contains("DOMPurify"), "应内联 DOMPurify");
+        assert!(html.contains("svgFilters: true"), "应放行 SVG 滤镜（fe*）");
+        assert!(
+            html.contains("ADD_TAGS: ['style', 'use', 'foreignObject']"),
+            "应放行 <style>/<use>/<foreignObject>"
+        );
     }
 
     /// Markdown 笔记导出：仍走原管线，不启用 HTML 消毒分支。

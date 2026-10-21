@@ -1839,7 +1839,8 @@ function renderEditPreview() {
   let html = renderMathMarkdown(src, editIsHtml);
   if (editIsHtml && window.DOMPurify) {
     html = DOMPurify.sanitize(html, {
-      USE_PROFILES: { html: true, svg: true, mathMl: true },
+      USE_PROFILES: { html: true, svg: true, svgFilters: true, mathMl: true },
+      ADD_TAGS: ["style", "use", "foreignObject"],
       ADD_ATTR: ["id"],
     });
   }
