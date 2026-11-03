@@ -426,6 +426,37 @@ impl Note {
         s
     }
 
+    /// 某块在笔记结构中的「章节路径」：从顶层到该块的各级**祖先**小节（含编号），
+    /// 形如 `["1 引言", "2 方法", "2.3 定理证明"]`。为顶层块/标题或找不到时返回空。
+    pub fn section_path(&self, block_id: &str) -> Vec<String> {
+        fn label(b: &Block) -> String {
+            if b.number.is_empty() {
+                b.text.clone()
+            } else {
+                format!("{} {}", b.number, b.text)
+            }
+        }
+        fn walk(blocks: &[Block], id: &str, trail: &mut Vec<String>) -> Option<Vec<String>> {
+            for b in blocks {
+                if b.id == id {
+                    return Some(trail.clone());
+                }
+                if b.kind == BlockKind::Section {
+                    trail.push(label(b));
+                    if let Some(found) = walk(&b.children, id, trail) {
+                        return Some(found);
+                    }
+                    trail.pop();
+                } else if let Some(found) = walk(&b.children, id, trail) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let mut trail = Vec::new();
+        walk(&self.blocks, block_id, &mut trail).unwrap_or_default()
+    }
+
     /// 按编号查找 Section 块（如 "3.2" 匹配 number=="3.2"）。
     pub fn find_section_by_number(&self, num: &str) -> Option<&Block> {
         for (b, _) in self.flatten() {
@@ -2338,5 +2369,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!all.contains("paperhelper-macros"));
+    }
+
+    /// `section_path` 返回块到顶层之间的祖先小节标题（含编号），供批注定位。
+    #[test]
+    fn section_path_lists_ancestor_headings() {
+        let md = "# 论文\n## 1 引言\n引言正文。\n## 2 方法\n方法正文。\n### 2.3 定理证明\n证明正文。\n";
+        let note = parse_markdown_note(md, "raw");
+        let para = note
+            .flatten()
+            .iter()
+            .find(|(b, _)| b.text.contains("证明正文"))
+            .map(|(b, _)| b.id.clone())
+            .unwrap();
+        // 只含祖先小节（"1 引言" 是兄弟，不应出现）
+        assert_eq!(note.section_path(&para), vec!["2 方法", "2.2 定理证明"]);
+
+        // Section 自身只返回其祖先（不含自己）
+        let sec = note.find_section_by_number("2.2").unwrap().id.clone();
+        assert_eq!(note.section_path(&sec), vec!["2 方法"]);
+
+        // 找不到的块 → 空
+        assert!(note.section_path("不存在").is_empty());
     }
 }

@@ -2284,7 +2284,7 @@ PaperHelper 命令：
             bail!("还没有笔记，先 `ingest <pdf>`");
         }
         let block_id = self.resolve_block_id(question, &block_num);
-        self.prepare_ask(question, block_id, None, record_concept, true)
+        self.prepare_ask(question, block_id, None, None, record_concept, true)
     }
 
     /// 按编号/关键词定位笔记块（ask 用）。
@@ -2306,6 +2306,7 @@ PaperHelper 命令：
         question: &str,
         block_id: Option<String>,
         quote: Option<&str>,
+        location: Option<String>,
         record_concept: bool,
         use_concept: bool,
     ) -> Result<AskJob> {
@@ -2316,8 +2317,14 @@ PaperHelper 命令：
         let session = self.session_key();
         // use_concept=false：本次提问不注入任何知识库关联（概念 + 关联论文 + 概念检索代理）
         let kb_agent = self.config.llm.kb_agent && use_concept;
-        let (msgs, block_id) =
-            self.build_context_messages(question, block_id.as_deref(), quote, use_concept, kb_agent);
+        let (msgs, block_id) = self.build_context_messages(
+            question,
+            block_id.as_deref(),
+            quote,
+            location.as_deref(),
+            use_concept,
+            kb_agent,
+        );
         let approx_tokens = msgs.iter().map(|m| m.content.chars().count()).sum::<usize>() / 4;
         let budget = if kb_agent {
             let used = self.kb.stats.total_tokens() + self.session.stats.total_tokens();
@@ -2946,7 +2953,10 @@ PaperHelper 命令：
         self.session.conversation.current = None; // 独立线程：新根
         // 给 LLM 的上下文优先用 quote_tex（公式还原成 TeX）
         let ctx = quote_tex.filter(|s| !s.trim().is_empty()).unwrap_or(quote);
-        let mut job = match self.prepare_ask(question, insert_block, Some(ctx), record_concept, use_concept) {
+        // 选段的**位置**（所在章节/段落）——避免模型把相同文字定位到别处
+        let location = self.quote_location_note(block_id);
+        let mut job =
+            match self.prepare_ask(question, insert_block, Some(ctx), location, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -2980,7 +2990,13 @@ PaperHelper 命令：
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = None; // 独立线程：新根
         let ctx = if quote.trim().is_empty() { None } else { Some(quote) };
-        let mut job = match self.prepare_ask(question, None, ctx, record_concept, use_concept) {
+        // 选段来自 PDF 原文：给出页码 + 该页对应位置的上下文，避免模型把相同文字定位到别处
+        let location = if quote.trim().is_empty() {
+            None
+        } else {
+            self.quote_location_pdf(page, quote)
+        };
+        let mut job = match self.prepare_ask(question, None, ctx, location, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -3135,7 +3151,7 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, None, record_concept, use_concept) {
+        let mut job = match self.prepare_ask(question, fallback_block, None, None, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -3166,7 +3182,9 @@ PaperHelper 命令：
         let fallback_block = self.annotation_block_for_node(node_id);
         let saved = self.session.conversation.current.clone();
         self.session.conversation.current = Some(node_id.to_string());
-        let mut job = match self.prepare_ask(question, fallback_block, Some(ctx), record_concept, use_concept) {
+        let location = Some("位置：上文助手回答中的选段。".to_string());
+        let mut job =
+            match self.prepare_ask(question, fallback_block, Some(ctx), location, record_concept, use_concept) {
             Ok(j) => j,
             Err(e) => {
                 self.session.conversation.current = saved;
@@ -3659,6 +3677,73 @@ PaperHelper 命令：
         *self.node_numbers.lock().unwrap() = nodes;
     }
 
+    /// 生成「选中文字在笔记中的位置」说明，供批注提问时帮助模型定位。
+    /// 返回形如「位置：章节「1 引言 › 2.3 定理证明」中的段落。\n该段落的完整文字：…」。
+    /// 无法定位（无笔记 / 块不存在）时返回 None，调用方退回仅给选段。
+    fn quote_location_note(&self, block_id: &str) -> Option<String> {
+        let note = self.session.notes.as_ref()?;
+        if block_id == notes::TITLE_ID {
+            return Some(format!("位置：笔记标题《{}》（全文）。", note.title.trim()));
+        }
+        let b = note.find_block(block_id)?;
+        let ancestors = note.section_path(block_id);
+        let label = if b.number.is_empty() {
+            b.text.clone()
+        } else {
+            format!("{} {}", b.number, b.text)
+        };
+        let mut s = match b.kind {
+            notes::BlockKind::Section => {
+                if ancestors.is_empty() {
+                    format!("位置：顶层小节「{label}」。")
+                } else {
+                    format!("位置：章节「{}」下的子小节「{label}」。", ancestors.join(" › "))
+                }
+            }
+            notes::BlockKind::Paragraph => {
+                if ancestors.is_empty() {
+                    "位置：笔记顶层的段落。".to_string()
+                } else {
+                    format!("位置：章节「{}」中的段落。", ancestors.join(" › "))
+                }
+            }
+            notes::BlockKind::Formula => {
+                if ancestors.is_empty() {
+                    "位置：笔记顶层的公式。".to_string()
+                } else {
+                    format!("位置：章节「{}」中的公式。", ancestors.join(" › "))
+                }
+            }
+        };
+        // 段落块补上完整文字，方便模型在该段内对照选中片段，避免与别处的相同文字混淆。
+        if b.kind == notes::BlockKind::Paragraph {
+            let text = b.text.trim();
+            if !text.is_empty() {
+                let total = text.chars().count();
+                let capped: String = text.chars().take(700).collect();
+                let ellipsis = if total > 700 { "…" } else { "" };
+                s.push_str(&format!("\n该段落的完整文字：{capped}{ellipsis}"));
+            }
+        }
+        Some(s)
+    }
+
+    /// 生成「PDF 选中文字的位置」说明：页码 + 该页原文中选段附近的上下文（选段用 « » 标出）。
+    /// 无原文时只给页码。
+    fn quote_location_pdf(&self, page: u32, quote: &str) -> Option<String> {
+        let page = page.max(1);
+        let mut s = format!("位置：PDF 第 {page} 页。");
+        if let Some(note) = self.session.notes.as_ref() {
+            let pages: Vec<&str> = note.raw_text.split('\u{0C}').collect();
+            let text = pages.get((page - 1) as usize).map(|t| t.trim()).unwrap_or("");
+            if !text.is_empty() {
+                s.push_str("\n该页选中处的上下文：");
+                s.push_str(&excerpt_around(text, quote, 240));
+            }
+        }
+        Some(s)
+    }
+
     /// 构建 ask 共用的上下文消息序列（笔记材料 + 对话路径 + 知识库关联）。
     /// `use_concept=false` 时不注入任何知识库关联（相关概念与关联论文都不带）；
     /// `kb_agent=true` 时概念改由 `AskJob` 在锁外挑选，此处不本地注入。
@@ -3675,6 +3760,7 @@ PaperHelper 命令：
         question: &str,
         block_id: Option<&str>,
         quote: Option<&str>,
+        location: Option<&str>,
         use_concept: bool,
         kb_agent: bool,
     ) -> (Vec<Message>, Option<String>) {
@@ -3735,13 +3821,21 @@ PaperHelper 命令：
             msgs.push(Message::text("assistant", a.clone()));
         }
 
-        // 批注提问时，把用户选中的原文一并作为上下文（普通 ask 无 quote）
+        // 批注提问时，把用户选中的原文连同**位置**一并作为上下文（普通 ask 无 quote）。
+        // 位置说明（所在章节/段落）用于消歧：同一段文字可能在多处出现，避免模型张冠李戴。
         let mut q_final = String::new();
         if let Some(qt) = quote {
             if !qt.trim().is_empty() {
+                if let Some(loc) = location.filter(|s| !s.trim().is_empty()) {
+                    q_final.push_str("【选中文字的位置】\n");
+                    q_final.push_str(loc.trim());
+                    q_final.push('\n');
+                }
                 q_final.push_str("【用户选中的原文】\n");
                 q_final.push_str(qt.trim());
-                q_final.push_str("\n【问题】\n");
+                q_final.push_str(
+                    "\n注意：以上「选中的原文」仅指上述位置，请勿套用资料中其它位置出现的相同文字。\n【问题】\n",
+                );
             }
         }
         q_final.push_str(question);
@@ -3840,6 +3934,45 @@ pub(crate) fn doc_context_messages(
         msgs.push(Message::text("user", format!("【原文材料】\n{}", note.raw_text)));
     }
     msgs
+}
+
+/// 在 `text` 中定位 `needle`，返回选段附近前后各约 `pad` 字的上下文窗口，选段用 « » 标出。
+/// 匹配时忽略空白差异（PDF 抽取的换行/空格常与选区文本不一致）；找不到时返回开头 `2*pad` 字。
+fn excerpt_around(text: &str, needle: &str, pad: usize) -> String {
+    let text_chars: Vec<char> = text.chars().collect();
+    let compact_target: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact_target.is_empty() {
+        return text_chars.iter().take(pad * 2).collect();
+    }
+    let mut compact: Vec<char> = Vec::new();
+    let mut idx: Vec<usize> = Vec::new();
+    for (i, c) in text_chars.iter().enumerate() {
+        if !c.is_whitespace() {
+            compact.push(*c);
+            idx.push(i);
+        }
+    }
+    let n = compact_target.len();
+    let hit = (0..=compact.len().saturating_sub(n))
+        .find(|&s| compact[s..s + n] == compact_target[..]);
+    let Some(s) = hit else {
+        return text_chars.iter().take(pad * 2).collect();
+    };
+    let start = idx[s].saturating_sub(pad);
+    let end = (idx[s + n - 1] + 1 + pad).min(text_chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(text_chars[start..idx[s]].iter());
+    out.push('«');
+    out.extend(text_chars[idx[s]..=idx[s + n - 1]].iter());
+    out.push('»');
+    out.extend(text_chars[idx[s + n - 1] + 1..end].iter());
+    if end < text_chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// 解析用户输入的文件路径/值参数（shell 风格）：
@@ -4770,19 +4903,98 @@ mod tests {
         let app = super::App::new(Config::default(), kb, reqwest::Client::new());
         let last = |msgs: &[crate::llm::Message]| msgs.last().unwrap().content.clone();
 
-        let (on, _) = app.build_context_messages("什么是语义熵", None, None, true, false);
+        let (on, _) = app.build_context_messages("什么是语义熵", None, None, None, true, false);
         assert!(
             last(&on).contains("【你之前学过的相关概念"),
             "开启时应注入相关概念提示: {}",
             last(&on)
         );
 
-        let (off, _) = app.build_context_messages("什么是语义熵", None, None, false, false);
+        let (off, _) = app.build_context_messages("什么是语义熵", None, None, None, false, false);
         assert!(
             !last(&off).contains("【你之前学过的相关概念"),
             "关闭时不应注入概念提示: {}",
             last(&off)
         );
+    }
+
+    /// 批注定位：给出选中文字所在的章节路径 + 段落完整文字。
+    #[test]
+    fn quote_location_note_reports_section_and_paragraph() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        use crate::notes;
+        let mut app =
+            super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        let md = "# 标题\n## 1 引言\n引言正文。\n## 2 方法\n方法正文。\n### 2.3 定理证明\n本节要证明的是命题 P。\n";
+        let note = notes::parse_markdown_note(md, "raw");
+        let para = note
+            .flatten()
+            .iter()
+            .find(|(b, _)| b.text.contains("命题 P"))
+            .map(|(b, _)| b.id.clone())
+            .unwrap();
+        app.session.notes = Some(note);
+
+        let loc = app.quote_location_note(&para).expect("应能定位");
+        assert!(
+            loc.contains("位置：章节「2 方法 › 2.2 定理证明」中的段落。"),
+            "{loc}"
+        );
+        assert!(loc.contains("该段落的完整文字") && loc.contains("命题 P"), "{loc}");
+
+        assert!(
+            app.quote_location_note("不存在").is_none(),
+            "定位不到块应返回 None"
+        );
+    }
+
+    /// 批注提问：位置说明注入到最后一条 user 消息，且带「勿套用别处相同文字」提醒。
+    #[test]
+    fn build_context_messages_includes_quote_location() {
+        use crate::config::Config;
+        use crate::knowledge::KnowledgeBase;
+        use crate::notes;
+        let mut app =
+            super::App::new(Config::default(), KnowledgeBase::default(), reqwest::Client::new());
+        let md = "# 标题\n## 2 方法\n### 2.3 定理证明\n本节要证明的是命题 P。\n";
+        let note = notes::parse_markdown_note(md, "raw");
+        let para = note
+            .flatten()
+            .iter()
+            .find(|(b, _)| b.text.contains("命题 P"))
+            .map(|(b, _)| b.id.clone())
+            .unwrap();
+        app.session.notes = Some(note);
+
+        let loc = app.quote_location_note(&para);
+        let (msgs, _) = app.build_context_messages(
+            "这里要证明的是什么命题？",
+            Some(&para),
+            Some("证明"),
+            loc.as_deref(),
+            false,
+            false,
+        );
+        let last = msgs.last().unwrap().content.clone();
+        assert!(last.contains("【选中文字的位置】"), "{last}");
+        assert!(
+            last.contains("位置：章节「1 方法 › 1.1 定理证明」中的段落。"),
+            "应含章节路径: {last}"
+        );
+        assert!(last.contains("【用户选中的原文】\n证明"), "{last}");
+        assert!(last.contains("请勿套用"), "应提示勿套用别处相同文字: {last}");
+    }
+
+    /// 上下文窗口：忽略空白差异定位选段，并用 « » 标出。
+    #[test]
+    fn excerpt_around_marks_selection_across_whitespace() {
+        let text = "第一段。原文写道证明如下：因为 A=B，所以 C=D。后面还有内容。";
+        let got = super::excerpt_around(text, "证明\n如下", 6);
+        assert!(got.contains("«证明如下»"), "{got}");
+        // 找不到时回退到开头若干字
+        let fb = super::excerpt_around("abc", "zzz", 2);
+        assert_eq!(fb, "abc");
     }
 
     /// 提问上下文档位：note（默认）只发整篇笔记不带原文；full 带原文；block 只发选中段落/小节。
